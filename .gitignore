@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+config.json
+*_state.json
+stats.json*
+*.lock
+supervision/runtime/
+*.log
+*.zip

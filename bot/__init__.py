@@ -1,0 +1,1 @@
+# CoCAttack Bot Package

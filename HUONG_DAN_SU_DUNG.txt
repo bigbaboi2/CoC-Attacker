@@ -1,0 +1,51 @@
+========================================================================
+            HƯỚNG DẪN CÀI ĐẶT & SỬ DỤNG COCATTACK
+========================================================================
+
+1. YÊU CẦU HỆ THỐNG:
+------------------------------------------------------------------------
+- Hệ điều hành: Windows 10 / 11 (64-bit).
+- Giả lập Android khuyên dùng: MuMu Player 12.
+  + Cấu hình độ phân giải giả lập: 1600 x 900.
+  + Bật ADB Debugging trong cài đặt MuMu.
+- Python 3.10 hoặc mới hơn (64-bit).
+
+
+2. BƯỚC 1: CÀI ĐẶT PYTHON VÀ THƯ VIỆN
+------------------------------------------------------------------------
+- Nếu máy bạn CHƯA CÓ Python:
+  + Truy cập: https://www.python.org/downloads/
+  + Tải bản Python mới nhất cho Windows.
+  + QUAN TRỌNG: Lúc chạy file cài đặt, nhớ TÍCH CHỌN ô:
+    "[X] Add python.exe to PATH" ở chân cửa sổ trước khi nhấn Install.
+- Sau khi cài Python xong:
+  + Nhấp đúp chuột vào file "cai_dat_thu_vien.bat".
+  + Script sẽ tự động cài đặt tất cả các thư viện cần thiết (PyQt5, OpenCV, RapidOCR, ONNXRuntime, ...).
+  + Đợi script báo "CÀI ĐẶT THÀNH CÔNG!" là xong.
+
+
+3. BƯỚC 2: CẤU HÌNH GIẢ LẬP MUMU PLAYER
+------------------------------------------------------------------------
+- Mở MuMu Player -> Vào phần Cài đặt (Settings):
+  + Hiển thị: Đặt độ phân giải là 1600 x 900 (Landscape).
+  + Cài đặt chung / Nhà phát triển: Bật ADB (ADB Debug / Gỡ lỗi ADB).
+  + MuMu 12 mặc định dùng cổng ADB: 127.0.0.1:16384.
+
+
+4. BƯỚC 3: KHỞI CHẠY VÀ SỬ DỤNG TOOL
+------------------------------------------------------------------------
+- Nhấp đúp chuột vào file "run.bat" (hoặc "CoCAttack.vbs") để mở tool.
+  (Nếu gặp vấn đề không mở được, bạn có thể chạy file "run_debug.bat"
+   để màn hình hiển thị chi tiết nguyên nhân lỗi).
+- Trên giao diện tool:
+  + Chọn thiết bị (mặc định 127.0.0.1:16384 cho MuMu).
+  + Bấm nút "Kết nối".
+  + Cài đặt các thông số mong muốn:
+    * Tab Làng chính: ngưỡng cướp tài nguyên, tự động nâng tường (hỗ trợ kiểm tra qua trình sửa bố cục), tự động nâng công trình & anh hùng theo ưu tiên/bộ lọc, nhận thưởng Ngân khố (Treasury), giao việc Thợ phụ, thu hoạch mỏ, tự hoàn tất farm khi đầy kho...
+    * Tab Tấn công: chiến thuật rải lính (Siêu nhanh, chia 4 hướng, rải quanh, ngẫu nhiên...), tùy chọn kiểm tra lính tiếp viện trong Xe công thành, điều kiện tự kết thúc trận...
+    * Tab Làng Thợ xây: tự động đánh cúp/thu hoạch mỏ/nâng tường tại Làng Đêm.
+  + Bấm "Bắt đầu" để bot tự động vận hành.
+
+========================================================================
+CHÚC BẠN FARM GAME VUI VẺ!
+========================================================================
