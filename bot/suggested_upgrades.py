@@ -1133,6 +1133,13 @@ class SuggestedUpgrader:
 
     def step(self, log, *, maintain_reserve=False, custom_mode=None, preopened=None):
         self.deadline = time.monotonic()+60
+        try:
+            return self._timed_step(log, maintain_reserve=maintain_reserve,
+                                    custom_mode=custom_mode, preopened=preopened)
+        finally:
+            self.deadline = 0
+
+    def _timed_step(self, log, *, maintain_reserve, custom_mode, preopened):
         if self.pending is not None:
             self.last_status = 'Giao dịch công trình chưa rõ; dừng để tránh nâng lặp.'
             return dict(status='uncertain', reason=self.last_status)

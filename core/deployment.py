@@ -12,14 +12,15 @@ class DeploymentPlanner:
         lines=cv2.HoughLinesP(mask,1,np.pi/180,threshold=35,minLineLength=90,maxLineGap=15)
         endpoints=[]
         if lines is not None:
-            for x1,y1,x2,y2 in lines[:,0]:
+            for x1,y1,x2,y2 in lines.reshape(-1,4):
                 slope=abs((y2-y1)/float(x2-x1)) if x2!=x1 else 99
                 if .45<=slope<=1.05:endpoints.extend([(x1,y1),(x2,y2)])
         if len(endpoints)<6:return []
         hull=cv2.convexHull(np.asarray(endpoints,dtype=np.float32))
         if cv2.contourArea(hull)<60000:return []
-        center=hull[:,0].mean(axis=0)
-        polygon=hull[:,0]; result=[]
+        polygon=hull.reshape(-1,2)
+        center=polygon.mean(axis=0)
+        result=[]
         for index,p1 in enumerate(polygon):
             p2=polygon[(index+1)%len(polygon)]
             dx,dy=p2-p1

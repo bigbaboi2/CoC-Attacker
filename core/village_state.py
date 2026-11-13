@@ -32,6 +32,8 @@ class VillageStateManager:
 
     def __init__(self, storage_path: Optional[str] = None):
         self.storage_path = Path(storage_path) if storage_path else Path("village_live_state.json")
+        self.account_key = None
+        self.account_caches = {}
         self.active_village: str = "main"  # 'main' or 'builder'
 
         self.home_resources: Dict[str, Any] = {
@@ -96,6 +98,69 @@ class VillageStateManager:
     def set_active_village(self, village_type: str):
         if village_type in ('main', 'builder'):
             self.active_village = village_type
+
+    def _account_snapshot(self):
+        return dict(wall_inventory=self.wall_inventory,
+                    home_resources=self.home_resources,
+                    builder_resources=self.builder_resources,
+                    walls_confirmed_maxed=self.walls_confirmed_maxed,
+                    th_level=self.th_level)
+
+    def set_account(self, key):
+        if not key or key == self.account_key:
+            return
+        if self.account_key:
+            self.account_caches[self.account_key] = json.loads(json.dumps(self._account_snapshot()))
+        self.account_key = key
+        saved = self.account_caches.get(key, {})
+        self.wall_inventory = {'main': {}, 'builder': {}}
+        for village in ('main', 'builder'):
+            for level, count in saved.get('wall_inventory', {}).get(village, {}).items():
+                try:
+                    self.wall_inventory[village][int(level)] = int(count)
+                except (TypeError, ValueError):
+                    pass
+        self.home_resources = dict(gold=0, elixir=0, dark_elixir=0, gems=0, updated_at=0.0, valid={})
+        self.builder_resources = dict(gold=0, elixir=0, gems=0, updated_at=0.0, valid={})
+        for name in ('home_resources', 'builder_resources'):
+            target = getattr(self, name)
+            source = saved.get(name, {})
+            for resource in ('gold', 'elixir', 'dark_elixir', 'gems'):
+                if type(source.get(resource)) is int and source.get('valid', {}).get(resource):
+                    target[resource] = source[resource]
+                    target['valid'][resource] = True
+            target['updated_at'] = source.get('updated_at', 0.0)
+        wallets = [entry for entry in (self.home_resources, self.builder_resources)
+                   if entry['valid'].get('gems')]
+        if wallets:
+            latest = max(wallets, key=lambda entry: entry['updated_at'])
+            for entry in (self.home_resources, self.builder_resources):
+                entry['gems'] = latest['gems']
+                entry['valid']['gems'] = True
+        self.walls_confirmed_maxed = bool(saved.get('walls_confirmed_maxed', False))
+        self.th_level = saved.get('th_level')
+        self.ongoing_upgrades = []
+        self.free_builders = None
+
+    def merge_account_cache(self, legacy, tag):
+        if self.account_key == legacy:
+            self.account_caches[legacy] = json.loads(json.dumps(self._account_snapshot()))
+        old = self.account_caches.get(legacy)
+        new = self.account_caches.get(tag)
+        if not isinstance(old, dict):
+            return True
+        def comparable(snapshot):
+            values = json.loads(json.dumps(snapshot))
+            for name in ('home_resources', 'builder_resources'):
+                values.get(name, {}).pop('updated_at', None)
+            return values
+        if isinstance(new, dict) and comparable(old) != comparable(new):
+            return False
+        self.account_caches.setdefault(tag, old)
+        del self.account_caches[legacy]
+        if self.account_key == legacy:
+            self.account_key = tag
+        return True
 
     def update_resources(self, village_type: str, resources: Dict[str, Any]):
         if village_type not in ('main', 'builder') or not isinstance(resources, dict):
@@ -223,13 +288,10 @@ class VillageStateManager:
 
     def _save_cache(self):
         try:
-            data = {
-                'wall_inventory': self.wall_inventory,
-                'home_resources': self.home_resources,
-                'builder_resources': self.builder_resources,
-                'walls_confirmed_maxed': getattr(self, 'walls_confirmed_maxed', False),
-                'th_level': getattr(self, 'th_level', None)
-            }
+            if not self.account_key:
+                return
+            self.account_caches[self.account_key] = self._account_snapshot()
+            data = {'accounts': self.account_caches}
             from core.stats_store import StatsStore
             self.storage_path.write_text(json.dumps(data, indent=2, ensure_ascii=False, default=StatsStore.json_default), encoding='utf-8')
         except Exception:
@@ -240,28 +302,11 @@ class VillageStateManager:
             return
         try:
             data = json.loads(self.storage_path.read_text(encoding='utf-8'))
-            self.walls_confirmed_maxed = bool(data.get('walls_confirmed_maxed', False))
-            self.th_level = data.get('th_level')
-            walls = data.get('wall_inventory', {})
-            for village in ('main', 'builder'):
-                v_walls = walls.get(village, {})
-                for k, v in v_walls.items():
-                    try:
-                        self.wall_inventory[village][int(k)] = int(v)
-                    except (ValueError, TypeError):
-                        pass
-            for name, target in (('home_resources', self.home_resources),
-                                 ('builder_resources', self.builder_resources)):
-                saved = data.get(name, {})
-                stamp = saved.get('updated_at')
-                if type(stamp) in (int, float) and stamp >= 0:
-                    target['updated_at'] = stamp
-                for key in target.keys() - {'valid', 'updated_at'}:
-                    value = saved.get(key)
-                    if type(value) is int and value >= 0:
-                        target[key] = value
-                        # Legacy caches stored zero for both failed reads and real zeros.
-                        if saved.get('valid', {}).get(key, value > 0):
-                            target['valid'][key] = True
+            if isinstance(data.get('accounts'), dict):
+                self.account_caches = data['accounts']
+                return
+            # Old live-state files had no account key. Do not display their
+            # wall or resource values before a player identity is established.
+            return
         except Exception:
             pass

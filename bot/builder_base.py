@@ -1,6 +1,7 @@
 import re
 import time
 import json
+import re
 from pathlib import Path
 
 import cv2
@@ -67,41 +68,70 @@ class BuilderBaseManager:
             self.engine.pause_bot()
 
     def remember_builder_waits(self):
-        """Persist only verified builder waits bound to an explicitly verified player tag."""
+        """Persist builder waits under the current tag or temporary legacy key."""
         village = getattr(self, 'village', None)
-        tag = getattr(village, '_session_player_tag', None)
-        if not isinstance(tag, str) or not re.fullmatch(r'#[0289PYLQGRJCUV]{3,15}', tag):
+        tag = getattr(village, '_session_player_tag', None) or getattr(village, '_session_legacy_key', None)
+        if not isinstance(tag, str) or not tag:
             return
         from core.stats_store import StatsStore
         path = Path(__file__).resolve().parents[1] / 'builder_wait_state.json'
         now, wall = time.monotonic(), time.time()
-        data = {'account': tag, 'saved_at': wall,
-                'main_until': wall + max(0, self.main_builders_wait_until - now),
-                'night_until': wall + max(0, self.night_builders_wait_until - now)}
+        entry = {'saved_at': wall,
+                 'main_until': wall + max(0, self.main_builders_wait_until - now),
+                 'night_until': wall + max(0, self.night_builders_wait_until - now),
+                 'night_walls_maxed': bool(self.walls_confirmed_maxed)}
         try:
+            old = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+            accounts = old.get('accounts', {}) if isinstance(old.get('accounts'), dict) else {}
+            if old.get('account') and old.get('account') not in accounts:
+                accounts[old['account']] = {key: old.get(key) for key in ('saved_at', 'main_until', 'night_until')}
+            accounts[tag] = entry
+            data = {'accounts': accounts}
             StatsStore._atomic_write(path, json.dumps(data, ensure_ascii=False).encode('utf-8'))
-        except OSError:
+        except (OSError, ValueError, TypeError):
             pass
 
     def restore_builder_waits(self, log):
         village = getattr(self, 'village', None)
-        tag = getattr(village, '_session_player_tag', None)
-        if not isinstance(tag, str) or not re.fullmatch(r'#[0289PYLQGRJCUV]{3,15}', tag):
+        tag = getattr(village, '_session_player_tag', None) or getattr(village, '_session_legacy_key', None)
+        if not isinstance(tag, str) or not tag:
             return
         if getattr(self, '_restored_wait_account', None) == tag:
             return
         if getattr(self, '_restored_wait_account', None) is not None:
             self.main_builders_wait_until = self.night_builders_wait_until = 0
             self.main_schedule_checked = self.night_schedule_checked = False
+            self.walls_confirmed_maxed = False
         self._restored_wait_account = tag
         path = Path(__file__).resolve().parents[1] / 'builder_wait_state.json'
         try:
             data = json.loads(path.read_text(encoding='utf-8'))
             now = time.time()
-            if data.get('account') != tag or not 0 <= now - float(data['saved_at']) <= 86400:
+            accounts = data.get('accounts', {})
+            if isinstance(accounts, dict) and tag.startswith('#'):
+                legacy = getattr(village, '_verified_header_key', None)
+                old = accounts.get(legacy)
+                current = accounts.get(tag)
+                if isinstance(old, dict):
+                    comparable = ('main_until', 'night_until', 'night_walls_maxed')
+                    matches = current is None or all(
+                        old.get(field) == current.get(field) for field in comparable
+                        if field in old and field in current)
+                    if matches:
+                        accounts.setdefault(tag, old)
+                        del accounts[legacy]
+                        from core.stats_store import StatsStore
+                        StatsStore._atomic_write(path, json.dumps({'accounts': accounts}, ensure_ascii=False).encode('utf-8'))
+                    else:
+                        log(f'[Thợ] Lịch {legacy} khác {tag}; giữ riêng lịch cũ.')
+            entry = accounts.get(tag) if isinstance(accounts, dict) else None
+            if entry is None and data.get('account') == tag:
+                entry = data
+            if entry is None or not 0 <= now - float(entry['saved_at']) <= 86400:
                 return
+            self.walls_confirmed_maxed = bool(entry.get('night_walls_maxed', False))
             for village_name in ('main', 'night'):
-                remaining = float(data.get(village_name + '_until', 0)) - now
+                remaining = float(entry.get(village_name + '_until', 0)) - now
                 if 0 < remaining <= 14 * 86400:
                     setattr(self, village_name + '_builders_wait_until', time.monotonic() + remaining)
                     setattr(self, village_name + '_schedule_checked', True)
@@ -203,6 +233,14 @@ class BuilderBaseManager:
             time.sleep(.25)
         return None
 
+    @staticmethod
+    def boat_tap_is_clear(hit):
+        if not hit:
+            return False
+        x, y = hit[:2]
+        # Resource bars, their plus buttons, and the bottom HUD cover the map.
+        return 150 <= x < 1530 and 210 <= y < 705
+
     def enter(self, screen):
         if self.is_home(screen):
             return True
@@ -211,7 +249,7 @@ class BuilderBaseManager:
                 return False
             boat = self.match(screen, ("builder_boat_home", "thuyensun", "builder_boat_badge"),
                               (150, 215, 900, 615), .83, (.7, .85, 1., 1.15, 1.3))
-            if boat:
+            if self.boat_tap_is_clear(boat):
                 self.tap(boat)
                 return self.wait_for(self.is_home, 15) is not None
             if attempt < 2:
@@ -226,12 +264,12 @@ class BuilderBaseManager:
             if not self.is_home(screen):
                 break
             hit = self.match(screen, names, roi, threshold, (.7, .85, 1., 1.15, 1.3))
-            if hit:
+            if self.boat_tap_is_clear(hit):
                 return hit
             if attempt == 5:
                 break
             # A selection from the builder panel may have zoomed into the green area.
-            if attempt == 0:
+            if attempt == 0 and not hit:
                 self.adb.zoom_out_map(times=2)
             elif not self.night_palette(screen):
                 self.adb.swipe(880, 465, 535, 240, duration_ms=540, jitter=0)
@@ -250,6 +288,71 @@ class BuilderBaseManager:
             return False
         self.tap(boat)
         return self.wait_for(self.is_main, 15) is not None
+
+    def scan_initial_layout_walls(self, log):
+        """Read Stage 1 wall inventory and discard the temporary layout edit."""
+        def contains(frame, roi, *words):
+            text = ' '.join(self.walls.texts(frame, roi, scale=1)).lower()
+            return all(word in text for word in words)
+
+        if not self.walls.ensure_menu_open():
+            log('[BH] Không mở được bảng thợ để kiểm tra Layout Editor.')
+            return False
+        editor_open = False
+        edit_open = False
+        result = None
+        try:
+            self.tap((1090, 715), .8)
+            frame = self.wait_for(lambda f: contains(f, (300, 0, 1000, 160), 'layout', 'editor'), 5)
+            if frame is None:
+                return False
+            editor_open = True
+            self.tap((300, 460), .4)
+            frame = self.wait_for(lambda f: contains(f, (200, 750, 400, 150), 'edit', 'layout'), 5)
+            if frame is None:
+                return False
+            self.tap((410, 825), .8)
+            frame = self.wait_for(lambda f: contains(f, (0, 0, 650, 150), 'builder', 'edit'), 5)
+            if frame is None:
+                return False
+            edit_open = True
+            if not contains(frame, (1290, 70, 300, 130), 'remove', 'all'):
+                return False
+            self.tap((1445, 130), .5)
+            frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'collect', 'all'), 5)
+            if frame is None:
+                return False
+            self.tap((980, 590), .8)
+            frame = self.wait_for(lambda f: contains(f, (0, 60, 300, 120), 'stage', 'wall'), 5)
+            if frame is not None:
+                result = self.walls.parse_layout_inventory_cards(frame, builder_base=True)
+                header = ' '.join(self.walls.texts(frame, (0, 60, 300, 120), scale=1))
+                total = re.search(r'0\s*/\s*(\d+)\s*wall', header, re.I)
+                if not total or not result or sum(g['count'] for g in result['wall_groups']) != int(total.group(1)):
+                    result = None
+        finally:
+            if edit_open:
+                self.tap((1445, 635), .5)
+                frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'cancel', 'editing'), 5)
+                if frame is not None:
+                    self.tap((975, 580), .7)
+                else:
+                    result = None
+            if editor_open:
+                frame = self.wait_for(lambda f: contains(f, (300, 0, 1000, 160), 'layout', 'editor'), 5)
+                if frame is not None:
+                    self.tap((1525, 70), .7)
+                else:
+                    result = None
+        if not self.is_home(self.adb.screencap()):
+            log('[BH] Chưa xác nhận về làng sau Layout Editor.')
+            return False
+        if result is None:
+            log('[BH] Chưa đọc chắc tường Stage 1 trong Layout Editor.')
+            return False
+        summary = ', '.join(f"cấp {g['level']} x{g['count']}" for g in result['wall_groups'])
+        log(f'[BH] Layout Editor Stage 1: {summary}.')
+        return True
 
     def collect_mines(self, screen, log, *, gem_only=False):
         resources = (
@@ -349,7 +452,7 @@ class BuilderBaseManager:
                 if policy in (name, "both") and (eligible is None or name in eligible)
                 and balances.get("valid", {}).get(name) and balances[name] > 0}
 
-    def wall_opening_resources(self, balances):
+    def wall_opening_resources(self, balances, *, continuing=False):
         """Return only eligible currencies when the configured opening condition is met."""
         mode = self.settings.get('builder_base_wall_trigger', 'either')
         if mode not in ('either', 'both', 'gold', 'elixir'):
@@ -358,7 +461,7 @@ class BuilderBaseManager:
         reached = {name for name in allowed if type(balances.get(name)) is int
                    and balances[name] > 0
                    and balances[name] >= self.settings.get(f'builder_base_wall_min_{name}', 0)}
-        return reached if (mode != 'both' or reached == allowed) else set()
+        return reached if (mode != 'both' or continuing or reached == allowed) else set()
 
     def upgrade_wall_cycle(self, screen, log):
         if self.walls_confirmed_maxed:
@@ -427,7 +530,7 @@ class BuilderBaseManager:
 
             # Re-read balances and re-verify threshold conditions
             balances = self.wall_balances(screen)
-            eligible = self.wall_opening_resources(balances)
+            eligible = self.wall_opening_resources(balances, continuing=True)
             for name, label in (("gold", "Builder Gold"), ("elixir", "Builder Elixir")):
                 if name not in allowed:
                     continue
@@ -748,6 +851,21 @@ class BuilderBaseManager:
             return None
         if level is not None:
             log(f"[BH] Đã chọn tường cấp {level} từ bảng gợi ý; kiểm tra số lượng và giá.")
+            if row and eligible_resources is not None:
+                balances = self.wall_balances(screen, eligible_resources)
+                if level < 6:
+                    balances.pop('elixir', None)
+                price = row.get('cost')
+                if type(price) is int and not any(amount >= price for amount in balances.values()):
+                    if level < 6 and 'elixir' in eligible_resources:
+                        log(f"[BH] Vàng không đủ nâng tường cấp {level}; tìm tường cấp 6 trở lên bằng dầu.")
+                        self.deselect()
+                        fresh = self.adb.screencap()
+                        if self.is_home(fresh):
+                            return self.upgrade_wall(fresh, log, eligible_resources={'elixir'})
+                        return None
+                    log(f"[BH] Tường cấp {level} cần {price:,}/đoạn; chưa đủ tài nguyên phù hợp để nâng.")
+                    return None
             screen, quantity = self.prepare_wall_quantity(screen, row, log, eligible_resources)
             if screen is not None:
                 result = self.confirm_wall_upgrade(screen, level, log, row=row, quantity=quantity,
@@ -909,8 +1027,17 @@ class BuilderBaseManager:
                     return None, self.adb.screencap()
                 if unknown and (level < min_level or (known and level + 1 > min(item['badge_level'] for item in known))):
                     if not known:
-                        log(f"[BH] Nhóm chưa rõ là cấp {level}; không có nhóm từ cấp {min_level} đủ điều kiện dùng tài nguyên này.")
-                        return None, selected
+                        log(f"[BH] Nhóm chưa rõ là cấp {level}; kiểm tra lại toàn bảng bằng OCR để tìm tường từ cấp {min_level}.")
+                        self.tap((1455, 690))
+                        screen = self.wait_for(self.walls.is_menu_open, 3)
+                        if screen is None:
+                            self.tap((1455, 690))
+                            screen = self.wait_for(self.walls.is_menu_open, 3)
+                        if screen is None:
+                            log("[BH] Không mở lại được bảng thợ để kiểm tra tường bằng dầu.")
+                            return None, self.adb.screencap()
+                        return self.lowest_wall_row(screen, budget, log, precise=True,
+                                                    _deadline=deadline, min_level=min_level)
                     lowest = min(known, key=lambda item: (item['badge_level'], item['cost']))
                     log(f"[BH] Nhóm chưa rõ là cấp {level}; tiếp tục tìm nhóm phù hợp Wall x{lowest['available']} giá {lowest['cost']:,} trong cùng lượt.")
                     if budget is not None and lowest['cost'] > budget:
@@ -1469,11 +1596,11 @@ class BuilderBaseManager:
         log("[BH] Không tìm thấy giá nâng khả dụng khớp với số lượng và tài nguyên đã chọn.")
         return False
 
-    def ready_actions(self, now):
+    def ready_actions(self, now, first_pass=False):
         if not self.settings.get("builder_base_enabled", False) or now < self.retry_after:
             return []
         main_enabled = self.settings.get("main_village_enabled", True)
-        if (main_enabled and now >= self.main_builders_wait_until
+        if (not first_pass and main_enabled and now >= self.main_builders_wait_until
                 and (self.all_upgrades_complete or now < self.night_builders_wait_until)):
             return []
         actions = []
@@ -1490,7 +1617,7 @@ class BuilderBaseManager:
                 and self.settings.get("builder_base_upgrade_buildings", False)
                 and not self.all_upgrades_complete):
             actions.append(("builder_base_upgrade_buildings", self.upgrade_building_cycle))
-        if not main_enabled or now >= self.main_turn_until or now < self.main_builders_wait_until:
+        if first_pass or not main_enabled or now >= self.main_turn_until or now < self.main_builders_wait_until:
             actions.append(("builder_base_battle", self.battle.start))
         return actions
 
@@ -1514,9 +1641,9 @@ class BuilderBaseManager:
             'builder', self.vision.read_village_resources(screen, builder=True)
         )
 
-    def run_cycle(self, screen, log):
+    def run_cycle(self, screen, log, first_pass=False):
         now = time.monotonic()
-        actions = self.ready_actions(now)
+        actions = self.ready_actions(now, first_pass=first_pass)
         cart_due = bool(actions) or now >= getattr(self, "next_cart_check", 0)
         check_cart = (self.settings.get("builder_base_enabled", False)
                       and self.settings.get("builder_base_collect_cart", False)
@@ -1538,7 +1665,7 @@ class BuilderBaseManager:
             })
         if self.dismiss_star_bonus(self.adb.screencap(), log):
             time.sleep(0.5)
-        if not self.night_schedule_checked or (self.night_builders_wait_until > 0
+        if first_pass or not self.night_schedule_checked or (self.night_builders_wait_until > 0
                                                 and time.monotonic() >= self.night_builders_wait_until):
             fresh = self.adb.screencap()
             free = self.confirmed_free_builders(fresh) if self.is_home(fresh) else None
@@ -1549,7 +1676,8 @@ class BuilderBaseManager:
                 self.night_builders_wait_until = time.monotonic() + seconds
                 self.remember_builder_waits()
                 log(f"[BH] Không có thợ rảnh; kiểm tra lại sau khoảng {max(1, seconds//60)} phút.")
-                return
+                if not first_pass:
+                    return
             if type(free) is int and free > 0:
                 self.night_builders_wait_until = 0
                 self.remember_builder_waits()

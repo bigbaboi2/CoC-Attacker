@@ -1,5 +1,6 @@
 import unittest
 import tempfile
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -17,15 +18,34 @@ class VillageSchedulingTests(unittest.TestCase):
             base.village = SimpleNamespace(_session_player_tag='#P0Y2')
             base.main_builders_wait_until = 500
             base.night_builders_wait_until = 900
-            with patch('bot.builder_base.Path', return_value=fake_source), patch('bot.builder_base.time.monotonic', return_value=100), patch('bot.builder_base.time.time', return_value=1000):
+            fake_time = SimpleNamespace(monotonic=lambda: 100, time=lambda: 1000)
+            with patch('bot.builder_base.Path', return_value=fake_source), patch('bot.builder_base.time', fake_time):
                 base.remember_builder_waits()
             restored = self.manager()
             restored.village = SimpleNamespace(_session_player_tag='#P0Y2')
-            with patch('bot.builder_base.Path', return_value=fake_source), patch('bot.builder_base.time.monotonic', return_value=200), patch('bot.builder_base.time.time', return_value=1500):
+            fake_time = SimpleNamespace(monotonic=lambda: 200, time=lambda: 1500)
+            with patch('bot.builder_base.Path', return_value=fake_source), patch('bot.builder_base.time', fake_time):
                 restored.restore_builder_waits(lambda _: None)
             self.assertEqual(restored.main_builders_wait_until, 0)
             self.assertEqual(restored.night_builders_wait_until, 500)
             self.assertTrue(restored.night_schedule_checked)
+
+    def test_builder_waits_are_saved_for_two_accounts(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fake_source = Path(folder) / 'bot' / 'builder_base.py'
+            clock = SimpleNamespace(monotonic=lambda: 100, time=lambda: 1000)
+            base = self.manager()
+            base.village = SimpleNamespace(_session_player_tag='#P0Y2')
+            base.main_builders_wait_until = 500
+            with patch('bot.builder_base.Path', return_value=fake_source), patch('bot.builder_base.time', clock):
+                base.remember_builder_waits()
+                base.village._session_player_tag = '#QJU2'
+                base.main_builders_wait_until = 900
+                base.remember_builder_waits()
+                saved = json.loads((Path(folder) / 'builder_wait_state.json').read_text())
+            self.assertEqual(set(saved['accounts']), {'#P0Y2', '#QJU2'})
+            self.assertEqual(saved['accounts']['#P0Y2']['main_until'], 1400)
+            self.assertEqual(saved['accounts']['#QJU2']['main_until'], 1800)
 
     def test_unstable_builder_count_does_not_claim_zero(self):
         base = self.manager()
@@ -76,6 +96,13 @@ class VillageSchedulingTests(unittest.TestCase):
         base.main_builders_wait_until = 300
         self.assertIn('builder_base_battle', [key for key, _ in base.ready_actions(100)])
 
+    def test_first_night_pass_runs_even_when_main_has_priority(self):
+        base = self.manager()
+        base.night_builders_wait_until = 400
+        self.assertEqual(base.ready_actions(100), [])
+        self.assertIn('builder_base_battle',
+                      [key for key, _ in base.ready_actions(100, first_pass=True)])
+
     def test_night_does_not_leave_before_main_builder_is_free(self):
         battle = SimpleNamespace(in_progress=False, find_now_failures=0, obstruction_buttons=Mock(return_value=None))
         base = SimpleNamespace(battle=battle, active=True, dismiss_star_bonus=Mock(return_value=False),
@@ -120,14 +147,16 @@ class VillageSchedulingTests(unittest.TestCase):
     def test_cross_village_sleep_selects_shortest_builder_time(self):
         base = self.manager()
         base.battle = SimpleNamespace(in_progress=False)
+        base.is_home = Mock(return_value=False)
         base.main_builders_wait_until = 1500  # 500s remaining
         base.night_builders_wait_until = 1300  # 300s remaining
         fake = SimpleNamespace(builder=base, settings={'main_village_enabled': True, 'builder_base_enabled': True},
-                               log=Mock(), _sleep_wait_for_builders=Mock(return_value=True))
+                               log=Mock(), adb=SimpleNamespace(screencap=Mock(return_value=object())),
+                               _sleep_wait_for_builders=Mock(return_value=True))
         with patch('bot.bot_engine.time.monotonic', return_value=1000):
             result = BotEngine._service_cross_village_sleep(fake)
         self.assertTrue(result)
-        fake._sleep_wait_for_builders.assert_called_once_with(300)
+        fake._sleep_wait_for_builders.assert_called_once_with(300, 'builder')
         self.assertEqual(base.night_builders_wait_until, 0)
 
     def test_cross_village_sleep_single_village(self):
@@ -139,7 +168,20 @@ class VillageSchedulingTests(unittest.TestCase):
         with patch('bot.bot_engine.time.monotonic', return_value=1000):
             result = BotEngine._service_cross_village_sleep(fake)
         self.assertTrue(result)
-        fake._sleep_wait_for_builders.assert_called_once_with(300)
+        fake._sleep_wait_for_builders.assert_called_once_with(300, 'builder')
         self.assertEqual(base.night_builders_wait_until, 0)
+
+    def test_equal_builder_waits_resume_in_current_night_village(self):
+        base = self.manager()
+        base.battle = SimpleNamespace(in_progress=False)
+        base.main_builders_wait_until = base.night_builders_wait_until = 1400
+        base.is_home = Mock(return_value=True)
+        fake = SimpleNamespace(builder=base,
+            settings={'main_village_enabled': True, 'builder_base_enabled': True},
+            adb=SimpleNamespace(screencap=Mock(return_value=object())),
+            log=Mock(), _sleep_wait_for_builders=Mock(return_value=True))
+        with patch('bot.bot_engine.time.monotonic', return_value=1000):
+            self.assertTrue(BotEngine._service_cross_village_sleep(fake))
+        fake._sleep_wait_for_builders.assert_called_once_with(400, 'builder')
 
 if __name__ == '__main__': unittest.main()

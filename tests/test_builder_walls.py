@@ -8,6 +8,49 @@ from bot.walls import WallUpgrader
 from collections import OrderedDict
 
 class BuilderWallQuantityTests(unittest.TestCase):
+    def test_builder_layout_counts_small_wall_groups(self):
+        wall = WallUpgrader.__new__(WallUpgrader)
+        wall.ocr_positions = Mock(return_value=[
+            ('x79', 84, 743), ('x14', 252, 744), ('x7', 419, 745),
+            ('Level 4', 86, 862), ('Level 5', 254, 862),
+            ('Level 8', 423, 862), ('Level 8', 594, 862)])
+        result = wall.parse_layout_inventory_cards(np.zeros((900, 1600, 3), dtype=np.uint8), builder_base=True)
+        self.assertEqual([(g['level'], g['count']) for g in result['wall_groups']],
+                         [(4, 79), (5, 14), (8, 7)])
+        self.assertFalse(result['maxed'])
+
+    def test_boat_tap_rejects_overlapping_hud(self):
+        self.assertFalse(BuilderBaseManager.boat_tap_is_clear((1350, 165, 40, 40, .9)))
+        self.assertFalse(BuilderBaseManager.boat_tap_is_clear((180, 740, 40, 40, .9)))
+        self.assertTrue(BuilderBaseManager.boat_tap_is_clear((1000, 350, 40, 40, .9)))
+
+    def test_enter_moves_map_before_tapping_boat_under_hud(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.is_home = Mock(return_value=False)
+        base.is_main = Mock(return_value=True)
+        base.match = Mock(side_effect=[(180, 740, 40, 40, .9), (500, 480, 40, 40, .9)])
+        base.adb = SimpleNamespace(swipe=Mock(), screencap=Mock(return_value=object()))
+        base.tap = Mock()
+        base.wait_for = Mock(return_value=object())
+        with patch('bot.builder_base.time.sleep'):
+            self.assertTrue(base.enter(object()))
+        base.adb.swipe.assert_called_once()
+        base.tap.assert_called_once_with((500, 480, 40, 40, .9))
+
+    def test_leave_moves_map_before_tapping_boat_under_resource_bar(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.is_home = Mock(return_value=True)
+        base.night_palette = Mock(return_value=True)
+        base.match = Mock(side_effect=[(1350, 165, 40, 40, .9), (1000, 350, 40, 40, .9)])
+        base.adb = SimpleNamespace(swipe=Mock(), screencap=Mock(return_value=object()), zoom_out_map=Mock())
+        base.tap = Mock()
+        base.is_main = Mock()
+        base.wait_for = Mock(return_value=object())
+        with patch('bot.builder_base.time.sleep'):
+            self.assertTrue(base.leave(object()))
+        base.adb.swipe.assert_called_once()
+        base.tap.assert_called_once_with((1000, 350, 40, 40, .9))
+
     def make_elixir_scan(self, unknown_low=False):
         base = BuilderBaseManager.__new__(BuilderBaseManager)
         rng = np.random.default_rng(42)
@@ -40,6 +83,24 @@ class BuilderWallQuantityTests(unittest.TestCase):
         self.assertEqual((row['cost'], row['upgrade_level']), (400000, 7))
         self.assertEqual(base.wait_for_wall_selection.call_count, 2)
 
+    def test_unknown_ineligible_wall_retries_full_scan(self):
+        base, frame = self.make_elixir_scan(unknown_low=True)
+        base.walls.menu_rows.side_effect = lambda *args, **kwargs: [
+            dict(x=1290, y=200, cost=10000, available=20)]
+        base.wait_for_wall_selection = Mock(return_value=(frame, 5))
+        original = base.lowest_wall_row
+        fallback = (dict(cost=400000, upgrade_level=7), frame)
+        def scan(screen, budget, log, precise=False, _deadline=None, min_level=1):
+            if precise:
+                self.assertEqual(min_level, 6)
+                return fallback
+            return original(screen, budget, log, precise=precise,
+                            _deadline=_deadline, min_level=min_level)
+        base.lowest_wall_row = scan
+        with patch('bot.builder_base.time.sleep'):
+            row, _ = base.lowest_wall_row(frame, 500000, lambda _: None, min_level=6)
+        self.assertEqual(row['upgrade_level'], 7)
+
     def test_builder_menu_single_wall_without_x_is_counted(self):
         wall = WallUpgrader.__new__(WallUpgrader)
         wall._selection_deadline = None
@@ -59,6 +120,27 @@ class BuilderWallQuantityTests(unittest.TestCase):
         base.settings['builder_base_wall_trigger'] = 'both'
         self.assertEqual(base.wall_opening_resources({'gold': 1000000, 'elixir': 1000000}), {'gold', 'elixir'})
         self.assertEqual(base.wall_opening_resources({'gold': 1000000}), set())
+        self.assertEqual(base.wall_opening_resources({'gold': 999999, 'elixir': 2000000}, continuing=True), {'elixir'})
+        self.assertEqual(base.wall_opening_resources({'gold': 2000000, 'elixir': 999999}, continuing=True), {'gold'})
+
+    def test_both_mode_continues_with_elixir_after_gold_falls_below_threshold(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.walls_confirmed_maxed = False
+        base.settings = {'builder_base_enabled': True, 'builder_base_upgrade_walls': True,
+                         'builder_base_wall_trigger': 'both', 'builder_base_wall_min_gold': 100,
+                         'builder_base_wall_min_elixir': 100}
+        base.wall_balances = Mock(side_effect=[{'gold': 200, 'elixir': 300},
+                                               {'gold': 50, 'elixir': 300},
+                                               {'gold': 50, 'elixir': 50}])
+        base.adb = SimpleNamespace(_guard_input=Mock(), screencap=Mock(return_value=object()))
+        base.is_home = Mock(return_value=True)
+        base.deselect = Mock()
+        base.confirmed_free_builders = Mock(return_value=1)
+        base.get_free_builders = Mock(return_value=1)
+        base.upgrade_wall = Mock(return_value=True)
+        self.assertTrue(base.upgrade_wall_cycle(object(), lambda _: None))
+        self.assertEqual([call.kwargs['eligible_resources'] for call in base.upgrade_wall.call_args_list],
+                         [{'gold', 'elixir'}, {'elixir'}])
 
     def test_below_threshold_never_opens_wall_menu(self):
         base = BuilderBaseManager.__new__(BuilderBaseManager)
@@ -205,9 +287,11 @@ class BuilderWallQuantityTests(unittest.TestCase):
         village = VillageManager.__new__(VillageManager)
         village.current_account_key = None
         village._session_player_tag = None
+        village._session_legacy_key = None
         village._verified_header_key = None
         village.verified_maxed_accounts = {}
         village.account_capacities = {}
+        village.account_builder_timers = {}
         village.TH_MAX_STORAGE_CAPACITIES = {}
         village.settings = {}
         village.set_wall_wait = Mock()
@@ -216,15 +300,16 @@ class BuilderWallQuantityTests(unittest.TestCase):
         village.get_account_capacities = Mock(return_value=None)
         village.get_account_shortest_builder_seconds = Mock(return_value=None)
         village.vision = SimpleNamespace(read_player_profile_header=Mock(return_value={'name': 'NightHero', 'level': 120, 'account_key': 'NightHero_120'}))
+        village.resolve_player_tag = Mock(side_effect=lambda *_: (village._activate_account('#P0Y2') or '#P0Y2'))
         village.is_in_main_village = Mock(return_value=False)
         builder = SimpleNamespace(is_home=Mock(return_value=True))
         village.builder = builder
 
         logs = []
         acc_key = village.check_and_sync_account(object(), logs.append)
-        self.assertEqual(acc_key, 'NightHero_120')
-        self.assertEqual(village.current_account_key, 'NightHero_120')
-        self.assertTrue(any('NightHero' in l for l in logs))
+        self.assertEqual(acc_key, '#P0Y2')
+        self.assertEqual(village.current_account_key, '#P0Y2')
+        village.resolve_player_tag.assert_called_once()
 
     def test_upgrade_building_cycle_respects_reserve(self):
         base = BuilderBaseManager.__new__(BuilderBaseManager)

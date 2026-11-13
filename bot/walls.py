@@ -6,6 +6,7 @@ import numpy as np
 import time
 import hashlib
 import json
+import unicodedata
 from core.adb_client import BotStoppedError
 from core.stats_store import StatsStore
 from pathlib import Path
@@ -107,7 +108,7 @@ class WallUpgrader:
             return None
         return th_level if th_level <= 8 else th_level + 1
 
-    def parse_layout_inventory_cards(self, screen):
+    def parse_layout_inventory_cards(self, screen, builder_base=False):
         """Parse the first inventory cards in Village Edit Mode after Remove All."""
         if not isinstance(screen, np.ndarray) or not screen.size:
             return None
@@ -151,7 +152,7 @@ class WallUpgrader:
         th_level = None
         for card in cards:
             cnt = card['count']
-            if cnt is not None and cnt >= 15:
+            if cnt is not None and cnt >= (1 if builder_base else 15):
                 wall_groups.append(dict(level=card['level'], count=cnt, x=card['x']))
             elif wall_groups:
                 if cnt is None and th_level is None:
@@ -163,11 +164,11 @@ class WallUpgrader:
         min_level = distinct_levels[0]
         max_level = distinct_levels[-1]
         min_available = sum(grp['count'] for grp in wall_groups if grp['level'] == min_level)
-        if len(distinct_levels) >= 2:
+        if builder_base or len(distinct_levels) >= 2:
             maxed = False
         else:
             max_allowed = self.max_wall_level_for_th(th_level)
-            maxed = False if (max_allowed is not None and min_level < max_allowed) else True
+            maxed = max_allowed is not None and min_level >= max_allowed
         return dict(
             maxed=maxed,
             min_level=min_level,
@@ -177,77 +178,119 @@ class WallUpgrader:
             th_level=th_level,
         )
 
+    def _dismiss_layout_obstacle(self, log):
+        """Dismiss only a recognized obstacle notice, then verify it disappeared."""
+        for _ in range(2):
+            frame = self.adb.screencap()
+            if frame is None:
+                return False
+            words = ' '.join(self.texts(frame, (330, 180, 940, 480), scale=1)).lower()
+            normalized = ''.join(c for c in unicodedata.normalize('NFD', words)
+                                 if unicodedata.category(c) != 'Mn')
+            compact = re.sub(r'[^a-z]', '', normalized)
+            if 'obstacle' not in compact and 'chuongngai' not in compact:
+                return True
+            button = self.vision.match_template(frame, 'okay', .75, roi=(500, 440, 600, 330))
+            if not button:
+                button = self.vision.find_okay_button(frame)
+            if not button:
+                log('[Wall] Thấy cảnh báo chướng ngại nhưng chưa nhận diện được Okay.')
+                return False
+            self.adb.tap(button[0], button[1], jitter=0, delay_after=.5)
+            log('[Wall] Đã bấm Okay để bỏ qua cảnh báo chướng ngại.')
+        frame = self.adb.screencap()
+        words = ' '.join(self.texts(frame, (330, 180, 940, 480), scale=1)).lower() if frame is not None else ''
+        normalized = ''.join(c for c in unicodedata.normalize('NFD', words)
+                             if unicodedata.category(c) != 'Mn')
+        compact = re.sub(r'[^a-z]', '', normalized)
+        return frame is not None and 'obstacle' not in compact and 'chuongngai' not in compact
+
     def verify_walls_via_layout_editor(self, log):
         """Fast fixed-coordinate wall verification via Layout Editor -> Edit layout -> Remove All."""
         pts = self.FIXED_LAYOUT_POINTS
         if not self.ensure_menu_open():
             return None
         entered_editor = False
+        edit_opened = False
+        cleanup_safe = True
+        verified = None
         try:
             self.adb.tap(*pts['layout_icon'], jitter=0, delay_after=0.8)
             entered_editor = True
+            if not self._dismiss_layout_obstacle(log):
+                cleanup_safe = False
+                return None
             self.adb.tap(*pts['edit_layout'], jitter=0, delay_after=1.0)
+            edit_opened = True
+            if not self._dismiss_layout_obstacle(log):
+                cleanup_safe = False
+                return None
             self.adb.tap(*pts['remove_all'], jitter=0, delay_after=0.6)
+            if not self._dismiss_layout_obstacle(log):
+                cleanup_safe = False
+                return None
             self.adb.tap(*pts.get('confirm_remove_all', (940, 555)), jitter=0, delay_after=0.8)
+            if not self._dismiss_layout_obstacle(log):
+                cleanup_safe = False
+                return None
             screen = self.adb.screencap()
             result = self.parse_layout_inventory_cards(screen)
-            if result is not None:
-                v_state = getattr(self.manager, 'village_state', None)
-                if v_state is not None:
-                    inv = {grp['level']: grp['count'] for grp in result['wall_groups']}
-                    if hasattr(v_state, 'replace_wall_inventory'):
-                        v_state.replace_wall_inventory('main', inv)
-                    else:
-                        for grp in result['wall_groups']:
-                            v_state.record_wall_group('main', grp['level'], grp['count'])
-                acc_key = getattr(self.manager, 'current_account_key', None) or 'default'
-                if result['maxed']:
-                    self.manager.walls_confirmed_maxed = True
-                    if hasattr(self.manager, 'verified_maxed_accounts'):
-                        self.manager.verified_maxed_accounts[acc_key] = {
-                            'th_level': result.get('th_level'),
-                            'min_level': result.get('min_level'),
-                            'verified_at': time.time()
-                        }
-                    th_note = f" (TH{result['th_level']})" if result.get('th_level') else ""
-                    self.manager.wall_status = (
-                        f"Đã xác minh qua Layout Editor: toàn bộ tường đạt Level {result['min_level']}{th_note} (Max)."
-                    )
-                    log('[Wall] ' + self.manager.wall_status)
-                    if v_state is not None:
-                        v_state.record_walls_maxed(True, result.get('th_level'))
-                    if hasattr(self.manager, 'save_wall_target'):
-                        self.manager.save_wall_target(None)
-                    if hasattr(self.manager, 'settings') and self.manager.settings:
-                        self.manager.settings.set('farm_finish_enabled', True)
-                        if self.manager.settings.get('farm_finish_resources') not in ('gold_elixir', 'gold', 'elixir'):
-                            self.manager.settings.set('farm_finish_resources', 'gold_elixir')
-                else:
-                    self.manager.walls_confirmed_maxed = False
-                    if hasattr(self.manager, 'verified_maxed_accounts'):
-                        self.manager.verified_maxed_accounts.pop(acc_key, None)
-                    if v_state is not None:
-                        v_state.record_walls_maxed(False, result.get('th_level'))
-                    levels_desc = ', '.join(f"Lv{g['level']}×{g['count']}" for g in result['wall_groups'])
-                    self.manager.wall_status = (
-                        f"Xác minh Layout Editor ({levels_desc}): tường CHƯA max, còn {result['available']} đoạn Level {result['min_level']}."
-                    )
-                    log('[Wall] ' + self.manager.wall_status)
-                    if hasattr(self.manager, 'save_wall_target'):
-                        self.manager.save_wall_target(None)
-                    if hasattr(self.manager, 'settings') and self.manager.settings:
-                        self.manager.settings.set('farm_finish_enabled', False)
-            return result
+            verified = result
         finally:
-            if entered_editor:
+            if entered_editor and cleanup_safe:
                 try:
-                    self.adb.tap(*pts['cancel_edit'], jitter=0, delay_after=0.6)
-                    self.adb.tap(*pts['confirm_discard'], jitter=0, delay_after=0.7)
+                    if edit_opened:
+                        self.adb.tap(*pts['cancel_edit'], jitter=0, delay_after=0.6)
+                        self.adb.tap(*pts['confirm_discard'], jitter=0, delay_after=0.7)
                     self.adb.tap(*pts['close_editor'], jitter=0, delay_after=0.7)
+                    is_main = getattr(self.manager, 'is_in_main_village', None)
+                    if callable(is_main) and not is_main(self.adb.screencap()):
+                        log('[Wall] Chưa xác nhận về làng chính sau khi hủy chỉnh sửa.')
+                        verified = None
                 except BotStoppedError:
                     raise
                 except Exception:
-                    pass
+                    verified = None
+            elif entered_editor:
+                log('[Wall] Popup chưa được đóng chắc chắn; giữ nguyên giao diện để thử khôi phục ở lượt sau.')
+        if verified is None:
+            return None
+        acc_key = getattr(self.manager, 'current_account_key', None)
+        if not acc_key:
+            log('[Wall] Chưa xác minh tài khoản; không ghi trạng thái tường.')
+            return None
+        v_state = getattr(self.manager, 'village_state', None)
+        if v_state is not None:
+            inv = {grp['level']: grp['count'] for grp in verified['wall_groups']}
+            if hasattr(v_state, 'replace_wall_inventory'):
+                v_state.replace_wall_inventory('main', inv)
+            else:
+                for grp in verified['wall_groups']:
+                    v_state.record_wall_group('main', grp['level'], grp['count'])
+        maxed = bool(verified['maxed'])
+        self.manager.walls_confirmed_maxed = maxed
+        if hasattr(self.manager, 'verified_maxed_accounts'):
+            if maxed:
+                self.manager.verified_maxed_accounts[acc_key] = dict(
+                    th_level=verified.get('th_level'), min_level=verified['min_level'], verified_at=time.time())
+            else:
+                self.manager.verified_maxed_accounts.pop(acc_key, None)
+        if v_state is not None:
+            v_state.record_walls_maxed(maxed, verified.get('th_level'))
+        if maxed:
+            th_note = f" (TH{verified['th_level']})" if verified.get('th_level') else ''
+            self.manager.wall_status = f"Đã xác minh qua Layout Editor: toàn bộ tường đạt Level {verified['min_level']}{th_note} (Max)."
+        else:
+            levels_desc = ', '.join(f"Lv{g['level']}×{g['count']}" for g in verified['wall_groups'])
+            self.manager.wall_status = f"Xác minh Layout Editor ({levels_desc}): tường CHƯA max, còn {verified['available']} đoạn Level {verified['min_level']}."
+        log('[Wall] ' + self.manager.wall_status)
+        if hasattr(self.manager, 'save_wall_target'):
+            self.manager.save_wall_target(None)
+        if hasattr(self.manager, 'settings') and self.manager.settings:
+            self.manager.settings.set('farm_finish_enabled', maxed)
+            if maxed and self.manager.settings.get('farm_finish_resources') not in ('gold_elixir', 'gold', 'elixir'):
+                self.manager.settings.set('farm_finish_resources', 'gold_elixir')
+        return verified
     def __init__(self, manager):
         self.manager = manager
         self.adb = manager.adb
@@ -1008,7 +1051,7 @@ class WallUpgrader:
             val = getattr(self.manager, '_wall_no_target_count', 0)
             no_target_count = (val if isinstance(val, int) else 0) + 1
             self.manager._wall_no_target_count = no_target_count
-            if no_target_count >= 3 and self.settings.get('wall_verify_layout_editor', False):
+            if no_target_count >= 3:
                 log(f'[Wall] Đã thử tìm tường {no_target_count} lần bị timeout/không thấy; kiểm tra xác minh qua Layout Editor...')
                 verified = self.verify_walls_via_layout_editor(log)
                 if isinstance(verified, dict):
@@ -1122,7 +1165,7 @@ class WallUpgrader:
             val = getattr(self.manager, '_wall_no_target_count', 0)
             no_target_count = (val if isinstance(val, int) else 0) + 1
             self.manager._wall_no_target_count = no_target_count
-            if no_target_count >= 3 and self.settings.get('wall_verify_layout_editor', False):
+            if no_target_count >= 3:
                 log(f'[Wall] Đã thử tìm tường {no_target_count} lần bình thường không thấy; kiểm tra xác minh qua Layout Editor (Chỉnh sửa làng)...')
                 verified = self.verify_walls_via_layout_editor(log)
                 if isinstance(verified, dict):

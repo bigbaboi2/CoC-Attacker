@@ -17,7 +17,9 @@ class ResourceCapacityReader:
         serial = self.village.settings.get('device_serial', '')
         has_account_store = isinstance(getattr(self.village, 'account_capacities', None), dict)
         screen = self.adb.screencap()
-        resolver = getattr(self.village, 'resolve_player_tag', None)
+        resolver = getattr(self.village, 'check_and_sync_account', None)
+        if not callable(resolver):
+            resolver = getattr(self.village, 'resolve_player_tag', None)
         acc_key = resolver(screen, log) if callable(resolver) else None
         if not acc_key:
             log('[Kho] Chưa xác minh được tài khoản; tạm hoãn đọc dung lượng.')

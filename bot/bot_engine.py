@@ -283,13 +283,9 @@ class BotEngine:
                 self.log(f"LỖI: Không thể kết nối tới {serial} sau nhiều lần thử. Kiểm tra MuMu và cổng ADB.")
             return False
 
-        screen=self.adb.screencap()
         if self.adb.device_unavailable is True:
             self.set_state('ADB_DISCONNECTED')
             self.log('[ADB] MuMu đã mất kết nối trong lúc khởi động.')
-            return False
-        if screen is None or screen.shape[:2] not in ((900,1600), (1600,900)):
-            self.log('Cần màn hình 1600×900 trước khi chạy bot.')
             return False
         self.log("Kết nối thành công! Tối ưu hóa MuMu Player...")
         self.optimizer.optimize_windows_priority()
@@ -306,7 +302,16 @@ class BotEngine:
             self.village.player_tag_failure = None
             self.village.player_tag_failures = 0
             self.village._session_player_tag = None
+            self.village._session_legacy_key = None
+            self.village._identity_verified_at = 0.0
             self.village._verified_header_key = None
+            self.village.current_account_key = None
+            self.village.walls_confirmed_maxed = False
+            self._startup_origin = None
+            self._startup_night_pass_done = False
+            self._night_layout_scan_done = False
+            self._startup_main_work_pending = False
+            self._main_scanned_account = None
             self.is_running = True
             self.is_paused = False
             self._action_failures = {}
@@ -322,7 +327,13 @@ class BotEngine:
                 builder.battle.army.verified_request = None
                 builder.consecutive_no_wall_count = 0
                 builder.walls_confirmed_maxed = False
+                builder.retry_after = 0
+                builder.next_maintenance = 0
+                builder.next_resource_scan = 0
                 builder.next_wall_check = 0
+                builder.next_building_check = 0
+                builder.next_cart_check = 0
+                builder.main_turn_until = 0
                 builder.all_upgrades_complete = False
                 builder.main_schedule_checked = False
                 builder.night_schedule_checked = False
@@ -522,6 +533,7 @@ class BotEngine:
         self.set_state(self.STATE_RECOVERY)
 
         self.optimizer.restart_game()
+        self.village._identity_verified_at = 0.0
 
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline:
@@ -530,6 +542,9 @@ class BotEngine:
             screen = self.adb.screencap()
             if screen is None:
                 continue
+            screen = self._ensure_game_resolution(screen)
+            if screen is None:
+                return False
 
             if self.screen_cb:
                 self.screen_cb(screen)
@@ -571,6 +586,9 @@ class BotEngine:
             self._checkpoint()
             screen = self.adb.screencap()
             if screen is not None:
+                screen = self._ensure_game_resolution(screen)
+                if screen is None:
+                    return False
                 if self.screen_cb:
                     self.screen_cb(screen)
                 if self._queue_screen_fault(screen):
@@ -609,17 +627,6 @@ class BotEngine:
                 return
         except Exception as exc:
             self.log(f'[Launch] Không kiểm tra được game: {exc}')
-
-        try:
-            screen = None if self.adb.device_unavailable else self.adb.screencap()
-        except BotStoppedError:
-            if not self.adb.device_unavailable:
-                return
-            screen = None
-        if screen is not None and screen.shape[:2] != (900, 1600):
-            self.log('Game cần màn hình 1600×900; kiểm tra độ phân giải trong tab Thiết bị.')
-            self.stop_bot()
-            return
 
         while self._is_current_worker():
             if self.is_paused:
@@ -660,6 +667,77 @@ class BotEngine:
 
             time.sleep(0.6)
 
+    def _ensure_game_resolution(self, screen):
+        if screen.shape[:2] == (900, 1600):
+            return screen
+        if not self.adb.is_coc_foreground():
+            return None
+
+        height, width = screen.shape[:2]
+        self.log(f'[MuMu] Ảnh hiện tại {width}×{height}. Đang tự chỉnh về 1600×900, 240 DPI.')
+        try:
+            self.optimizer.set_optimal_resolution()
+            for _ in range(8):
+                self._checkpoint()
+                time.sleep(.5)
+                screen = self.adb.screencap()
+                if screen is not None and screen.shape[:2] == (900, 1600):
+                    self.log('[MuMu] Đã xác nhận ảnh game 1600×900.')
+                    return screen
+        except BotStoppedError:
+            raise
+        except Exception as exc:
+            self.log(f'[MuMu] Không chỉnh được độ phân giải: {exc}')
+
+        if not self.adb.device_unavailable:
+            self.log('[MuMu] Chưa xác nhận được ảnh game 1600×900. Đã dừng bot.')
+            self.stop_bot()
+        return None
+
+    def _prepare_village_startup(self, screen):
+        """Bind the session to an account before either village can act."""
+        builder = getattr(self, 'builder', None)
+        night = builder is not None and builder.is_home(screen)
+        main = self.village.is_in_main_village(screen)
+        if not (night or main):
+            return True
+        if getattr(self, '_startup_origin', None) is None:
+            self._startup_origin = 'night' if night else 'main'
+            self._startup_main_work_pending = main and self.settings.get('main_village_enabled', True)
+        account = self.village.check_and_sync_account(screen, self.log)
+        if not account:
+            self.log('[Tài khoản] Chưa nhận diện được tài khoản; chờ màn hình làng ổn định.')
+            return False
+        if builder is not None:
+            builder.restore_builder_waits(self.log)
+        if night or not self.settings.get('main_village_enabled', True):
+            return True
+        if getattr(self, '_main_scanned_account', None) == account:
+            return True
+        self._startup_main_work_pending = True
+        worker = self.farm_finish.suggested_upgrader()
+        first = worker.observe_home_builders(screen)
+        second = worker.observe_home_builders(self.adb.screencap()) if type(first) is int else None
+        if type(first) is int and first == second:
+            self.log(f'[Thợ] Đầu lượt làng chính có {first} thợ rảnh.')
+            if builder is not None:
+                builder.main_schedule_checked = True
+                if first == 0:
+                    seconds = worker.get_shortest_ongoing_builder_seconds()
+                    builder.main_builders_wait_until = time.monotonic() + (seconds + 10 if type(seconds) is int and seconds > 0 else 300)
+                else:
+                    builder.main_builders_wait_until = 0
+                builder.remember_builder_waits()
+        else:
+            self.log('[Thợ] Chưa đọc ổn định số thợ làng chính; sẽ kiểm tra lại.')
+        self.log('[Wall] Quét tường đầu phiên qua Layout Editor.')
+        result = self.village.verify_walls(self.log)
+        if result is None:
+            self.log('[Wall] Quét chưa thành công; hoãn công việc làng chính và thử lại lượt sau.')
+            return False
+        self._main_scanned_account = account
+        return True
+
     def _iteration(self):
         if not self.settings.get("main_village_enabled", True) and not self.settings.get("builder_base_enabled", False):
             self.set_state(self.STATE_IDLE)
@@ -678,6 +756,12 @@ class BotEngine:
             self._action_outcome('Chụp màn hình MuMu', False, inspect=False)
             return
         self._action_outcome('Chụp màn hình MuMu', True)
+        if screen.shape[:2] != (900, 1600):
+            screen = self._ensure_game_resolution(screen)
+            if screen is None:
+                if self._is_current_worker() and not self.adb.device_unavailable:
+                    self._open_game_if_needed()
+                return
 
         if self.screen_cb:
             self.screen_cb(screen)
@@ -687,6 +771,9 @@ class BotEngine:
 
         if self.village.dismiss_notification_prompt(screen):
             self.log('[Bot] Đã đóng thông báo Star Bonus.')
+            return
+
+        if not self._prepare_village_startup(screen):
             return
 
         if self._handle_builder_base(screen):
@@ -783,10 +870,14 @@ class BotEngine:
                     self.log(f'[Thợ] Đã đọc {builders} thợ thường rảnh từ cùng ảnh làng.')
 
             if self._farm_finish_gate(screen):
+                self._startup_main_work_pending = False
                 return
 
             # Thực hiện chu trình chăm sóc làng (Luyện quân, Thu hoạch, Nâng tường)
             self._run_village_maintenance()
+            if getattr(self, '_startup_main_work_pending', False):
+                self._startup_main_work_pending = False
+                self._defer_battle_after_maintenance = True
             if getattr(self, '_defer_battle_after_maintenance', False):
                 self._force_builder_maintenance = True
                 return
@@ -831,6 +922,9 @@ class BotEngine:
         builder = getattr(self, "builder", None)
         if builder is None:
             return False
+        if (getattr(self, '_startup_main_work_pending', False)
+                and self.village.is_in_main_village(screen)):
+            return False
         bh_failures = getattr(getattr(builder, "battle", None), "find_now_failures", 0)
         if isinstance(bh_failures, (int, float)) and bh_failures >= 3:
             self.log("[BH] Làng đêm bị kẹt liên tiếp (Find Now không phản hồi 3 lần). Khởi động lại game...")
@@ -872,7 +966,40 @@ class BotEngine:
                 village.check_and_sync_account(screen, self.log)
             if callable(getattr(builder, 'restore_builder_waits', None)):
                 builder.restore_builder_waits(self.log)
-            builder.run_cycle(screen, self.log)
+            if not getattr(self, '_night_layout_scan_done', False):
+                scan = getattr(builder, 'scan_initial_layout_walls', None)
+                if callable(scan):
+                    self.log('[BH] Đang quét tường Stage 1 qua Layout Editor.')
+                    scan(self.log)
+                    if not builder.is_home(self.adb.screencap()):
+                        self.log('[BH] Chưa về được làng sau khi quét; dừng bot để kiểm tra.')
+                        self.stop_bot()
+                        return True
+                self._night_layout_scan_done = True
+            first_night = (getattr(self, '_startup_origin', None) == 'night'
+                           and not getattr(self, '_startup_night_pass_done', False))
+            if first_night:
+                builder.next_wall_check = 0
+                builder.next_building_check = 0
+                builder.next_maintenance = 0
+                builder.walls_confirmed_maxed = False
+            if not (getattr(self, '_startup_night_pass_done', False)
+                    and self.settings.get('main_village_enabled', True)
+                    and getattr(self, '_main_scanned_account', None) is None):
+                builder.run_cycle(screen, self.log, first_pass=first_night)
+                if callable(getattr(builder, 'remember_builder_waits', None)):
+                    builder.remember_builder_waits()
+            if first_night:
+                self._startup_night_pass_done = True
+            if (getattr(self, '_startup_origin', None) == 'night'
+                    and self._startup_night_pass_done
+                    and self.settings.get('main_village_enabled', True)
+                    and getattr(self, '_main_scanned_account', None) is None
+                    and not builder.battle.in_progress):
+                if builder.leave(self.adb.screencap()):
+                    builder.active = False
+                    self.set_state(self.STATE_VILLAGE)
+                return True
             if self._service_cross_village_sleep():
                 return True
             main_waiting = time.monotonic() < getattr(builder, 'main_builders_wait_until', 0)
@@ -1071,6 +1198,10 @@ class BotEngine:
         if home:
             if self.settings.get("main_village_enabled", True) and self._maybe_periodic_restart():
                 return True
+            if FarmFinishController.enabled(self.settings) and self.settings.get('auto_collect', True):
+                screen = self.adb.screencap()
+                if screen is not None and self.village.is_in_main_village(screen):
+                    self.village.collect_resources(screen, log_callback=self.log)
             self._run_village_maintenance(force=True)
             return True
         self.log('[Village] Chưa xác nhận về làng; hoãn bảo trì.')
@@ -1134,7 +1265,7 @@ class BotEngine:
         final_screen = self.adb.screencap()
         return self.village.is_in_main_village(final_screen) if final_screen is not None else False
 
-    def _sleep_wait_for_builders(self, wait_seconds: int) -> bool:
+    def _sleep_wait_for_builders(self, wait_seconds: int, target_village='main') -> bool:
         """Close CoC, sleep until builder is free, with live countdown and clean stop responsiveness."""
         from datetime import datetime, timezone, timedelta
 
@@ -1190,16 +1321,37 @@ class BotEngine:
         self.set_state(self.STATE_RECOVERY)
         try:
             self.optimizer.restart_game()
+            self.village._identity_verified_at = 0.0
         except Exception as e:
             self.log(f"[Hệ thống] Khởi động game CoC gặp lỗi: {e}")
             return False
 
-        if self.settings.get("main_village_enabled", True):
-            self.log("[Hệ thống] Đang xác nhận màn hình Làng chính sau khi thức dậy...")
-            recovered = self._ensure_main_village()
-            if not recovered:
-                self.log("[Hệ thống] Chưa vào được Làng chính; chuyển sang chu trình khôi phục.")
-                self.restart_game_and_recover(force=True)
+        deadline = time.monotonic() + 40
+        recovered = False
+        while self._is_current_worker() and time.monotonic() < deadline:
+            self._checkpoint()
+            frame = self.adb.screencap()
+            if frame is None:
+                time.sleep(1)
+                continue
+            frame = self._ensure_game_resolution(frame)
+            if frame is None:
+                return False
+            main = self.village.is_in_main_village(frame)
+            night = self.builder.is_home(frame) if getattr(self, 'builder', None) else False
+            if target_village == 'builder':
+                recovered = night or (main and self.builder.enter(frame))
+            else:
+                recovered = main or (night and self.builder.leave(frame))
+            if recovered:
+                self.log(f'[Hệ thống] Đã tới {"làng đêm" if target_village == "builder" else "làng chính"} sau khi thức dậy.')
+                break
+            self.village.close_popups_and_dialogs(frame)
+            time.sleep(1)
+        if not recovered:
+            self.log('[Hệ thống] Chưa tới được làng có thợ rảnh; chuyển sang chu trình khôi phục.')
+            self.restart_game_and_recover(force=True)
+            return False
 
         return True
 
@@ -1227,11 +1379,13 @@ class BotEngine:
             night_rem = int(night_wait - now)
             shortest_sec = min(main_rem, night_rem)
             if shortest_sec >= 15:
-                next_village = 'builder' if night_rem < main_rem else 'main'
+                current = self.adb.screencap()
+                here_night = self.builder.is_home(current) if current is not None else False
+                next_village = 'builder' if night_rem < main_rem or (night_rem == main_rem and here_night) else 'main'
                 self.log(f"💤 [Kế hoạch] Cả Làng chính (còn {main_rem//60}m) và Làng đêm (còn {night_rem//60}m) đều hết thợ rảnh.")
                 target_str = "Làng đêm" if next_village == 'builder' else "Làng chính"
                 self.log(f"💤 [Kế hoạch] Tạm đóng game nghỉ ngơi, thức dậy sau {shortest_sec//60} phút để xử lý {target_str}.")
-                slept = self._sleep_wait_for_builders(shortest_sec)
+                slept = self._sleep_wait_for_builders(shortest_sec, next_village)
                 if slept:
                     if next_village == 'builder':
                         builder.night_builders_wait_until = 0
@@ -1246,7 +1400,7 @@ class BotEngine:
             night_rem = int(night_wait - now)
             if night_rem >= 15:
                 self.log(f"💤 [Kế hoạch] Làng đêm hết thợ rảnh (thợ gần nhất còn {night_rem//60} phút).")
-                slept = self._sleep_wait_for_builders(night_rem)
+                slept = self._sleep_wait_for_builders(night_rem, 'builder')
                 if slept:
                     builder.night_builders_wait_until = 0
                     return True
@@ -1267,7 +1421,8 @@ class BotEngine:
         if controller is None:
             controller = self.farm_finish = FarmFinishController(self.village)
         action = controller.observe_home(self.settings, screen, self.log)
-        if getattr(self.village, 'player_tag_failures', 0) >= 3:
+        if (getattr(self.village, 'player_tag_failures', 0) >= 3
+                and not getattr(self.village, '_session_legacy_key', None)):
             reason = getattr(self.village, 'player_tag_failure', None) or 'Không xác minh được mã người chơi'
             self.village.player_tag_failures = 0
             self.log(f'[Tài khoản] {reason} sau 3 lần và thử Share/Copy; tạm dừng để kiểm tra clipboard giả lập.')
@@ -1580,6 +1735,9 @@ class BotEngine:
 
     def _service_optional_upgrades(self, fresh):
         self._upgrade_resource_hold = False
+        builder = getattr(self, 'builder', None)
+        if builder is not None and builder.is_home(fresh):
+            return dict(status='blocked', reason='Đang ở làng đêm; chờ về làng chính để kiểm tra nâng quân và công trình.')
         # Research has first claim on shared elixir; construction and walls
         # must not consume it while the selected research target is pending.
         worker = self.farm_finish.suggested_upgrader()

@@ -209,6 +209,13 @@ class ArmyUpgrader:
     def step(self):
         w = self.w
         w.deadline = time.monotonic() + 60
+        try:
+            return self._step()
+        finally:
+            w.deadline = 0
+
+    def _step(self):
+        w = self.w
         if self.pending:
             return self.reconcile_pending()
         if not any(self.village.settings.get('army_upgrade_resources', {}).get(k, True) for k in ('elixir', 'dark_elixir')) or not any(self.village.settings.get('army_upgrade_types', {}).get(k, True) for k in ('troops', 'spells', 'siege')):

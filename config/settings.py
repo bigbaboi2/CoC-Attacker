@@ -295,7 +295,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "heroes": True,
     },
     "building_upgrade_whitelist": dict(DEFAULT_BUILDING_WHITELIST),
-    "wall_verify_layout_editor": True,
     "wall_max_upgrades_per_cycle": 5,
     "wall_upgrade_max_by_money": False,
     "wall_quantity_button_mode": "ocr",  # ocr (existing recognition), fixed
@@ -355,6 +354,7 @@ class BotSettings:
                         )
                     saved.pop("builder_base_only", None)
                     saved.pop("builder_base_battle", None)
+                    saved.pop("wall_verify_layout_editor", None)
                     self.data.update(saved)
             except Exception as e:
                 print(f"[Settings] Warning loading settings: {e}")

@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import subprocess
@@ -79,7 +80,6 @@ class MuMuOptimizer:
         Tune Android system settings inside the emulator for maximum bot speed:
         - Disable UI animations (0.0x scale -> instant page transitions)
         - Prevent screen sleep
-        - Fix orientation to Landscape (Rotation 90)
         """
         actions = []
         try:
@@ -126,8 +126,14 @@ class MuMuOptimizer:
         }
 
     def set_optimal_resolution(self):
-        """Set emulator resolution to 1600x900 and density to 240."""
-        self.adb.shell("wm size 1600x900")
+        """Set the base size in the emulator's natural orientation."""
+        physical_size = re.search(r"Physical size:\s*(\d+)x(\d+)", self.adb.shell("wm size"))
+        if physical_size is None:
+            raise RuntimeError("Không đọc được kích thước gốc của MuMu qua ADB.")
+        width, height = map(int, physical_size.groups())
+        # Android rotates the base display when Clash of Clans requests landscape.
+        size = "900x1600" if height > width else "1600x900"
+        self.adb.shell(f"wm size {size}")
         self.adb.shell("wm density 240")
 
     def ensure_coc_running(self) -> bool:

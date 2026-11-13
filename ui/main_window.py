@@ -1037,14 +1037,6 @@ class MainWindow(QMainWindow):
         self.chk_wall_hold.toggled.connect(lambda enabled: self.settings.set('wall_hold_enabled', enabled))
         self.chk_wall_hold.setToolTip('Khi nâng lỗi và tài nguyên đạt 125% ngưỡng nâng: ngừng tìm trận, thử lại mỗi 30 giây. Chạy tiếp sau 2 lần đọc dưới 110%. Đây không phải phần trăm dung lượng kho.')
         form_wall.addRow(self.chk_wall_hold)
-        self.chk_wall_verify_layout = QCheckBox('Xác minh Max tường qua Layout Editor (Remove All) khi không thấy tường')
-        self.chk_wall_verify_layout.setChecked(self.settings.get('wall_verify_layout_editor', True))
-        self.chk_wall_verify_layout.setToolTip(
-            'Dùng tọa độ cố định mở Layout Editor -> Edit layout -> Remove All để quét nhanh các thẻ tường đầu tiên ở thanh dưới, '
-            'kiểm tra xem tường đã đồng cấp tối đa hay còn sót tường cấp thấp, rồi bấm Cancel thoát an toàn.'
-        )
-        self.chk_wall_verify_layout.toggled.connect(lambda enabled: self.settings.set('wall_verify_layout_editor', enabled))
-        form_wall.addRow(self.chk_wall_verify_layout)
         self.chk_farm_finish = QCheckBox('Tường đã tối đa: dùng hết thợ → cày full kho → dừng tool')
         self.chk_farm_finish.setChecked(self.settings.get('farm_finish_enabled', False))
         self.chk_farm_finish.setToolTip('Bật khi tường đã tối đa: tự động dùng hết số thợ rảnh để nâng công trình (duy trì 0 thợ), sau đó farm cày full 100% kho tài nguyên (vàng/dầu) rồi mới dừng tool.')
@@ -1570,6 +1562,7 @@ class MainWindow(QMainWindow):
             self.settings.get('builder_base_wall_trigger', 'either'))))
         self.combo_builder_wall_trigger.setToolTip(
             'Điều kiện được kiểm tra trước khi mở bảng thợ. Chế độ chỉ vàng hoặc chỉ dầu cũng chỉ dùng loại đó. '
+            'Sau khi mở lượt, tiếp tục dùng loại còn đạt ngưỡng. '
             'Tường dưới cấp 6 chỉ nâng bằng vàng. Nếu chỉ dầu đạt điều kiện, tool tìm tường cấp 6 trở lên.')
         self.combo_builder_wall_trigger.currentIndexChanged.connect(
             lambda _: self.settings.set('builder_base_wall_trigger', self.combo_builder_wall_trigger.currentData()))
@@ -1583,7 +1576,7 @@ class MainWindow(QMainWindow):
             threshold.setSingleStep(500000)
             threshold.setGroupSeparatorShown(True)
             threshold.setValue(self.settings.get(key, 0))
-            threshold.setToolTip("Ngưỡng mở lượt nâng tường làng đêm. Xét vàng và dầu riêng, rồi dùng tài nguyên đạt ngưỡng đến khi không đủ giá nâng.")
+            threshold.setToolTip("Xét ngưỡng khi bắt đầu và sau mỗi lần nâng. Tài nguyên còn đạt ngưỡng có thể tiếp tục được sử dụng.")
             threshold.valueChanged.connect(lambda value, option=key: self.settings.set(option, value))
             wall_enabled = tasks["builder_base_upgrade_walls"]
             threshold.setEnabled(wall_enabled.isChecked())
@@ -2288,8 +2281,6 @@ class MainWindow(QMainWindow):
         self.combo_wall_quantity_mode.setCurrentIndex(1 if DEFAULT_CONFIG["wall_quantity_button_mode"] == 'fixed' else 0)
         self.spin_wall_fixed_gap.setValue(DEFAULT_CONFIG["wall_quantity_fixed_gap_ms"])
         self.chk_wall_hold.setChecked(DEFAULT_CONFIG["wall_hold_enabled"])
-        if hasattr(self, 'chk_wall_verify_layout'):
-            self.chk_wall_verify_layout.setChecked(DEFAULT_CONFIG["wall_verify_layout_editor"])
         self.chk_farm_finish.setChecked(DEFAULT_CONFIG["farm_finish_enabled"])
         if hasattr(self, 'chk_farm_finish_close'):
             self.chk_farm_finish_close.setChecked(DEFAULT_CONFIG.get("farm_finish_close_app", False))
@@ -2301,7 +2292,7 @@ class MainWindow(QMainWindow):
         for k in ("auto_upgrade_walls", "wall_resource", "min_gold_to_upgrade_wall",
                   "min_elixir_to_upgrade_wall", "wall_max_upgrades_per_cycle", "wall_upgrade_max_by_money",
                   "wall_quantity_button_mode", "wall_quantity_fixed_gap_ms", "wall_hold_enabled",
-                  "wall_verify_layout_editor", "farm_finish_enabled", "farm_finish_target_percent", "farm_finish_resources"):
+                  "farm_finish_enabled", "farm_finish_target_percent", "farm_finish_resources"):
             self.settings.set(k, DEFAULT_CONFIG[k])
         self.statusBar().showMessage("Đã đặt lại mặc định: Nâng tường", 3000)
 
@@ -2746,8 +2737,6 @@ class MainWindow(QMainWindow):
             self.spin_wall_fixed_gap.setValue(self.settings.get("wall_quantity_fixed_gap_ms", 120))
         if hasattr(self, 'chk_wall_hold'):
             self.chk_wall_hold.setChecked(self.settings.get("wall_hold_enabled", True))
-        if hasattr(self, 'chk_wall_verify_layout'):
-            self.chk_wall_verify_layout.setChecked(self.settings.get("wall_verify_layout_editor", True))
         if hasattr(self, 'chk_farm_finish'):
             self.chk_farm_finish.setChecked(self.settings.get("farm_finish_enabled", False))
         if hasattr(self, 'chk_farm_finish_close'):

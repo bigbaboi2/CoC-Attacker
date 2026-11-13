@@ -61,6 +61,8 @@ class VillageManager:
         self.current_account_key = None
         self._verified_header_key = None
         self._session_player_tag = None
+        self._session_legacy_key = None
+        self._identity_verified_at = 0.0
         self.player_tag_failure = None
         self.player_tag_failures = 0
         config_path = getattr(settings, 'filepath', None)
@@ -139,9 +141,9 @@ class VillageManager:
         return None
 
     def get_account_capacities(self, resources, acc_key: Optional[str] = None) -> Optional[Dict[str, int]]:
-        """Only trust directly measured storage values bound to a player tag."""
+        """Use measured storage values bound to the current session identity."""
         key = acc_key or self.current_account_key
-        if not isinstance(key, str) or not re.fullmatch(r'#[0289PYLQGRJCUV]{3,15}', key):
+        if not isinstance(key, str) or key not in (getattr(self, '_session_player_tag', None), getattr(self, '_session_legacy_key', None)):
             return None
         saved = self.account_capacities.get(key)
         if (isinstance(saved, dict) and saved.get('source') == 'popup_ocr'
@@ -152,7 +154,7 @@ class VillageManager:
     def save_account_capacities(self, values: Dict[str, int], acc_key: Optional[str] = None,
                                 th_level: Optional[int] = None, source: str = 'popup_ocr'):
         key = acc_key or self.current_account_key
-        if not isinstance(key, str) or not re.fullmatch(r'#[0289PYLQGRJCUV]{3,15}', key):
+        if not isinstance(key, str) or key not in (getattr(self, '_session_player_tag', None), getattr(self, '_session_legacy_key', None)):
             return
         if not isinstance(values, dict) or source != 'popup_ocr':
             return
@@ -363,9 +365,8 @@ class VillageManager:
         self.player_tag_failure = None
         self.player_tag_failures = 0
         if tag != self.current_account_key:
-            self.current_account_key = tag
-            self.walls_confirmed_maxed = bool(self.verified_maxed_accounts.get(tag))
-            self._lowest_wall_target = None
+            self._merge_legacy_account(header_key, tag, log)
+            self._activate_account(tag)
             if log:
                 log(f'[Tài khoản] Đã xác minh mã người chơi {tag}.')
         self._verified_header_key = header_key
@@ -374,11 +375,112 @@ class VillageManager:
             log(f'[Tài khoản] Đã kiểm tra mã {tag}; tiếp tục tại làng hiện tại.')
         return tag
 
+    @staticmethod
+    def _same_account_data(left, right):
+        """Compare known values, ignoring observation timestamps and expired jobs."""
+        if not isinstance(left, dict) or not isinstance(right, dict):
+            return left == right
+        ignored = {'updated_at', 'verified_at', 'saved_at', 'next_free_in_sec'}
+        for key in set(left) & set(right) - ignored:
+            if key == 'jobs':
+                def active(jobs):
+                    now = time.time()
+                    return sorted((job.get('name'), round(float(job.get('finish_at', 0)) / 60))
+                                  for job in jobs if isinstance(job, dict)
+                                  and float(job.get('finish_at', 0)) > now)
+                if active(left[key]) != active(right[key]):
+                    return False
+            elif left[key] != right[key]:
+                return False
+        return True
+
+    def _merge_legacy_account(self, legacy, tag, log=None):
+        if not legacy or legacy == tag:
+            return
+        stores = tuple(store for store in (
+            getattr(self, 'verified_maxed_accounts', None),
+            getattr(self, 'account_capacities', None),
+            getattr(self, 'account_builder_timers', None)) if isinstance(store, dict))
+        v_state = getattr(self, 'village_state', None)
+        has_live_state = (v_state is not None and
+                          (getattr(v_state, 'account_key', None) == legacy or
+                           legacy in getattr(v_state, 'account_caches', {})))
+        if not any(legacy in store for store in stores) and not has_live_state:
+            return
+        if any(legacy in store and tag in store
+               and not self._same_account_data(store[legacy], store[tag]) for store in stores):
+            if log:
+                log(f'[Tài khoản] Dữ liệu {legacy} khác {tag}; giữ riêng, ưu tiên mã người chơi.')
+            return
+        if v_state is not None and hasattr(v_state, 'merge_account_cache'):
+            if not v_state.merge_account_cache(legacy, tag):
+                if log:
+                    log(f'[Tài khoản] Dữ liệu làng {legacy} khác {tag}; giữ riêng.')
+                return
+        for store in stores:
+            if legacy in store:
+                if tag in store and isinstance(store[tag], dict) and isinstance(store[legacy], dict):
+                    store[tag] = {**store[legacy], **store[tag]}
+                else:
+                    store.setdefault(tag, store[legacy])
+                del store[legacy]
+        if log:
+            log(f'[Tài khoản] Đã gộp dữ liệu {legacy} vào {tag}.')
+
+    def _activate_account(self, key):
+        if key == self.current_account_key:
+            v_state = getattr(self, 'village_state', None)
+            if v_state is not None and hasattr(v_state, 'set_account'):
+                v_state.set_account(key)
+            return
+        self.current_account_key = key
+        self.walls_confirmed_maxed = bool(self.verified_maxed_accounts.get(key))
+        self._lowest_wall_target = None
+        self._wall_builder_retry_at = 0
+        v_state = getattr(self, 'village_state', None)
+        if v_state is not None:
+            if hasattr(v_state, 'set_account'):
+                v_state.set_account(key)
+            info = self.verified_maxed_accounts.get(key)
+            th_level = info.get('th_level') if isinstance(info, dict) else None
+            v_state.record_walls_maxed(self.walls_confirmed_maxed, th_level)
+
+    def establish_account(self, screen, log=None):
+        """Resolve identity before account-dependent work, with three fresh profile opens."""
+        if self._session_player_tag:
+            return self._session_player_tag
+        if getattr(self, '_session_legacy_key', None):
+            return self._session_legacy_key
+        validator = getattr(self, 'is_valid_village_screen', None) or getattr(self, 'is_in_main_village', None)
+        if screen is None or (callable(validator) and not validator(screen)):
+            return None
+        header = self.vision.read_player_profile_header(screen)
+        legacy = header.get('account_key') if header else None
+        for attempt in range(3):
+            tag = self.resolve_player_tag(screen if attempt == 0 else self.adb.screencap(), log)
+            if tag:
+                self._identity_verified_at = time.monotonic()
+                return tag
+            if log and attempt < 2:
+                log(f'[Tài khoản] Đóng và mở lại My Profile, thử lần {attempt + 2}/3.')
+        if legacy:
+            self._session_legacy_key = legacy
+            self._verified_header_key = legacy
+            self._identity_verified_at = time.monotonic()
+            self._activate_account(legacy)
+            self.set_wall_wait(self._wall_builder_retry_at, self.wall_status)
+            if log:
+                log(f'[Tài khoản] Chưa đọc được #tag sau 3 lần; tạm đọc và ghi theo tên + cấp: {legacy}.')
+            return legacy
+        if log:
+            log('[Tài khoản] Không đọc được #tag hoặc tên + cấp; hoãn tác vụ phụ thuộc tài khoản.')
+        return None
+
     def save_account_builder_timers(self, jobs: list, acc_key: Optional[str] = None):
         """Lưu danh sách tiến trình thợ đang xây và thời điểm thợ rảnh gần nhất theo từng tài khoản."""
-        acc_key = acc_key if isinstance(acc_key, str) and acc_key else (
-            self.current_account_key if isinstance(self.current_account_key, str) and self.current_account_key else 'default'
-        )
+        acc_key = acc_key if isinstance(acc_key, str) and acc_key else self.current_account_key
+        if not acc_key:
+            return
         now = time.time()
         normalized_jobs = []
         for job in (jobs or []):
@@ -416,9 +518,9 @@ class VillageManager:
         """Ghi nhận thêm một thợ vừa bắt đầu nâng cấp công trình mới vào lịch thợ của tài khoản."""
         if not isinstance(duration_sec, int) or duration_sec <= 0:
             return
-        acc_key = acc_key if isinstance(acc_key, str) and acc_key else (
-            self.current_account_key if isinstance(self.current_account_key, str) and self.current_account_key else 'default'
-        )
+        acc_key = acc_key if isinstance(acc_key, str) and acc_key else self.current_account_key
+        if not acc_key:
+            return
         now = time.time()
         existing = []
         cur = self.account_builder_timers.get(acc_key)
@@ -441,9 +543,9 @@ class VillageManager:
 
     def get_account_shortest_builder_seconds(self, acc_key: Optional[str] = None) -> Optional[int]:
         """Lấy số giây còn lại của thợ xây hoàn thành sớm nhất đã lưu cho tài khoản."""
-        acc_key = acc_key if isinstance(acc_key, str) and acc_key else (
-            self.current_account_key if isinstance(self.current_account_key, str) and self.current_account_key else 'default'
-        )
+        acc_key = acc_key if isinstance(acc_key, str) and acc_key else self.current_account_key
+        if not acc_key:
+            return None
         entry = self.account_builder_timers.get(acc_key)
         if not isinstance(entry, dict):
             return None
@@ -463,59 +565,13 @@ class VillageManager:
         self.set_wall_wait(0, 'Sẽ kiểm tra lại thợ ở lượt về làng kế tiếp.')
 
     def check_and_sync_account(self, screen, log=None):
-        """Check top-left player profile. If switched account, sync maxed status accordingly."""
-        validator = getattr(self, 'is_valid_village_screen', getattr(self, 'is_in_main_village', None))
+        """Keep account state bound to the identity established for this session."""
+        validator = getattr(self, 'is_valid_village_screen', None) or getattr(self, 'is_in_main_village', None)
         if screen is None or (callable(validator) and not validator(screen)):
-            return self.current_account_key
-        prof = self.vision.read_player_profile_header(screen)
-        if not prof:
-            return self.current_account_key
-        acc_key = prof['account_key']
-        if self._session_player_tag:
-            return self._session_player_tag
-        if (isinstance(self.current_account_key, str) and self.current_account_key.startswith('#')
-                and self._verified_header_key == acc_key):
-            return self.current_account_key
-        if acc_key != self.current_account_key:
-            prev = self.current_account_key
-            self.current_account_key = acc_key
-            v_info = self.verified_maxed_accounts.get(acc_key)
-            is_max = bool(v_info)
-            th_lvl = v_info.get('th_level') if isinstance(v_info, dict) else None
-            self.walls_confirmed_maxed = is_max
-            v_state = getattr(self, 'village_state', None)
-            if v_state is not None:
-                v_state.record_walls_maxed(is_max, th_lvl)
-            if isinstance(th_lvl, int) and th_lvl in self.TH_MAX_STORAGE_CAPACITIES and acc_key not in self.account_capacities:
-                self.account_capacities[acc_key] = dict(
-                    self.TH_MAX_STORAGE_CAPACITIES[th_lvl],
-                    th_level=th_lvl,
-                    source='th_verified',
-                    updated_at=time.time(),
-                )
-            wall_enabled = bool(self.settings.get('auto_upgrade_walls', True)) if self.settings else True
-            if log:
-                th_str = f", TH{th_lvl}" if th_lvl else ""
-                log(f"[Tài khoản] Đã nhận diện: {prof['name']} (Cấp {prof['level']}{th_str}).")
-                if is_max:
-                    log(f"[Tài khoản] Tài khoản {prof['name']} ĐÃ XÁC MINH MAX TƯỜNG ✅.")
-                elif not wall_enabled:
-                    log(f"[Tài khoản] Tài khoản {prof['name']}: Tự động nâng tường đang TẮT trong cài đặt.")
-                else:
-                    log(f"[Tài khoản] Tài khoản {prof['name']} CHƯA xác minh Max tường; sẽ nâng tường bình thường.")
-                caps = self.get_account_capacities(('gold', 'elixir'), acc_key=acc_key)
-                if caps:
-                    log(f"[Tài khoản] Dung lượng kho {prof['name']}: Vàng {caps['gold']:,} | Dầu {caps['elixir']:,} (bỏ qua quét chạm).")
-                shortest = self.get_account_shortest_builder_seconds(acc_key=acc_key)
-                if shortest:
-                    sh_h, sh_rem = divmod(shortest, 3600)
-                    sh_m, sh_s = divmod(sh_rem, 60)
-                    sh_str = f"{sh_h}h {sh_m}m {sh_s}s" if sh_h > 0 else f"{sh_m}m {sh_s}s"
-                    log(f"[Tài khoản] Lịch thợ xây đã lưu của {prof['name']}: thợ gần nhất còn {sh_str}.")
-            if self.settings:
-                self.settings.set('farm_finish_enabled', is_max)
-            self.set_wall_wait(self._wall_builder_retry_at, self.wall_status)
-        return acc_key
+            return None
+        if self._session_player_tag or getattr(self, '_session_legacy_key', None):
+            return self._session_player_tag or self._session_legacy_key
+        return self.establish_account(screen, log)
 
     def verify_walls(self, log_callback=None):
         from bot.walls import WallUpgrader
@@ -556,6 +612,9 @@ class VillageManager:
     def is_in_main_village(self, screen: np.ndarray) -> bool:
         """Verify if player is on the main village screen."""
         if screen is None:
+            return False
+        builder = getattr(self, 'builder', None)
+        if builder is not None and (builder.night_palette(screen) or builder.is_home(screen)):
             return False
         return self.vision.is_in_main_village(screen)
 
