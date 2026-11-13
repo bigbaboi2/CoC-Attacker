@@ -8,6 +8,21 @@ from bot.walls import WallUpgrader
 from collections import OrderedDict
 
 class BuilderWallQuantityTests(unittest.TestCase):
+    def test_uncertain_multi_selection_can_return_to_verified_single_wall(self):
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.adb = SimpleNamespace(keyevent=Mock(), screencap=Mock(return_value=frame))
+        base.is_home = Mock(return_value=True)
+        base.walls = SimpleNamespace(level=Mock(return_value=4))
+        base.wall_offer = Mock(side_effect=lambda _, resource:
+                               ((600, 700), 150000) if resource == 'gold' else None)
+        logs = []
+        self.assertIs(base.single_wall_after_quantity_failure(4, {'cost': 150000}, logs.append), frame)
+        base.adb.keyevent.assert_called_once_with(4)
+        self.assertTrue(any('một đoạn' in line for line in logs))
+        base.wall_offer = Mock(return_value=((600, 700), 300000))
+        self.assertIsNone(base.single_wall_after_quantity_failure(4, {'cost': 150000}, logs.append))
+
     def test_builder_layout_counts_small_wall_groups(self):
         wall = WallUpgrader.__new__(WallUpgrader)
         wall.ocr_positions = Mock(return_value=[

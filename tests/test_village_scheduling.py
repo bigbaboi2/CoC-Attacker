@@ -4,12 +4,46 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
+import numpy as np
 from bot.builder_base import BuilderBaseManager
 from bot.bot_engine import BotEngine
 from bot.farm_finish import FarmFinishController
 from bot.walls import WallUpgrader
+from core.vision import VisionEngine
 
 class VillageSchedulingTests(unittest.TestCase):
+    def test_network_fault_keeps_short_message_for_recovery_log(self):
+        vision = VisionEngine.__new__(VisionEngine)
+        vision._get_ocr = Mock(return_value=Mock(return_value=SimpleNamespace(
+            txts=['Connection lost', 'Please reload game'])))
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        self.assertEqual(vision.game_fault(frame), 'network')
+        self.assertIn('connection lost', vision.last_game_fault_message)
+        fake = SimpleNamespace(vision=vision, _pending_recovery=None,
+                               _request_recovery=Mock(), log=Mock())
+        with patch('bot.bot_engine.cv2.imwrite', return_value=True):
+            self.assertTrue(BotEngine._queue_screen_fault(fake, frame))
+        self.assertTrue(any('connection lost' in call.args[0] for call in fake.log.call_args_list))
+
+    def test_recovery_accepts_builder_base_home_after_restart(self):
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        builder = SimpleNamespace(is_home=Mock(return_value=True), deselect=Mock())
+        fake = SimpleNamespace(
+            settings={'auto_restart_game': True}, optimizer=SimpleNamespace(restart_game=Mock()),
+            village=SimpleNamespace(_identity_verified_at=1.0,
+                                    is_in_main_village=Mock(return_value=False),
+                                    close_popups_and_dialogs=Mock()),
+            builder=builder, adb=SimpleNamespace(screencap=Mock(return_value=frame)),
+            vision=SimpleNamespace(game_fault=Mock(return_value=None)),
+            screen_cb=None, STATE_RECOVERY='RECOVERY', STATE_BUILDER='BUILDER_BASE',
+            log=Mock(), set_state=Mock(), _checkpoint=Mock(),
+            _ensure_game_resolution=Mock(return_value=frame), _reset_restart_timer=Mock())
+        with patch('bot.bot_engine.time.sleep'):
+            self.assertTrue(BotEngine.restart_game_and_recover(fake))
+        fake.set_state.assert_any_call('BUILDER_BASE')
+        builder.deselect.assert_called_once()
+        fake.village.close_popups_and_dialogs.assert_not_called()
+
     def test_builder_waits_restore_only_unexpired_verified_account(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

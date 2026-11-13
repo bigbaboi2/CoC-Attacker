@@ -274,6 +274,7 @@ class VisionEngine:
 
     def game_fault(self, screen):
         """Classify blocking messages from the central game dialog."""
+        self.last_game_fault_message = None
         if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
             return None
         ocr = self._get_ocr()
@@ -286,8 +287,10 @@ class VisionEngine:
         message = ' '.join(getattr(result, 'txts', None) or ()).lower()
         message = ' '.join(message.split())
         if re.search(r'\b(?:captcha|robot check|(?:not a|are you a|i am a) robot|verify (?:that )?you are human|human verification)\b', message):
+            self.last_game_fault_message = message[:180]
             return 'robot'
         if re.search(r'\b(?:connection (?:lost|error|failed|interrupted)|(?:lost|no|check your) (?:internet |network )?connection|(?:unable|failed|could not) to connect|disconnected|network error|reload game|server (?:error|unavailable)|out of sync)\b', message):
+            self.last_game_fault_message = message[:180]
             return 'network'
         return None
 

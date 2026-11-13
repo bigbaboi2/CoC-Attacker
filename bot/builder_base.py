@@ -290,17 +290,22 @@ class BuilderBaseManager:
         return self.wait_for(self.is_main, 15) is not None
 
     def scan_initial_layout_walls(self, log):
-        """Read Stage 1 wall inventory and discard the temporary layout edit."""
+        """Read both Builder Base stages and discard the temporary layout edit."""
         def contains(frame, roi, *words):
             text = ' '.join(self.walls.texts(frame, roi, scale=1)).lower()
             return all(word in text for word in words)
+
+        def stage_number(frame):
+            text = ' '.join(self.walls.texts(frame, (0, 60, 300, 120), scale=1))
+            match = re.search(r'stage\s*([12])\b', text, re.I)
+            return int(match.group(1)) if match else None
 
         if not self.walls.ensure_menu_open():
             log('[BH] Không mở được bảng thợ để kiểm tra Layout Editor.')
             return False
         editor_open = False
         edit_open = False
-        result = None
+        results = {}
         try:
             self.tap((1090, 715), .8)
             frame = self.wait_for(lambda f: contains(f, (300, 0, 1000, 160), 'layout', 'editor'), 5)
@@ -316,42 +321,86 @@ class BuilderBaseManager:
             if frame is None:
                 return False
             edit_open = True
-            if not contains(frame, (1290, 70, 300, 130), 'remove', 'all'):
+            current_stage = stage_number(frame)
+            if current_stage is None:
                 return False
-            self.tap((1445, 130), .5)
-            frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'collect', 'all'), 5)
-            if frame is None:
-                return False
-            self.tap((980, 590), .8)
-            frame = self.wait_for(lambda f: contains(f, (0, 60, 300, 120), 'stage', 'wall'), 5)
-            if frame is not None:
-                result = self.walls.parse_layout_inventory_cards(frame, builder_base=True)
+            for stage in (current_stage, 3 - current_stage):
+                if stage != current_stage:
+                    # Move the map until its Stage label confirms the transition.
+                    start_y, end_y = (300, 680) if stage == 2 else (680, 300)
+                    for _ in range(8):
+                        self.adb.swipe(800, start_y, 800, end_y, duration_ms=650, jitter=0)
+                        time.sleep(.5)
+                        frame = self.adb.screencap()
+                        if frame is not None and stage_number(frame) == stage:
+                            break
+                    else:
+                        log(f'[BH] Chưa chuyển được sang Stage {stage}; chưa tổng hợp đủ tường.')
+                        break
+                if not contains(frame, (1290, 70, 300, 130), 'remove', 'all'):
+                    break
+                self.tap((1445, 130), .5)
+                frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'collect', 'all'), 5)
+                if frame is None:
+                    break
+                self.tap((980, 590), .8)
+                frame = self.wait_for(lambda f: stage_number(f) == stage and
+                                      contains(f, (0, 60, 300, 120), 'wall'), 5)
+                if frame is None:
+                    break
                 header = ' '.join(self.walls.texts(frame, (0, 60, 300, 120), scale=1))
-                total = re.search(r'0\s*/\s*(\d+)\s*wall', header, re.I)
-                if not total or not result or sum(g['count'] for g in result['wall_groups']) != int(total.group(1)):
-                    result = None
+                if not re.search(r'0\s*/\s*\d+\s*wall', header, re.I):
+                    break
+                result = self.walls.parse_layout_inventory_cards(frame, builder_base=True)
+                fresh = self.adb.screencap()
+                confirmed = (self.walls.parse_layout_inventory_cards(fresh, builder_base=True)
+                             if fresh is not None and stage_number(fresh) == stage else None)
+                if result is None or confirmed is None or result['wall_groups'] != confirmed['wall_groups']:
+                    log(f'[BH] Chưa đọc ổn định tường Stage {stage}; hoãn tổng hợp.')
+                    break
+                counts = {}
+                for group in result['wall_groups']:
+                    counts[group['level']] = counts.get(group['level'], 0) + group['count']
+                if results:
+                    previous = next(iter(results.values()))
+                    if any(counts.get(level, 0) < count for level, count in previous.items()):
+                        log('[BH] Khay tường thay đổi bất thường giữa hai Stage; chưa tổng hợp.')
+                        break
+                    counts = {level: count - previous.get(level, 0)
+                              for level, count in counts.items()
+                              if count > previous.get(level, 0)}
+                results[stage] = counts
         finally:
             if edit_open:
                 self.tap((1445, 635), .5)
-                frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'cancel', 'editing'), 5)
-                if frame is not None:
+                frame = self.wait_for(lambda f: contains(f, (350, 200, 900, 400), 'cancel', 'editing')
+                                      or contains(f, (300, 0, 1000, 160), 'layout', 'editor'), 5)
+                if frame is not None and contains(frame, (350, 200, 900, 400), 'cancel', 'editing'):
                     self.tap((975, 580), .7)
-                else:
-                    result = None
+                elif frame is None:
+                    results.clear()
             if editor_open:
                 frame = self.wait_for(lambda f: contains(f, (300, 0, 1000, 160), 'layout', 'editor'), 5)
                 if frame is not None:
                     self.tap((1525, 70), .7)
                 else:
-                    result = None
+                    results.clear()
         if not self.is_home(self.adb.screencap()):
             log('[BH] Chưa xác nhận về làng sau Layout Editor.')
             return False
-        if result is None:
-            log('[BH] Chưa đọc chắc tường Stage 1 trong Layout Editor.')
+        if len(results) != 2:
+            log('[BH] Chưa đọc đủ tường cả hai Stage trong Layout Editor.')
             return False
-        summary = ', '.join(f"cấp {g['level']} x{g['count']}" for g in result['wall_groups'])
-        log(f'[BH] Layout Editor Stage 1: {summary}.')
+        totals = {}
+        for stage, counts in sorted(results.items()):
+            summary = ', '.join(f'cấp {level} x{count}' for level, count in sorted(counts.items()))
+            log(f'[BH] Layout Editor Stage {stage}: {summary}.')
+            for level, count in counts.items():
+                totals[level] = totals.get(level, 0) + count
+        if self.village_state is not None:
+            self.village_state.replace_wall_inventory('builder', totals)
+        log('[BH] Tổng tường hai Stage: ' +
+            ', '.join(f'cấp {level} x{count}' for level, count in sorted(totals.items())) + '.')
         return True
 
     def collect_mines(self, screen, log, *, gem_only=False):
@@ -772,7 +821,7 @@ class BuilderBaseManager:
         if screen is not None and priority and self.walls.is_menu_open(screen):
             row, screen = self.lowest_wall_row(screen, budget, log, min_level=6 if elixir_only else 1)
             if row is None:
-                log("[BH] Chưa xác minh được nhóm tường cấp thấp nhất; hoãn lượt nâng.")
+                log("[BH] Không chọn được nhóm tường phù hợp; hoãn lượt nâng.")
                 if screen is not None and self.walls.is_menu_open(screen):
                     self.tap((1570, 30), .35)
                 return None
@@ -867,6 +916,9 @@ class BuilderBaseManager:
                     log(f"[BH] Tường cấp {level} cần {price:,}/đoạn; chưa đủ tài nguyên phù hợp để nâng.")
                     return None
             screen, quantity = self.prepare_wall_quantity(screen, row, log, eligible_resources)
+            if screen is None and row is not None:
+                screen = self.single_wall_after_quantity_failure(level, row, log)
+                quantity = 1
             if screen is not None:
                 result = self.confirm_wall_upgrade(screen, level, log, row=row, quantity=quantity,
                                                    eligible_resources=eligible_resources)
@@ -973,7 +1025,8 @@ class BuilderBaseManager:
                 log('[BH] Đã xác nhận bảng thợ báo hoàn tất toàn bộ nâng cấp; ưu tiên làng chính.')
                 return None, screen
             if not unknown and not known and groups:
-                log(f"[BH] Không thấy tường từ cấp {min_level} phù hợp tài nguyên được chọn; kết thúc lượt.")
+                log(f"[BH] Bảng thợ không có nhóm tường từ cấp {min_level} có thể nâng. "
+                    "Tường đã đạt cấp tối đa không xuất hiện trong danh sách nâng cấp.")
                 return None, screen
             if groups and len(unknown) <= 1:
                 candidate = unknown[0] if unknown else min(known, key=lambda item: (item['badge_level'], item['cost']))
@@ -1437,6 +1490,9 @@ class BuilderBaseManager:
         current = self.builder_wall_quantity(screen)
         buttons = self.wall_quantity_buttons(screen, available)
         if type(current) is not int or not 1 <= current <= target or 1 not in buttons:
+            save = getattr(getattr(self, 'walls', None), 'save_wall_frame', None)
+            if callable(save):
+                save('builder-wall-quantity-uncertain.png', screen)
             log("[BH] Chưa nhận diện chắc số đoạn hoặc nút +1; hoãn nâng.")
             return None, 1
         remaining = target - current
@@ -1458,6 +1514,9 @@ class BuilderBaseManager:
             previous = actual
             time.sleep(.2)
         log("[BH] Không đọc được số đoạn ổn định sau chọn nhanh; bỏ giao dịch.")
+        save = getattr(getattr(self, 'walls', None), 'save_wall_frame', None)
+        if callable(save):
+            save('builder-wall-quantity-uncertain.png', frame)
         return None, 1
 
     def builder_wall_quantity(self, screen):
@@ -1470,7 +1529,22 @@ class BuilderBaseManager:
                 value = int(match.group(1))
                 if 1 <= value <= 1000:
                     return value
-        return None
+        return self.walls.quantity(screen)
+
+    def single_wall_after_quantity_failure(self, level, row, log):
+        """Return to a single selected wall only when its level and price still agree."""
+        self.adb.keyevent(4)
+        screen = self.adb.screencap()
+        if screen is None or not self.is_home(screen) or self.walls.level(screen) != level:
+            return None
+        price = row.get('cost')
+        if type(price) is not int or price <= 0:
+            return None
+        if not any(offer and offer[1] == price
+                   for offer in (self.wall_offer(screen, 'gold'), self.wall_offer(screen, 'elixir'))):
+            return None
+        log('[BH] Không xác minh được chọn nhiều đoạn; đã trở lại một đoạn với cấp và giá khớp.')
+        return screen
 
     def select_visible_wall(self, screen, log, eligible_resources=None):
         tried = []
@@ -1551,7 +1625,8 @@ class BuilderBaseManager:
             if not offer:
                 continue
             button, price = offer
-            if price > balances[resource] or (quantity > 1 and price != row["cost"] * quantity):
+            if (price > balances[resource]
+                    or (row is not None and price != row["cost"] * quantity)):
                 log(f"[BH] Bỏ {resource}: giá {price:,}, số dư {balances[resource]:,}, số đoạn {quantity}; giá hoặc số dư chưa khớp.")
                 continue
             log(f"[BH] Đang mở xác nhận nâng {quantity} đoạn cấp {level} → {level + 1}, giá {price:,} {resource}.")

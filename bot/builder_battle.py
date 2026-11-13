@@ -64,6 +64,10 @@ class BuilderBattle:
         self.revealed_stage_two = False
         self.find_now_failures = 0
         self.last_sweep_at = 0
+        self.map_pan_attempts = 0
+        self.empty_sweep_observations = 0
+        self.empty_sweep_logged = False
+        self.unknown_since = 0
         self.army = BuilderArmy(self)
 
     def phase(self, screen):
@@ -126,6 +130,10 @@ class BuilderBattle:
         self.speed_stage = 0
         self.sweep_pending = False
         self.empty_stacks = set()
+        self.map_pan_attempts = 0
+        self.empty_sweep_observations = 0
+        self.empty_sweep_logged = False
+        self.unknown_since = 0
         self.troops = []
         self.combat_seen = False
         self.match_counted = False
@@ -309,6 +317,7 @@ class BuilderBattle:
             if not self.zoomed_for_stage:
                 self.zoomed_for_stage = True
                 self.adb.zoom_out_map(times=1)
+            self.pan_map_for_deployment(log, cards)
             return False
         point, direction, inward, _ = approach
         first_wave = self.approach is None
@@ -413,7 +422,30 @@ class BuilderBattle:
                 self.deploy_notice(log, "điểm thả chưa được game chấp nhận, chuyển sang hướng khác")
             else:
                 self.deploy_notice(log, "còn ô quân chưa xác nhận thả hết")
+            self.pan_map_for_deployment(log, cards)
         return complete
+
+    def pan_map_for_deployment(self, log, cards=None):
+        """Expose the other half of the deployment edge after an unaccepted drop."""
+        if self.map_pan_attempts >= 2:
+            return False
+        frame = self.adb.screencap()
+        if frame is None:
+            return False
+        for _, card in (cards if cards is not None else self.cards(frame)):
+            if self.is_card_selected(frame, card):
+                self.base.tap(card, .15)
+                frame = self.adb.screencap()
+                if frame is None or self.is_card_selected(frame, card):
+                    return False
+                break
+        start_y, end_y = ((370, 550) if self.map_pan_attempts == 0 else (550, 370))
+        self.adb.swipe(1000, start_y, 1000, end_y, duration_ms=450, jitter=0)
+        self.map_pan_attempts += 1
+        self.approach = None
+        self.rejected_entries.clear()
+        log(f"[BH] Stage {self.stage}: dịch bản đồ {'xuống' if end_y > start_y else 'lên'} để dò lại vùng thả quân.")
+        return True
 
     def stack_count(self, screen, card):
         if screen is None:
@@ -735,6 +767,9 @@ class BuilderBattle:
         if not self.approach:
             self.approach = self.entry(screen) or (self.terrain_entry(screen) if self.stage == 2 else None)
         if not self.approach:
+            cards = self.cards(screen, threshold=.70 if self.stage == 2 else .78)
+            if cards:
+                self.pan_map_for_deployment(log, cards)
             return
         point, direction, inward, _ = self.approach
         p = np.asarray(point, dtype=float)
@@ -759,8 +794,13 @@ class BuilderBattle:
                     leftovers.append((troop, count or 1))
                     self.empty_stacks.discard(card[0])
             if not leftovers:
-                log(f"[BH] Stage {self.stage}: Đã xác nhận vét sạch toàn bộ lính.")
+                self.empty_sweep_observations += 1
+                if self.empty_sweep_observations >= 2 and not self.empty_sweep_logged:
+                    log(f"[BH] Stage {self.stage}: hai lượt quét liên tiếp chưa thấy lính chờ thả.")
+                    self.empty_sweep_logged = True
                 break
+            self.empty_sweep_observations = 0
+            self.empty_sweep_logged = False
             log(f"[BH] Stage {self.stage}: Vét thêm {len(leftovers)} ô lính còn sót: " +
                 ", ".join(f"{t.kind} ({c} con)" for t, c in leftovers))
             for index, (troop, count) in enumerate(leftovers):
@@ -770,12 +810,23 @@ class BuilderBattle:
                 candidates = list(self.drop_candidates(drop, direction, inward))
                 drop_pt = candidates[min(sweep_round, len(candidates)-1)] if candidates else drop
                 self.send_drop(troop.card, drop_pt, min(count, 8), settle=.05, screen=screen)
-            for troop, _ in leftovers:
-                if not any(abs(t.card[0] - troop.card[0]) < 25 for t in self.troops):
-                    self.troops.append(troop)
-                self.empty_stacks.add(troop.card[0])
             time.sleep(0.3)
             screen = self.adb.screencap()
+            if screen is None:
+                break
+            unchanged = 0
+            for troop, before in leftovers:
+                after = self.stack_count(screen, troop.card)
+                state = self.slot_state(screen, troop)
+                hero_deployed = troop.kind in ('machine', 'copter') and state == 'deployed'
+                if after == 0 or state == 'dead' or hero_deployed:
+                    self.empty_stacks.add(troop.card[0])
+                    if state != 'dead' and not any(abs(t.card[0] - troop.card[0]) < 25 for t in self.troops):
+                        self.troops.append(troop)
+                elif after == before or (after is None and state == 'waiting'):
+                    unchanged += 1
+            if unchanged == len(leftovers) and self.pan_map_for_deployment(log, cards):
+                break
 
     def monitor(self, log, seconds=410):
         until = time.monotonic()+seconds
@@ -836,6 +887,17 @@ class BuilderBattle:
                         self.match_requested = time.monotonic() - 40
             result = self.result_button(screen)
             phase = None if result else self.phase(screen)
+            if result or phase:
+                self.unknown_since = 0
+            elif time.monotonic() - self.match_requested >= 45:
+                if not self.unknown_since:
+                    self.unknown_since = time.monotonic()
+                elif time.monotonic() - self.unknown_since >= 60:
+                    log('[BH] Không nhận diện được trạng thái trận trong 60 giây; chuyển sang phục hồi game.')
+                    engine = getattr(self.base, 'engine', None)
+                    if engine is not None:
+                        engine._request_recovery('Trận làng đêm mất trạng thái')
+                    return False
             if (result or phase) and not self.match_counted:
                 self.match_counted = True
                 if self.record_stat:
@@ -882,6 +944,10 @@ class BuilderBattle:
                 self.rejected_entries.clear()
                 self.sweep_pending = False
                 self.empty_stacks.clear()
+                self.map_pan_attempts = 0
+                self.empty_sweep_observations = 0
+                self.empty_sweep_logged = False
+                self.unknown_since = 0
                 log("[BH] Đã sang Stage 2, dò đội quân sống sót và quân tiếp viện.")
                 time.sleep(1.5)
                 log(f"[BH] Stage 2: Thu nhỏ bản đồ làng đêm (zoom out).")

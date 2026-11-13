@@ -1,6 +1,7 @@
 import time
 import threading
 import re
+import cv2
 from contextlib import nullcontext
 import numpy as np
 from typing import Optional, Callable, Dict, Any
@@ -451,6 +452,18 @@ class BotEngine:
     def _queue_screen_fault(self, screen):
         reason = self.vision.game_fault(screen)
         if reason in ('network', 'robot'):
+            if getattr(self, '_pending_recovery', None) is None:
+                detail = getattr(self.vision, 'last_game_fault_message', None)
+                if detail:
+                    self.log(f'[Recovery] Thông báo game nhận diện: {detail}')
+                if isinstance(screen, np.ndarray) and screen.size:
+                    try:
+                        folder = Path(__file__).resolve().parents[1] / 'supervision' / 'runtime'
+                        folder.mkdir(exist_ok=True)
+                        if cv2.imwrite(str(folder / 'recovery-game-fault.png'), screen):
+                            self.log('[Recovery] Đã lưu ảnh thông báo lỗi vào supervision/runtime/recovery-game-fault.png.')
+                    except (OSError, cv2.error):
+                        pass
             self._request_recovery(reason)
             return True
         return False
@@ -505,7 +518,7 @@ class BotEngine:
             self._action_failures = {}
             self._recovery_retry_at = 0
         else:
-            self._recovery_retry_at = time.monotonic() + 60
+            self._recovery_retry_at = 0
             if self._pending_recovery == 'robot' and self._robot_restart_attempted:
                 self.log('[Recovery] Kiểm tra robot vẫn xuất hiện. Cần xử lý trong game rồi tiếp tục.')
                 self._recovery_paused = True
@@ -515,7 +528,7 @@ class BotEngine:
                 self._recovery_paused = True
                 self.pause_bot()
             else:
-                self.log('[Recovery] Chưa vào lại làng. Chờ 60 giây trước lượt phục hồi tiếp theo.')
+                self.log('[Recovery] Chưa vào lại làng. Thử phục hồi lại ngay.')
         return True
 
     def restart_game_and_recover(self, force=False) -> bool:
@@ -523,7 +536,7 @@ class BotEngine:
         Tự động khởi động lại Clash of Clans khi bị kẹt/lỗi/mất kết nối:
         1. Force stop game
         2. Mở lại game
-        3. Chờ nạp game vào Làng chính
+        3. Chờ nạp game vào một trong hai làng
         4. Tắt mọi thông báo khởi động và bỏ chọn công trình
         """
         if not force and not self.settings.get('auto_restart_game',True):
@@ -556,12 +569,19 @@ class BotEngine:
             if fault == 'network':
                 return False
 
-            # Kiểm tra xem đã về Làng chính chưa
+            # Game may reopen in the village that was active before the restart.
             if self.village.is_in_main_village(screen):
                 self.log("[Recovery] Đã vào lại Làng chính thành công!")
                 time.sleep(1.0)
                 self.village.deselect_all()
                 self.set_state(self.STATE_VILLAGE)
+                self._reset_restart_timer()
+                return True
+            builder = getattr(self, 'builder', None)
+            if builder is not None and builder.is_home(screen):
+                self.log("[Recovery] Đã vào lại Làng đêm thành công!")
+                builder.deselect()
+                self.set_state(self.STATE_BUILDER)
                 self._reset_restart_timer()
                 return True
             self.village.close_popups_and_dialogs(screen)
@@ -969,7 +989,7 @@ class BotEngine:
             if not getattr(self, '_night_layout_scan_done', False):
                 scan = getattr(builder, 'scan_initial_layout_walls', None)
                 if callable(scan):
-                    self.log('[BH] Đang quét tường Stage 1 qua Layout Editor.')
+                    self.log('[BH] Đang quét tường hai Stage qua Layout Editor.')
                     scan(self.log)
                     if not builder.is_home(self.adb.screencap()):
                         self.log('[BH] Chưa về được làng sau khi quét; dừng bot để kiểm tra.')

@@ -69,6 +69,20 @@ class CombatExecutor:
         self.adb.zoom_out_map(times=times)
         time.sleep(.3)
 
+    def _find_drop_points_after_pan(self, count):
+        """Move the map at most twice before a troop is deployed, then rescan."""
+        for start_y, end_y in ((370, 550), (550, 370)):
+            self.adb.swipe(1000, start_y, 1000, end_y, duration_ms=450, jitter=0)
+            time.sleep(.3)
+            frame = self.adb.screencap()
+            if frame is None or self.vision.battle_phase(frame) not in ('scouting', 'combat'):
+                return []
+            points = self.planner.points(frame, count)
+            if points:
+                self._log(f"[Deploy] Đã dịch bản đồ {'xuống' if end_y > start_y else 'lên'} và tìm lại {len(points)} điểm thả.")
+                return points
+        return []
+
     def interpolate_line_points(self,p1,p2,count):
         if count<=0:return []
         return [(round(p1[0]+(p2[0]-p1[0])*i/max(1,count-1)),round(p1[1]+(p2[1]-p1[1])*i/max(1,count-1))) for i in range(count)]
@@ -813,6 +827,10 @@ class CombatExecutor:
         UltraAttackPlan.remember(self.settings,cards,serial=self._fixed_serial())
         point_count=int(self.settings.get('attack_spread_points',16))
         points=self.planner.points(screen,max(32,point_count) if strategy=='resource_dragons' else point_count)
+        if cards['troops'] and not points:
+            points=self._find_drop_points_after_pan(max(32,point_count) if strategy=='resource_dragons' else point_count)
+            if points:
+                screen=self.adb.screencap()
         if not cards['troops'] or not points:
             self._log('[Combat] Chưa xác nhận quân hoặc ranh thả; không triển khai.')
             return self._result(0,False,reason='unrecognized_deck_or_boundary')
