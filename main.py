@@ -59,7 +59,9 @@ class GuiOutput:
 def run_gui(output):
     _preload_ocr()
     from PyQt5.QtWidgets import QApplication
+    from PyQt5.QtGui import QFontDatabase
     from PyQt5.QtCore import Qt
+    from ui.styles import FONT_FILES
     from ui.main_window import MainWindow
 
     # Enable High DPI scaling
@@ -68,6 +70,9 @@ def run_gui(output):
 
     app = QApplication(sys.argv)
     app.setApplicationName("CoCAttack")
+    for font_file in FONT_FILES:
+        if font_file.is_file():
+            QFontDatabase.addApplicationFont(str(font_file))
 
     window = MainWindow()
     output.attach(window.bridge.sig_log.emit)
@@ -104,11 +109,15 @@ def run_cli():
 def main():
     parser = argparse.ArgumentParser(description="CoCAttack - Clash of Clans MuMu Automation Tool")
     parser.add_argument("--cli", action="store_true", help="Run in headless CLI mode without GUI")
+    parser.add_argument("--wait-for-mumu", action="store_true", help="Open the GUI after MuMu starts")
     args = parser.parse_args()
 
     if args.cli:
         run_cli()
     else:
+        if args.wait_for_mumu:
+            from core.startup import wait_for_mumu
+            wait_for_mumu()
         output = GuiOutput()
         console_available = sys.stderr is not None
         try:

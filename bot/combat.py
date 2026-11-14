@@ -14,6 +14,9 @@ from core.fixed_attack import FixedAttackPlan
 
 class CombatExecutor:
     """Deploy observed cards, coordinate timed spells/heroes, and verify battle exit."""
+    CASTABLE_SPELLS = frozenset(('no', 'angry_spell', 'haste_spell',
+                                 'healing_spell', 'bang', 'ice_block_spell',
+                                 'poison_spell'))
     def __init__(self, adb, vision, settings, screen_callback=None, village_state=None):
         self.village_state = village_state
         self.adb,self.vision,self.settings=adb,vision,settings
@@ -51,6 +54,11 @@ class CombatExecutor:
         self._deployment_pending=False
         self._deployment_recoveries=0
         self._fixed_audit_pending = False
+        self._surrender_armed = False
+        self._surrender_empty_checks = 0
+        self._next_surrender_arm_check_at = 0
+        self._speedup_used = False
+        self._next_speed_check_at = 0
 
     def save_ultra_trace(self):
         if self._ultra_trace is not None:
@@ -204,6 +212,11 @@ class CombatExecutor:
             self.save_ultra_trace()
         if completed or reason in ('not_scouting','unrecognized_deck_or_boundary'):
             self._active_fight=False
+            self._speedup_used=False
+            self._next_speed_check_at=0
+            self._surrender_armed=False
+            self._surrender_empty_checks=0
+            self._next_surrender_arm_check_at=0
             if self.village_state is not None:
                 self.village_state.clear_battle('main')
         return dict(stars=stars,duration=max(0,time.monotonic()-self.battle_start_time),completed=completed,
@@ -218,6 +231,14 @@ class CombatExecutor:
         if home:
             self.adb.tap(home[0],home[1],jitter=0,delay_after=1.5)
             return True
+        if self._surrender_armed:
+            okay=self.vision.match_template(screen,'okay',.75,roi=(750,450,450,250))
+            if okay:
+                self.adb.tap(okay[0],okay[1],jitter=0,delay_after=.3)
+                self._surrender_armed=False
+                return self._wait_for_battle_result(log, confirmed=True)
+            self._surrender_armed=False
+            log('[Exit] Hộp thoại Surrender đã đóng; tìm lại nút kết thúc trận.')
         if self.vision.battle_phase(screen) not in ('scouting','combat'):
             log('[Exit] Chưa xác nhận màn hình trận; không bấm tọa độ đoán.')
             return False
@@ -228,8 +249,10 @@ class CombatExecutor:
             log('[Exit] Không tìm thấy nút kết thúc trận.')
             return False
         self.adb.tap(end[0],end[1],jitter=0,delay_after=.5)
+        return self._wait_for_battle_result(log)
+
+    def _wait_for_battle_result(self,log,confirmed=False):
         deadline=time.monotonic()+12
-        confirmed=False
         while time.monotonic()<deadline:
             self._control()
             screen=self.adb.screencap()
@@ -247,6 +270,46 @@ class CombatExecutor:
         log('[Exit] Chưa xác minh được kết quả trận; giữ trạng thái để kiểm tra lại.')
         return False
 
+    @staticmethod
+    def _deployable_cards_left(cards):
+        troops=cards.get('troops', [])
+        spells=[card for card in cards.get('spells', [])
+                if card.get('name') in CombatExecutor.CASTABLE_SPELLS]
+        return bool(troops or spells)
+
+    def _arm_surrender_if_ready(self, screen, policy, log):
+        if (self._surrender_armed or self._deployment_pending or not policy.enabled
+                or not (policy.stars_enabled or policy.time_enabled
+                        or policy.loot_enabled or policy.destruction_enabled)):
+            return
+        now=time.monotonic()
+        if now < self._next_surrender_arm_check_at:
+            return
+        self._next_surrender_arm_check_at=now+1
+        if self.vision.battle_phase(screen) != 'combat':
+            self._surrender_empty_checks=0
+            return
+        cards=self.scan_deck_cards(screen)
+        self._surrender_empty_checks=(0 if self._deployable_cards_left(cards)
+                                      else self._surrender_empty_checks+1)
+        if self._surrender_empty_checks<2:
+            return
+        end=self.vision.match_template(screen,'1star',.80,roi=(15,600,230,120))
+        if not end:
+            end=self.vision.match_template(screen,'surrender',.75,roi=(15,600,230,120))
+        if not end:
+            return
+        self.adb.tap(end[0],end[1],jitter=0,delay_after=.15)
+        for _ in range(3):
+            fresh=self.adb.screencap()
+            okay=self.vision.match_template(fresh,'okay',.75,roi=(750,450,450,250))
+            if okay:
+                self._surrender_armed=True
+                log('[Combat] Đã thả hết quân và phép có thể dùng; mở sẵn Surrender, chờ điều kiện kết thúc.')
+                return
+            time.sleep(.15)
+        self._surrender_empty_checks=0
+
     def _cast_pending_spells(self, screen=None):
         now=time.monotonic()
         first_delay=.3 if self._ultra_active else float(self.settings.get('spell_first_delay_sec',1))
@@ -261,7 +324,7 @@ class CombatExecutor:
             self.targeter.target(screen,'no',now)
         for card in self.pending_spells:
             if card['count']<=0:continue
-            if card['name'] not in ('no','angry_spell','haste_spell','healing_spell','bang','ice_block_spell','poison_spell'):
+            if card['name'] not in self.CASTABLE_SPELLS:
                 continue
             now=time.monotonic()
             target=self.targeter.target(screen,card['name'],now)
@@ -302,6 +365,45 @@ class CombatExecutor:
         if self.village_state is not None:
             self.village_state.start_battle('main', self.battle_start_time, recovered=recovered)
 
+    def _enable_final_minute_speedup(self, screen, log):
+        if self._speedup_used or time.monotonic() < self._next_speed_check_at:
+            return
+        self._next_speed_check_at = time.monotonic() + 2
+        remaining = self.vision.battle_seconds_remaining(screen)
+        if remaining is None or remaining > 60:
+            return
+        hit = self.vision.match_template(screen, '4x', .88)
+        if hit:
+            self.adb.tap(hit[0], hit[1], jitter=0, delay_after=.15)
+            self._speedup_used = True
+            log(f'[Combat] Còn {remaining}s, đã bấm 4×.')
+
+    def _speedup_after_prearming(self, screen, log):
+        """Temporarily close the dialog if the final-minute 4x button is due."""
+        if not self._surrender_armed or self._speedup_used:
+            return
+        now=time.monotonic()
+        if now < self._next_speed_check_at:
+            return
+        self._next_speed_check_at=now+2
+        remaining=self.vision.battle_seconds_remaining(screen)
+        if remaining is None or remaining>60:
+            return
+        self.adb.keyevent(4)
+        time.sleep(.15)
+        fresh=self.adb.screencap()
+        if self.vision.match_template(fresh,'okay',.75,roi=(750,450,450,250)):
+            return
+        self._surrender_armed=False
+        self._surrender_empty_checks=0
+        if self.vision.battle_phase(fresh)=='combat':
+            self._next_speed_check_at=0
+            self._enable_final_minute_speedup(fresh,log)
+            if not self._speedup_used:
+                self._next_speed_check_at=time.monotonic()+10
+            log('[Combat] Đã đóng tạm Surrender để xử lý 4×; sẽ mở lại khi đủ điều kiện.')
+        return True
+
     def _monitor(self,log_callback=None,screen_callback=None):
         log=log_callback or self._log
         policy=self._end_policy or BattleEndPolicy.from_settings(self.settings)
@@ -315,7 +417,8 @@ class CombatExecutor:
                 self._start_live_battle(recovered=True)
             stars = self.village_state.live_battle['main']['stars']
         while time.monotonic()<deadline:
-            self._abilities()
+            if not self._surrender_armed:
+                self._abilities()
             screen=self.adb.screencap()
             if screen is None:
                 self._wait(.5);continue
@@ -325,6 +428,14 @@ class CombatExecutor:
                 self.adb.tap(home[0],home[1],jitter=0,delay_after=1.5)
                 log(f'[Combat] Đã thấy kết quả trận; sao xác nhận: {stars}.')
                 return self._result(stars,True)
+            if self._surrender_armed:
+                okay=self.vision.match_template(screen,'okay',.75,roi=(750,450,450,250))
+                if not okay:
+                    self._surrender_armed=False
+                    self._surrender_empty_checks=0
+                    log('[Combat] Hộp thoại Surrender đã đóng; tiếp tục theo dõi trận.')
+            if not self._surrender_armed:
+                self._enable_final_minute_speedup(screen, log)
             stars=max(stars,self._stars(screen))
             if self.village_state is not None:
                 self.village_state.update_battle('main', stars)
@@ -362,7 +473,10 @@ class CombatExecutor:
                 done=self._surrender_and_exit(log)
                 self._update_loot(screen)
                 return self._result(stars,done,done,reason)
-            self._cast_pending_spells(screen=screen)
+            dialog_closed=self._speedup_after_prearming(screen,log)
+            if not self._surrender_armed and not dialog_closed:
+                self._cast_pending_spells(screen=screen)
+                self._arm_surrender_if_ready(screen,policy,log)
             elapsed=int(time.monotonic()-self.battle_start_time)
             if elapsed//10!=last_report:
                 last_report=elapsed//10

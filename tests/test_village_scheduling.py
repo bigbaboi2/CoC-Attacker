@@ -12,6 +12,59 @@ from bot.walls import WallUpgrader
 from core.vision import VisionEngine
 
 class VillageSchedulingTests(unittest.TestCase):
+    def test_entering_builder_base_verifies_layout_before_battle(self):
+        events = []
+        frame = object()
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.settings = {'builder_base_enabled': True, 'builder_base_battle': True,
+                         'main_village_enabled': False}
+        base.ready_actions = Mock(return_value=[('builder_base_battle',
+                                                  lambda *_: events.append('battle') or True)])
+        base.enter = Mock(side_effect=lambda *_: events.append('enter') or True)
+        base.is_home = Mock(return_value=True)
+        base.dismiss_star_bonus = Mock(return_value=False)
+        base.scan_initial_layout_walls = Mock(side_effect=lambda *_: events.append('layout') or True)
+        base.scan_resources = Mock()
+        base.adb = SimpleNamespace(screencap=Mock(return_value=frame))
+        base.village_state = None
+        base.night_schedule_checked = True
+        base.night_builders_wait_until = 0
+        base.next_cart_check = 0
+        base.next_resource_scan = 0
+        base.main_builders_wait_until = 0
+        base.battle = SimpleNamespace(in_progress=False)
+        engine = SimpleNamespace(_night_layout_scan_done=False, log=Mock(),
+                                 adb=base.adb, stop_bot=Mock())
+        engine._verify_builder_walls_once = lambda builder: BotEngine._verify_builder_walls_once(engine, builder)
+        base.engine = engine
+
+        base.run_cycle(frame, engine.log)
+
+        self.assertEqual(events, ['enter', 'layout', 'battle'])
+        self.assertTrue(engine._night_layout_scan_done)
+
+    def test_failed_builder_layout_verification_prevents_battle(self):
+        frame = object()
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.settings = {'builder_base_enabled': True}
+        battle = Mock()
+        base.ready_actions = Mock(return_value=[('builder_base_battle', battle)])
+        base.enter = Mock(return_value=True)
+        base.is_home = Mock(return_value=True)
+        base.scan_initial_layout_walls = Mock(return_value=False)
+        base.adb = SimpleNamespace(screencap=Mock(return_value=frame))
+        base.next_cart_check = 0
+        base.next_resource_scan = 0
+        engine = SimpleNamespace(_night_layout_scan_done=False, log=Mock(),
+                                 adb=base.adb, stop_bot=Mock())
+        engine._verify_builder_walls_once = lambda builder: BotEngine._verify_builder_walls_once(engine, builder)
+        base.engine = engine
+
+        base.run_cycle(frame, engine.log)
+
+        battle.assert_not_called()
+        self.assertFalse(engine._night_layout_scan_done)
+
     def test_network_fault_keeps_short_message_for_recovery_log(self):
         vision = VisionEngine.__new__(VisionEngine)
         vision._get_ocr = Mock(return_value=Mock(return_value=SimpleNamespace(
@@ -144,6 +197,7 @@ class VillageSchedulingTests(unittest.TestCase):
                                main_builders_wait_until=400)
         fake = SimpleNamespace(builder=base, settings={'main_village_enabled': True, 'builder_base_enabled': True},
                                set_state=Mock(), STATE_BUILDER='BUILDER', STATE_VILLAGE='VILLAGE', log=Mock(),
+                               _night_layout_scan_done=True,
                                adb=SimpleNamespace(screencap=Mock(return_value=object())))
         fake._service_cross_village_sleep = Mock(return_value=False)
         with patch('bot.bot_engine.time.monotonic', return_value=100), patch('bot.bot_engine.time.sleep'):
@@ -217,5 +271,82 @@ class VillageSchedulingTests(unittest.TestCase):
         with patch('bot.bot_engine.time.monotonic', return_value=1000):
             self.assertTrue(BotEngine._service_cross_village_sleep(fake))
         fake._sleep_wait_for_builders.assert_called_once_with(400, 'builder')
+
+    def finished_main_engine(self, *, night_wait=0, night_enabled=True):
+        base = self.manager()
+        base.battle = SimpleNamespace(in_progress=False, start=Mock())
+        base.night_builders_wait_until = night_wait
+        base.night_schedule_checked = True
+        base.remember_builder_waits = Mock()
+        worker = SimpleNamespace(get_shortest_ongoing_builder_seconds=Mock(return_value=3600))
+        controller = SimpleNamespace(
+            completed=True, ready_reads=2, status='Đã hết thợ thường',
+            observe_home=Mock(return_value='complete'),
+            suggested_upgrader=Mock(return_value=worker),
+            assign_builders=Mock(return_value='done'))
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'farm_finish_enabled': True, 'farm_finish_wait_builders': True,
+                           'main_village_enabled': True, 'builder_base_enabled': night_enabled}
+        engine.builder = base
+        engine.farm_finish = controller
+        engine.village = SimpleNamespace(player_tag_failures=0, wall_status='',
+                                         is_in_main_village=Mock(return_value=False))
+        engine.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        engine.log = Mock()
+        engine.set_state = Mock()
+        engine._service_optional_upgrades = Mock(return_value={'status': 'idle'})
+        engine._sleep_wait_for_builders = Mock(return_value=True)
+        return engine, controller, base
+
+    def test_full_main_with_night_builder_keeps_night_running(self):
+        engine, controller, base = self.finished_main_engine()
+        with patch('bot.bot_engine.time.monotonic', return_value=1000):
+            self.assertTrue(engine._farm_finish_gate(object()))
+            self.assertEqual(base.main_builders_wait_until, 4615)
+            self.assertIn('builder_base_battle', [key for key, _ in base.ready_actions(1000)])
+            self.assertTrue(engine._farm_finish_gate(object()))
+        engine._sleep_wait_for_builders.assert_not_called()
+        self.assertEqual(controller.observe_home.call_count, 1)
+        self.assertTrue(engine.settings['main_village_enabled'])
+        base.remember_builder_waits.assert_called_once()
+
+    def test_main_builder_wait_routes_next_turn_to_night(self):
+        base = self.manager()
+        base.main_builders_wait_until = 4615
+        base.main_schedule_checked = True
+        base.is_home = Mock(return_value=False)
+        base.is_main = Mock(return_value=True)
+        base.active = False
+        base.dismiss_star_bonus = Mock(return_value=False)
+        base.battle.obstruction_buttons = Mock(return_value=None)
+        base.battle.in_progress = False
+        base.battle.find_now_failures = 0
+        base.run_cycle = Mock()
+        engine = BotEngine.__new__(BotEngine)
+        engine.builder = base
+        engine.settings = {'main_village_enabled': True, 'builder_base_enabled': True}
+        engine.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        engine.set_state = Mock()
+        engine._service_cross_village_sleep = Mock(return_value=False)
+        engine.log = Mock()
+        with patch('bot.bot_engine.time.monotonic', return_value=1000):
+            self.assertTrue(engine._handle_builder_base(object()))
+        base.run_cycle.assert_called_once()
+
+    def test_full_main_and_night_both_wait_for_earliest_builder(self):
+        engine, controller, base = self.finished_main_engine(night_wait=1300)
+        base.is_home = Mock(return_value=False)
+        with patch('bot.bot_engine.time.monotonic', return_value=1000):
+            self.assertTrue(engine._farm_finish_gate(object()))
+        engine._sleep_wait_for_builders.assert_called_once_with(300, 'builder')
+        self.assertEqual(base.night_builders_wait_until, 0)
+        self.assertFalse(controller.completed)
+
+    def test_full_main_only_preserves_wait_behavior(self):
+        engine, controller, _ = self.finished_main_engine(night_enabled=False)
+        with patch('bot.bot_engine.time.monotonic', return_value=1000):
+            self.assertTrue(engine._farm_finish_gate(object()))
+        engine._sleep_wait_for_builders.assert_called_once_with(3600)
+        self.assertFalse(controller.completed)
 
 if __name__ == '__main__': unittest.main()

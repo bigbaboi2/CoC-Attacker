@@ -55,6 +55,7 @@ class BuilderBattle:
         self.approach = None
         self.rejected_entries = []
         self.speed_stage = 0
+        self.next_speed_check_at = 0
         self.sweep_pending = False
         self.empty_stacks = set()
         self.combat_seen = False
@@ -128,6 +129,7 @@ class BuilderBattle:
         self.approach = None
         self.rejected_entries = []
         self.speed_stage = 0
+        self.next_speed_check_at = 0
         self.sweep_pending = False
         self.empty_stacks = set()
         self.map_pan_attempts = 0
@@ -691,11 +693,18 @@ class BuilderBattle:
     def enable_speedup(self, screen, log):
         if self.speed_stage == self.stage:
             return
+        now = time.monotonic()
+        if now < self.next_speed_check_at:
+            return
+        self.next_speed_check_at = now + 2
+        remaining = self.vision.battle_seconds_remaining(screen)
+        if remaining is None or remaining > 60:
+            return
         hit = self.base.match(screen, ("4x",), (0, 0, 1600, 900), .88, (.85, 1., 1.15))
         if hit and self.base.green_button(screen, hit):
             self.base.tap(hit, .15)
             self.speed_stage = self.stage
-            log(f"[BH] Stage {self.stage}: đã bấm 4×.")
+            log(f"[BH] Stage {self.stage}: còn {remaining}s, đã bấm 4×.")
 
     @staticmethod
     def count_result_stars(screen):
@@ -934,6 +943,7 @@ class BuilderBattle:
                 continue
             if phase == "scouting" and self.stage == 1 and self.combat_seen:
                 self.stage = 2
+                self.next_speed_check_at = 0
                 if village_state is not None:
                     village_state.update_battle('builder', 3, stage=2)
                 self.troops = []

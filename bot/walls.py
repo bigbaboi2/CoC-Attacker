@@ -365,7 +365,7 @@ class WallUpgrader:
     @frame_analysis
     def wall_controls_present(self,screen):
         if screen is None:return False
-        return bool(self.wall_template(screen,'upmore',.86,roi=(200,620,950,170)) or
+        return bool(self.wall_template(screen,'upmore',.76,roi=(200,620,950,170)) or
                     self.wall_template(screen,'addwall',.86,roi=(200,620,950,170)))
 
     def wall_template(self, screen, name, threshold, roi):
@@ -622,16 +622,19 @@ class WallUpgrader:
                    for row in self.menu_rows(screen, self.menu_words(screen)))
 
     @selection_stage('scan')
-    def scan_wall_rows(self, precise=False, both_directions=False):
+    def scan_wall_rows(self, precise=False, both_directions=False, first_match=False,
+                       target_available=None):
         seen = []
         for direction in ('down','up'):
             previous = None
             found_in_direction = False
-            for _ in range(6):
+            # Read the page reached by the sixth swipe as well. Previously the
+            # loop swiped six times but never inspected that final page.
+            for step in range(7):
                 self._selection_checkpoint()
                 screen = self.adb.screencap()
                 words = self.menu_words(screen, precise=precise)
-                rows = self.menu_rows(screen, words)
+                rows = self.menu_rows(screen, words, read_level=not first_match)
                 signature = self.menu_signature(words)
                 if rows:
                     current_offset = getattr(self.manager, '_wall_menu_offset', 0)
@@ -640,13 +643,19 @@ class WallUpgrader:
                             r['scroll_down'] = current_offset
                     seen.extend(rows)
                     found_in_direction = True
-                elif found_in_direction:
+                    if first_match:
+                        return seen
+                    if (type(target_available) is int
+                            and any(row['available'] == target_available for row in rows)):
+                        return seen
+                elif found_in_direction and target_available is None:
                     break
                 if not signature or signature == previous:
                     break
                 previous = signature
-                self.scroll_menu(direction)
-            if seen and not both_directions:
+                if step < 6:
+                    self.scroll_menu(direction)
+            if seen and not both_directions and target_available is None:
                 break
         return seen
 
@@ -855,19 +864,23 @@ class WallUpgrader:
         return False
 
     @selection_stage('seek_row')
-    def seek_cost(self, cost):
+    def seek_cost(self, cost, available=None):
         # Start where the menu actually is. Only reverse at a verified boundary.
+        def matches(row):
+            return (row is not None and row['cost'] == cost
+                    and (available is None or row['available'] == available))
         screen = self.adb.screencap()
-        cached = getattr(self.manager, '_lowest_wall_target', None)
+        cached = (getattr(self.manager, '_lowest_wall_target', None)
+                  if self.settings.get('wall_lowest_first', True) else None)
         if isinstance(cached, dict) and cached.get('cost') == cost:
             direct = self.cached_menu_row(screen, cached)
-            if direct:
+            if matches(direct):
                 self._cache_visible_on_open = True
                 return direct
         words = self.menu_words(screen)
-        visible = self.menu_rows(screen, words)
+        visible = self.menu_rows(screen, words, read_level=available is None)
         for row in visible:
-            if row['cost'] == cost:
+            if matches(row):
                 if isinstance(cached, dict) and cached.get('cost') == cost:
                     self._cache_visible_on_open = True
                 return row
@@ -879,12 +892,12 @@ class WallUpgrader:
                     self.scroll_menu('down', fast=True)
                     screen = self.adb.screencap()
                     direct = self.cached_menu_row(screen, cached)
-                    if direct:
+                    if matches(direct):
                         return direct
                     words = self.menu_words(screen)
-                    visible = self.menu_rows(screen, words)
+                    visible = self.menu_rows(screen, words, read_level=available is None)
                     for row in visible:
-                        if row['cost'] == cost:
+                        if matches(row):
                             return row
                     signature = self.menu_signature(words)
                     if not signature or signature == previous:
@@ -895,8 +908,8 @@ class WallUpgrader:
             for direction in ('up','up','down','down','down','down'):
                 self.scroll_menu(direction, fast=True)
                 screen = self.adb.screencap()
-                rows = self.menu_rows(screen, self.menu_words(screen))
-                match = next((row for row in rows if row['cost'] == cost), None)
+                rows = self.menu_rows(screen, self.menu_words(screen), read_level=available is None)
+                match = next((row for row in rows if matches(row)), None)
                 if match:
                     return match
             return None
@@ -913,7 +926,7 @@ class WallUpgrader:
                 self._selection_checkpoint()
                 screen = self.adb.screencap()
                 words = self.menu_words(screen)
-                rows = [row for row in self.menu_rows(screen, words) if row['cost'] == cost]
+                rows = [row for row in self.menu_rows(screen, words, read_level=available is None) if matches(row)]
                 if rows:
                     return rows[0]
                 signature = self.menu_signature(words)
@@ -937,15 +950,17 @@ class WallUpgrader:
                 return None
             hint = dict(cost=row['cost'],relative_y=previous['y']/900)
             current = self.cached_menu_row(frame,hint)
+            if current is not None and current['available'] != row['available']:
+                current = None
             if current is None:
                 top = max(50, min(680, int(previous['y']) - 60))
                 words = self.ocr_positions(frame, (1235, top, 365, 140))
-                current = next((candidate for candidate in self.menu_rows(frame, words)
-                                if candidate['cost'] == row['cost']), None)
+                current = next((candidate for candidate in self.menu_rows(frame, words, read_level=expected is not None)
+                                if candidate['cost'] == row['cost'] and candidate['available'] == row['available']), None)
             if current is None:
-                current = next((candidate for candidate in self.menu_rows(frame, self.menu_words(frame))
-                                if candidate['cost'] == row['cost']), None)
-            if current is not None and (expected is None or current.get('upgrade_level') in (None, expected)):
+                current = next((candidate for candidate in self.menu_rows(frame, self.menu_words(frame), read_level=expected is not None)
+                                if candidate['cost'] == row['cost'] and candidate['available'] == row['available']), None)
+            if current is not None and current['available'] == row['available'] and (expected is None or current.get('upgrade_level') in (None, expected)):
                 if (consecutive and current['available'] == previous['available']
                         and abs(current['y']-previous['y']) <= 8
                         and abs(current['x']-previous['x']) <= 12):
@@ -1004,7 +1019,8 @@ class WallUpgrader:
                 previous = level
                 # Two settled observations with live wall controls can use
                 # the verified menu badge when title OCR alone is unreadable.
-                if (attempt >= 1 and level is None and controls
+                if (not self.settings.get('wall_lowest_first', True)
+                        and attempt >= 1 and level is None and controls
                         and type(expected) is int and 2 <= expected <= 25):
                     self._menu_selection_evidence = dict(level=expected-1, cost=row['cost'],
                                                          available=row['available'])
@@ -1023,7 +1039,8 @@ class WallUpgrader:
                 self.last_selection = screen
                 return screen, level
             destination=row.get('upgrade_level')
-            if type(destination) is int and 2<=destination<=25 and self.wall_controls_present(screen):
+            if (not self.settings.get('wall_lowest_first', True)
+                    and type(destination) is int and 2<=destination<=25 and self.wall_controls_present(screen)):
                 self._menu_selection_evidence=dict(level=destination-1,cost=row['cost'],available=row['available'])
                 self.last_selection=screen
                 return screen,destination-1
@@ -1090,6 +1107,11 @@ class WallUpgrader:
             except (OSError, TypeError, ValueError):
                 pass
 
+    def reverify_selection_inventory(self, log):
+        """The 30-second row budget must not interrupt Layout Editor cleanup."""
+        self._selection_deadline = None
+        return self.verify_walls_via_layout_editor(log)
+
     def _select_from_menu(self, log):
         self._selection_timed_out = False
         lookup_started = time.monotonic()
@@ -1115,9 +1137,27 @@ class WallUpgrader:
         self.manager._wall_menu_offset = 0
         self._cache_visible_on_open = False
         scan_both_directions = False
+        lowest_first = self.settings.get('wall_lowest_first', True)
+        inventory = getattr(getattr(self.manager, 'village_state', None), 'wall_inventory', {})
+        inventory = inventory.get('main', {}) if isinstance(inventory, dict) else {}
+        known_levels = [int(level) for level, count in inventory.items()
+                        if str(level).isdigit() and int(count) > 0]
+        known_lowest = min(known_levels) if lowest_first and known_levels else None
+        known_count = (inventory.get(known_lowest, inventory.get(str(known_lowest)))
+                       if known_lowest is not None else None)
+        if lowest_first and (known_lowest is None or type(known_count) is not int or known_count <= 0):
+            log('[Wall] Chưa có số đoạn/cấp tường đã xác minh; quét Layout Editor trước khi chọn.')
+            self.reverify_selection_inventory(log)
+            return None
 
         # 3. Check cached lowest wall target
-        cached = getattr(self.manager, '_lowest_wall_target', None)
+        cached = (getattr(self.manager, '_lowest_wall_target', None)
+                  if self.settings.get('wall_lowest_first', True) else None)
+        if (isinstance(cached, dict) and known_lowest is not None
+                and (cached.get('level') != known_lowest or cached.get('available') != known_count)):
+            cached = None
+            self.manager._lowest_wall_target = None
+            self.manager.save_wall_target(None)
         if isinstance(cached, dict) and time.time()-cached.get('scanned_at', time.time()) >= 1800:
             cached = None
             self.manager._lowest_wall_target = None
@@ -1127,9 +1167,12 @@ class WallUpgrader:
             self.manager._lowest_wall_target = None
             self.manager.save_wall_target(None)
         if cached:
-            row = self.seek_cost(cached['cost'])
+            row = self.seek_cost(cached['cost'], cached['available'])
             if row:
-                if row.get('upgrade_level') is None:row['upgrade_level']=cached['level']+1
+                if lowest_first:
+                    row.pop('upgrade_level', None)
+                elif row.get('upgrade_level') is None:
+                    row['upgrade_level'] = cached['level'] + 1
                 self._selection_row_tapped = False
                 selected, level = self.choose_row(row, close=True)
                 if level == cached['level']:
@@ -1156,10 +1199,19 @@ class WallUpgrader:
 
         self._full_scan_at = time.time()
         self._menu_open_signature = self.menu_signature(self.menu_words(opening))
-        all_seen_rows = self.scan_wall_rows(both_directions=True) if scan_both_directions else self.scan_wall_rows()
+        first_match = not lowest_first
+        all_seen_rows = (self.scan_wall_rows(both_directions=True, first_match=first_match,
+                                             target_available=known_count)
+                         if scan_both_directions else self.scan_wall_rows(
+                             first_match=first_match, target_available=known_count))
         if not all_seen_rows:
             log('[Wall] Chưa thấy nhóm qua quét nhanh; dùng OCR đầy đủ để kiểm tra lại.')
-            all_seen_rows = self.scan_wall_rows(precise=True, both_directions=scan_both_directions)
+            all_seen_rows = self.scan_wall_rows(precise=True, both_directions=scan_both_directions,
+                                                first_match=first_match, target_available=known_count)
+        elif (lowest_first and not any(row['available'] == known_count for row in all_seen_rows)):
+            log(f'[Wall] Quét nhanh chưa đọc được nhóm {known_count} đoạn; tìm lại bằng OCR đầy đủ.')
+            all_seen_rows.extend(self.scan_wall_rows(
+                precise=True, both_directions=True, target_available=known_count))
 
         if not all_seen_rows:
             val = getattr(self.manager, '_wall_no_target_count', 0)
@@ -1187,28 +1239,23 @@ class WallUpgrader:
 
         self.manager._wall_no_target_count = 0
 
-        # The menu badge is the destination level. Rank by it before price;
-        # verify the current level again after selecting the actual wall.
-        ranked = self.rank_wall_groups(all_seen_rows, log)
-        if not ranked:
+        target = self.choose_wall_candidate(all_seen_rows, lowest_first, known_lowest, known_count)
+        if target is None:
+            log(f'[Wall] Layout Editor đã xác minh cấp {known_lowest} × {known_count}; '
+                'Menu thợ chưa đọc được dòng khớp sau hai cách OCR, giữ làng và tìm lại, chưa bấm nâng.')
             self.close_dialog()
             return None
-        min_cost = ranked[0]['cost']
-        reused = getattr(self, '_ranked_selection', None)
-        if reused is not None:
-            selected, level, row = reused
-            self.available_walls = row['available']
-            self.remember_group(row, level)
-            log(f'[Wall] Dùng tiếp tường level {level} đã xác minh; không chọn lại.')
-            return selected
+        min_cost = target['cost']
         # Check if current screen still has the min_cost row
         fresh_screen = self.adb.screencap()
         fresh_words = self.menu_words(fresh_screen)
-        current_rows = [r for r in self.menu_rows(fresh_screen, fresh_words) if r['cost'] == min_cost]
+        current_rows = [r for r in self.menu_rows(fresh_screen, fresh_words, read_level=False)
+                        if r['cost'] == min_cost and (not lowest_first or type(known_count) is not int
+                                                      or r['available'] == known_count)]
         if current_rows:
             target_row = current_rows[0]
         else:
-            target_row = self.seek_cost(min_cost)
+            target_row = self.seek_cost(min_cost, known_count if lowest_first else None)
 
         if not target_row:
             self.close_dialog()
@@ -1216,7 +1263,13 @@ class WallUpgrader:
             return None
 
         # 7. Select the lowest wall row and close menu
-        if target_row.get('upgrade_level') is None:target_row['upgrade_level']=ranked[0]['upgrade_level']
+        if (lowest_first and type(known_count) is int
+                and target_row['available'] == known_count):
+            # Badge OCR can read the destination 9 as 19. The verified count
+            # identifies this row; use the wall title after selection for level.
+            target_row.pop('upgrade_level', None)
+        elif target_row.get('upgrade_level') is None and target.get('upgrade_level') is not None:
+            target_row['upgrade_level'] = target['upgrade_level']
         selected, level = self.choose_row(target_row, close=True)
         if level is None:
             time.sleep(0.4)
@@ -1225,19 +1278,21 @@ class WallUpgrader:
 
         self.available_walls = target_row['available']
         if level is not None:
-            expected_level = ranked[0]['upgrade_level']-1
-            if level != expected_level:
+            expected_level = known_lowest if lowest_first else None
+            if expected_level is not None and level != expected_level:
                 log(f'[Wall] Cấp dòng menu {expected_level} khác tường đã chọn {level}; '
                     'không nâng nhóm này, kiểm tra lại lượt sau.')
                 self.manager._lowest_wall_target = None
                 self.manager.save_wall_target(None)
                 self.manager.deselect_all()
+                self.reverify_selection_inventory(log)
                 return None
             self.remember_group(target_row, level)
             v_state = getattr(self.manager, 'village_state', None)
             if v_state is not None and isinstance(level, int) and target_row.get('available'):
                 v_state.record_wall_group('main', level, int(target_row['available']))
-            log(f"[Wall] Chọn level thấp nhất {level}; giá {min_cost:,}, còn {target_row['available']} đoạn.")
+            label = 'level thấp nhất' if lowest_first else 'nhóm OCR thấy trước'
+            log(f"[Wall] Chọn {label} {level}; giá {min_cost:,}, còn {target_row['available']} đoạn.")
         else:
             if selected is not None:
                 folder = Path(__file__).resolve().parents[1]/'supervision'/'runtime'
@@ -1247,6 +1302,18 @@ class WallUpgrader:
             return None
 
         return selected
+
+    @staticmethod
+    def choose_wall_candidate(rows, lowest_first, known_lowest=None, known_count=None):
+        if not lowest_first:
+            # First OCR hit wins; skip ranking every group.
+            return rows[0]
+        # The badge OCR can add a spurious leading digit (9 -> 19). Require
+        # the verified Layout Editor count, then check the selected wall title.
+        if type(known_lowest) is not int or type(known_count) is not int or known_count <= 0:
+            return None
+        matching = [row for row in rows if row['available'] == known_count]
+        return min(matching, key=lambda row: row['cost']) if matching else None
 
     def remember_group(self, row, level):
         offset = row.get('scroll_down', getattr(self.manager, '_wall_menu_offset', 0))
@@ -1630,7 +1697,7 @@ class WallUpgrader:
     def enter_more(self, screen):
         if self.is_menu_open(screen):
             return None
-        more = self.wall_template(screen,'upmore',.86,roi=(200,620,950,170))
+        more = self.wall_template(screen,'upmore',.76,roi=(200,620,950,170))
         point = tuple(more[:2]) if more else None
         if point is None:
             if self.quantity(screen) is not None:
@@ -1944,17 +2011,11 @@ class WallUpgrader:
 
         available = getattr(self, 'available_walls', 1)
         max_affordable = max(1, resources[resource] // unit_cost)
-        use_max_money = self.settings.get('wall_upgrade_max_by_money', False)
-        limit_setting = int(self.settings.get('wall_max_upgrades_per_cycle', 5))
-
         if force_single:
             target = 1
-        elif use_max_money or limit_setting <= 0:
+        else:
             target = min(available, max_affordable)
             log(f'[Wall] Chế độ tối đa theo tiền: Khả dụng {available} đoạn, đủ tiền nâng {max_affordable} đoạn -> Mục tiêu {target} đoạn.')
-        else:
-            target = min(limit_setting, available, max_affordable)
-            log(f'[Wall] Chế độ giới hạn {limit_setting} đoạn: Khả dụng {available} đoạn, đủ tiền {max_affordable} đoạn -> Mục tiêu {target} đoạn.')
 
         target = max(1, target)
 
@@ -1986,8 +2047,7 @@ class WallUpgrader:
         observed_total,red=self.upgrade_price(screen,resource)
         if (needs_price_fallback or red is True or type(observed_total) is int and observed_total!=unit_cost*target
                 or total!=unit_cost*target or total>resources[resource]):
-            cap=available if use_max_money or limit_setting<=0 else min(available,limit_setting)
-            fitted=self.fit_upgrade_budget(screen,resource,target,unit_cost,resources[resource],log,cap=cap)
+            fitted=self.fit_upgrade_budget(screen,resource,target,unit_cost,resources[resource],log,cap=available)
             if fitted is None:
                 self._wall_retryable=True
                 self.manager.deselect_all()
@@ -2027,6 +2087,9 @@ class WallUpgrader:
                 self._wall_retryable = True
                 self.close_dialog()
                 return False
+            self.manager._pending_wall_transaction = dict(level=before_level,
+                before_count=self.available_walls, quantity=target, resource=resource,
+                balance_before=resources[resource])
             self._transaction_submitted = True
             self.record_wall_tap('confirm', confirm, tuple(button[:2]), dict(resource=resource, quantity=target, total=total))
             log(f'[Wall] Xác nhận nâng tại ({button[0]}, {button[1]}).')
@@ -2055,6 +2118,9 @@ class WallUpgrader:
                     log('[Wall] Hộp xác nhận một đoạn chưa khớp cấp/giá; bỏ lượt, tiếp tục bot.')
                     self.close_dialog()
                     return False
+            self.manager._pending_wall_transaction = dict(level=before_level,
+                before_count=self.available_walls, quantity=target, resource=resource,
+                balance_before=resources[resource])
             self._transaction_submitted = True
             self.record_wall_tap('confirm', confirm, tuple(button[:2]), dict(resource=resource, quantity=target, total=total))
             log(f'[Wall] Xác nhận nâng tại ({button[0]}, {button[1]}).')
@@ -2062,9 +2128,11 @@ class WallUpgrader:
 
         after = self.adb.screencap()
         if self.dismiss_resource_purchase(after,log):
+            self.manager._pending_wall_transaction = None
             self.manager.set_wall_wait(time.time()+120,'Game báo thiếu tài nguyên; đã thoát mua gem, bỏ lượt nâng.')
             return False
         if self.paid_builder_dialog(after):
+            self.manager._pending_wall_transaction = None
             log('[Wall] Game báo hết thợ thường và đề nghị Goblin Builder; hủy, không tiêu gem.')
             close_path = str(Path(__file__).resolve().parents[1]/'local_assets'/'goblin_builder_close.png')
             close = self.vision.match_template(after, close_path, .90, roi=(1300, 120, 200, 160))
@@ -2075,7 +2143,16 @@ class WallUpgrader:
         success = self.verify_upgrade(after, resources, resource, total, before_level, target, unit_cost, log)
         self.manager.deselect_all()
         if success:
+            self.manager._pending_wall_transaction = None
             self.last_upgrade = dict(resource=resource, quantity=target, total=total, prices=prices)
+            state = getattr(self.manager, 'village_state', None)
+            if (not getattr(self, '_layout_inventory_verified', False) and state is not None
+                    and isinstance(getattr(state, 'wall_inventory', None), dict)):
+                counts = state.wall_inventory.get('main', {})
+                if isinstance(counts, dict) and before_level in counts:
+                    state.record_wall_group('main', before_level, max(0, counts[before_level] - target))
+                    state.record_wall_group('main', before_level + 1,
+                                            counts.get(before_level + 1, 0) + target)
             cached = getattr(self.manager, '_lowest_wall_target', None)
             if isinstance(cached, dict) and cached.get('level') == before_level:
                 cached['available'] = max(0, self.available_walls - target)
@@ -2084,12 +2161,13 @@ class WallUpgrader:
                 self.manager.save_wall_target(self.manager._lowest_wall_target)
         else:
             # The confirm may already have spent currency. Never route an
-            # uncertain submitted transaction into the single-wall retry path.
-            self.manager.set_wall_wait(time.time()+120, 'Chưa đủ bằng chứng giao dịch tường; kiểm tra lại sau 2 phút, bot tiếp tục.')
+            # uncertain submitted transaction into a second purchase.
+            self.manager.set_wall_wait(0, 'Giao dịch tường chưa rõ; xác minh lại qua Layout Editor ngay lượt kế tiếp.')
         return success
 
     def verify_upgrade(self, after, resources, resource, total, before_level, target, unit_cost, log):
         """Two exact debits plus a level or inventory change, never debit alone."""
+        self._layout_inventory_verified = False
         stable_debits = 0
         stable_levels = 0
         for attempt in range(8):
@@ -2116,7 +2194,20 @@ class WallUpgrader:
                                   and self.inventory_count(unit_cost) == remaining)
             if inventory_verified:
                 success = True
-                log(f'[Wall] Đã xác minh nhóm tường: {self.available_walls} -> {remaining} đoạn cấp {before_level}, đã nâng {target} đoạn, dùng {spent:,} {resource}.')
+                log(f'[Wall] Đã xác minh nhóm tường: {self.available_walls} -> {remaining} đoạn cấp {before_level}, đã nâng {target} đoạn.')
+        if not success and isinstance(getattr(self, 'available_walls', None), int):
+            # A HUD reading may differ from the actual debit. Verify the wall
+            # inventory immediately instead of sleeping for a fixed 2 minutes.
+            layout = self.verify_walls_via_layout_editor(log)
+            if isinstance(layout, dict) and isinstance(layout.get('wall_groups'), list):
+                remaining = sum(group['count'] for group in layout['wall_groups']
+                                if group.get('level') == before_level)
+                inventory_verified = self.available_walls - remaining == target
+                if inventory_verified:
+                    success = True
+                    self._layout_inventory_verified = True
+                    log(f'[Wall] Layout Editor xác nhận cấp {before_level}: '
+                        f'{self.available_walls} -> {remaining} đoạn; đã nâng {target} đoạn.')
         if success:
             if not inventory_verified:
                 log(f'[Wall] Đã xác minh {target} đoạn: cấp {before_level} -> {after_level}, đã dùng {spent:,} {resource}.')
@@ -2125,10 +2216,14 @@ class WallUpgrader:
                 f'cấp {before_level} -> {after_level}; bỏ lượt nâng, bot tiếp tục.')
         self.last_upgrade_verification.update(inventory_verified=inventory_verified, success=success)
         if success:
-            log(f'[Wall] Kiểm chứng hoàn tất: chọn {target} đoạn × {unit_cost:,}; '
-                f'{resource} {resources[resource]:,} → {after_resources[resource]:,}, '
-                f'trừ đúng {total:,} trên {stable_debits} lần đọc liên tiếp; '
-                + ('đã đối chiếu số tường còn lại.' if inventory_verified else 'đã đối chiếu cấp mới.'))
+            if inventory_verified and stable_debits < 2:
+                log(f'[Wall] Kiểm chứng hoàn tất bằng số tường còn lại; số tiền HUD đọc được '
+                    f'{resources[resource]:,} → {after_resources[resource]:,} không khớp giá {total:,}.')
+            else:
+                log(f'[Wall] Kiểm chứng hoàn tất: chọn {target} đoạn × {unit_cost:,}; '
+                    f'{resource} {resources[resource]:,} → {after_resources[resource]:,}, '
+                    f'trừ đúng {total:,} trên {stable_debits} lần đọc liên tiếp; '
+                    + ('đã đối chiếu số tường còn lại.' if inventory_verified else 'đã đối chiếu cấp mới.'))
         self.save_verification()
         return success
 
@@ -2149,7 +2244,7 @@ class WallUpgrader:
             self.manager.wall_status = message.removeprefix('[Wall] ')
             (log_callback or (lambda message: None))(message)
             if getattr(self, '_transaction_submitted', False):
-                self.manager.set_wall_wait(time.time()+120, 'Kết quả giao dịch chưa rõ; kiểm tra tường lại sau 2 phút.')
+                self.manager.set_wall_wait(0, 'Kết quả giao dịch chưa rõ; xác minh lại qua Layout Editor ở lượt kế tiếp.')
             try:
                 self.close_dialog()
                 self.manager.deselect_all()
@@ -2175,6 +2270,29 @@ class WallUpgrader:
             self.manager.wall_status = 'Đã tắt tự động nâng tường.'
             self.manager.wall_result['status'] = 'disabled'
             return False
+        pending = getattr(self.manager, '_pending_wall_transaction', None)
+        if isinstance(pending, dict):
+            layout = self.verify_walls_via_layout_editor(log)
+            if not isinstance(layout, dict) or not isinstance(layout.get('wall_groups'), list):
+                self.manager.wall_status = 'Chưa đọc chắc kết quả giao dịch; sẽ xác minh lại, chưa nâng trùng.'
+                self.manager.wall_result['status'] = 'transaction_pending'
+                return False
+            remaining = sum(group['count'] for group in layout['wall_groups']
+                            if group.get('level') == pending['level'])
+            if pending['before_count'] - remaining == pending['quantity']:
+                self.manager._pending_wall_transaction = None
+                self.manager.wall_status = 'Layout Editor xác nhận giao dịch tường trước đã hoàn tất.'
+                self.manager.wall_result['status'] = 'upgraded'
+                log('[Wall] ' + self.manager.wall_status)
+                return True
+            balance = {'gold': current_gold, 'elixir': current_elixir}.get(pending['resource'])
+            if remaining == pending['before_count'] and balance == pending['balance_before']:
+                self.manager._pending_wall_transaction = None
+                log('[Wall] Tường và tài nguyên không đổi; thử nâng lại ngay.')
+            else:
+                self.manager.wall_status = 'Kết quả giao dịch tường còn mơ hồ; sẽ xác minh lại, chưa nâng trùng.'
+                self.manager.wall_result['status'] = 'transaction_pending'
+                return False
         retry = getattr(self.manager, '_wall_builder_retry_at', 0)
         if (isinstance(retry, (int, float)) and time.time() < retry
                 and self.manager.refresh_wall_builder_wait(screen) is not True):

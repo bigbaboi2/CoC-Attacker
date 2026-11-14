@@ -159,6 +159,7 @@ class StartupIdentityTests(unittest.TestCase):
             settings={'main_village_enabled': True},
             adb=SimpleNamespace(screencap=Mock(return_value=object())),
             log=Mock(), set_state=Mock(), STATE_BUILDER='BUILDER', STATE_VILLAGE='VILLAGE',
+            _night_layout_scan_done=True,
             _startup_origin='night', _startup_night_pass_done=False,
             _main_scanned_account=None, _service_cross_village_sleep=Mock(return_value=False))
         with patch('bot.bot_engine.time.sleep'):

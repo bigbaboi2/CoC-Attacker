@@ -1,4 +1,5 @@
 import unittest
+import time
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import numpy as np
@@ -90,6 +91,30 @@ class BuilderWallQuantityTests(unittest.TestCase):
             row, _ = base.lowest_wall_row(frame, 500000, lambda _: None, min_level=6)
         self.assertEqual((row['cost'], row['upgrade_level']), (400000, 7))
         self.assertEqual(base.wait_for_wall_selection.call_count, 1)
+
+    def test_elixir_scan_remembers_when_every_upgrade_is_below_level_six(self):
+        base, frame = self.make_elixir_scan()
+        base.walls.menu_rows.side_effect = lambda *args, **kwargs: [
+            dict(x=1290, y=200, cost=150000, available=91)]
+        base.builder_wall_badge_template = Mock(return_value=5)
+        with patch('bot.builder_base.time.sleep'):
+            row, _ = base.lowest_wall_row(frame, 2500000, lambda _: None, min_level=6)
+        self.assertIsNone(row)
+        self.assertGreater(base._elixir_wall_unavailable_at, 0)
+
+    def test_elixir_only_skips_recently_verified_unavailable_menu(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.walls_confirmed_maxed = False
+        base.settings = {'builder_base_wall_trigger': 'either',
+                         'builder_base_wall_min_gold': 500000,
+                         'builder_base_wall_min_elixir': 500000}
+        base.wall_balances = Mock(return_value={'gold': 336841, 'elixir': 2650311})
+        base.upgrade_wall = Mock()
+        base._elixir_wall_unavailable_at = time.monotonic()
+        logs = []
+        self.assertIsNone(base.upgrade_wall_cycle(object(), logs.append))
+        base.upgrade_wall.assert_not_called()
+        self.assertTrue(any('bỏ lượt quét' in line for line in logs))
 
     def test_elixir_scan_checks_unknown_then_selects_eligible_wall(self):
         base, frame = self.make_elixir_scan(unknown_low=True)

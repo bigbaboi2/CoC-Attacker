@@ -4,6 +4,7 @@ import time
 import unicodedata
 import cv2
 import json
+import itertools
 from pathlib import Path
 from core.adb_client import BotStoppedError
 from core.resource_targets import ResourceTargetDetector
@@ -33,9 +34,17 @@ class TreasuryCollector:
                             self.memory[key]=value
                         elif key=='last_result' and type(value) is str:
                             self.memory[key]=value
+                        elif key=='castle_search_version' and type(value) is int:
+                            self.memory[key]=value
             except (OSError,ValueError,TypeError,AttributeError):
                 pass
         retry=self.memory.get('next_check_at',0)
+        # An older Castle-image miss should get one fresh search with the
+        # level-independent locator instead of inheriting its long cooldown.
+        if self.memory.get('last_result')=='castle_not_found' and self.memory.get('castle_search_version',0)<2:
+            retry=0
+            self.memory['next_check_at']=0
+        self.memory['castle_search_version']=2
         if type(retry) in (int,float) and time.time()<retry<time.time()+31*86400:
             manager._treasury_next_check=retry
 
@@ -106,6 +115,13 @@ class TreasuryCollector:
             return None
         return next(((x,y) for text,x,y in words if text.strip() in ('treasury','kho bac')),None)
 
+    @staticmethod
+    def castle_probe_points():
+        """Search the visible village without assuming a Clan Castle level."""
+        points = itertools.product(range(280, 1321, 80), range(160, 641, 80))
+        return sorted(points, key=lambda point: ((point[0]-800)**2 + (point[1]-400)**2,
+                                                 point[1], point[0]))
+
     def open_castle(self, screen):
         button=self.treasury_button(screen)
         if button:
@@ -115,17 +131,35 @@ class TreasuryCollector:
         screen=self.adb.screencap()
         if not self.vision.is_in_main_village(screen):
             return None,None
+        # A single sprite template cannot cover every Clan Castle level.
+        # Image hits are only hints; the selected title and Treasury button
+        # remain the proof before opening anything.
         candidates=self.detector.detect(screen,kinds=('clan_castle',),threshold=.8)
-        positions=[(item['x'],item['y']) for item in candidates[:2]]
-        if not positions:
-            positions=[(x,min(690,y+55)) for text,x,y in self.words(screen,(200,140,1150,460))
-                       if text.strip() in ('request','xin quan')][:2]
+        hints=[(item['x'],item['y']) for item in candidates[:4]]
+        # A troop-request label is independent of the Castle's visual level.
+        hints.extend((x,min(690,y+55)) for text,x,y in self.words(screen,(200,140,1150,460))
+                     if text.strip() in ('request','xin quan'))
+        positions=hints+self.castle_probe_points()
+        started=time.monotonic()
+        tried=[]
         for point in positions:
-            self.adb.tap(*point,jitter=0,delay_after=.5)
+            if time.monotonic()-started>60:
+                break
+            if any((point[0]-x)**2+(point[1]-y)**2<35**2 for x,y in tried):
+                continue
+            self.adb._guard_input()
+            self.adb.tap(*point,jitter=0,delay_after=.18)
+            tried.append(point)
             screen=self.adb.screencap()
+            if screen is None or not self.vision.is_in_main_village(screen):
+                return None,None
             button=self.treasury_button(screen)
             if button:
                 return screen,button
+            # A selected building exposes Upgrade buttons across the bottom.
+            # Clear that toolbar before probing another map coordinate.
+            if not self.manager.deselect_all():
+                return None,None
         return None,None
 
     def collect_button(self, screen):
@@ -148,11 +182,15 @@ class TreasuryCollector:
             self.adb.tap(*close[:2],jitter=0,delay_after=.4)
 
     def run(self, log=None):
+        log=log or (lambda message:None)
         result=self._run(log)
         reason=result.get('reason')
         if reason not in ('disabled','cooldown','not_home'):
             now=time.time()
             self.memory.update(last_checked_at=now,last_result='collected' if result.get('verified') else reason)
+            if reason=='castle_not_found':
+                self.manager._treasury_next_check=now+120
+                log('[Treasury] Chưa tìm thấy Clan Castle; thử lại sau 2 phút.')
             if result.get('verified'):
                 self.memory['last_collected_at']=now
             if result.get('verified') or reason=='collect_unavailable':
@@ -178,6 +216,11 @@ class TreasuryCollector:
         if self.memory.get('last_result') in ('collected','collect_unavailable') and not pending and not war_enabled:
             return dict(verified=False,reason='cooldown')
         if now<getattr(self.manager,'_treasury_next_check',0) and not pending:
+            retry=self.manager._treasury_next_check
+            if getattr(self,'_logged_cooldown_until',None)!=retry:
+                detail=self.memory.get('last_result','chưa rõ')
+                log(f"[Treasury] Chờ lịch kiểm tra lúc {time.strftime('%H:%M:%S',time.localtime(retry))} (lượt trước: {detail}).")
+                self._logged_cooldown_until=retry
             return dict(verified=False,reason='cooldown')
         minutes=max(1,int(self.manager.settings.get('treasury_check_interval_min',30)))
         self.manager._treasury_next_check=now+minutes*60

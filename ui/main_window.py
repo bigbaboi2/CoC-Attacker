@@ -9,15 +9,18 @@ from datetime import datetime, timezone, timedelta
 import numpy as np
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget,
-    QLabel, QPushButton, QComboBox, QCheckBox, QSpinBox, QGroupBox,
-    QFormLayout, QGridLayout, QMessageBox, QFrame, QSplitter, QScrollArea, QDateTimeEdit, QStyle,
-    QBoxLayout, QInputDialog, QDialog, QLineEdit, QFileDialog, QSizePolicy
+    QLabel, QPushButton, QCheckBox, QGroupBox,
+    QFormLayout, QGridLayout, QMessageBox, QFrame, QSplitter, QScrollArea, QStyle,
+    QBoxLayout, QInputDialog, QDialog, QLineEdit, QFileDialog, QSizePolicy, QLayout,
+    QSystemTrayIcon, QMenu, QAction, QApplication
 )
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QObject
-from PyQt5.QtGui import QIcon, QFont
+from PyQt5.QtGui import QIcon
 
-from ui.styles import DARK_THEME_QSS
-from ui.widgets import StatCard, LiveScreenViewer, LogConsole, VillageTabBar, VillageLiveStatusWidget
+from ui.styles import theme_qss, TEXT_SIZES
+from ui.activity import activity_from_log
+from ui.widgets import StatCard, LiveScreenViewer, LogConsole, VillageTabBar, VillageLiveStatusWidget, BubbleTabBar
+from ui.widgets import NoWheelSpinBox as QSpinBox, NoWheelComboBox as QComboBox, NoWheelDateTimeEdit as QDateTimeEdit
 from config.settings import (
     BotSettings, DEFAULT_CONFIG, BUILDING_CATEGORY_LABELS,
     BUILDING_CATALOG, DEFAULT_BUILDING_WHITELIST,
@@ -26,6 +29,7 @@ from config.settings import (
 from core.adb_client import ADBSocketClient
 from core.mumu_optimizer import MuMuOptimizer
 from core.performance import PerformanceMonitor
+from core.startup import configure_startup, STARTUP_MODES
 from core.action_timer import ToolActionTimer
 from core.fixed_attack import FixedAttackPlan
 from ui.fixed_calibration import FixedCalibrationDialog
@@ -53,9 +57,9 @@ class BuildingItemWidget(QWidget):
         layout.addWidget(self.chk, 1)
 
         res_meta = {
-            "gold": ("🟡 Vàng", "#F59E0B", "rgba(245, 158, 11, 0.15)"),
-            "elixir": ("🟣 Dầu", "#EC4899", "rgba(236, 72, 153, 0.15)"),
-            "dark_elixir": ("⚫ Đen", "#A855F7", "rgba(168, 85, 247, 0.15)"),
+            "gold": ("Vàng", "#F59E0B", "rgba(245, 158, 11, 0.15)"),
+            "elixir": ("Dầu", "#EC4899", "rgba(236, 72, 153, 0.15)"),
+            "dark_elixir": ("Đen", "#A855F7", "rgba(168, 85, 247, 0.15)"),
         }
         for r in b_resources:
             badge_text, fg, bg = res_meta.get(r, (r.upper(), "#94A3B8", "rgba(148, 163, 184, 0.1)"))
@@ -67,23 +71,11 @@ class BuildingItemWidget(QWidget):
                     border: 1px solid {fg}40;
                     border-radius: 3px;
                     padding: 1px 4px;
-                    font-size: 10px;
                     font-weight: bold;
                 }}
             """)
             layout.addWidget(badge)
 
-        self.setStyleSheet("""
-            BuildingItemWidget {
-                border-radius: 5px;
-                border: 1px solid rgba(255, 255, 255, 0.05);
-                background-color: rgba(30, 41, 59, 0.4);
-            }
-            BuildingItemWidget:hover {
-                background-color: rgba(51, 65, 85, 0.6);
-                border-color: rgba(96, 165, 250, 0.3);
-            }
-        """)
 
 
 class BuildingSelectionDialog(QDialog):
@@ -92,7 +84,7 @@ class BuildingSelectionDialog(QDialog):
     def __init__(self, settings: BotSettings, parent=None):
         super().__init__(parent)
         self.settings = settings
-        self.setWindowTitle("🛠️ Thiết lập chi tiết từng công trình nâng cấp")
+        self.setWindowTitle("Thiết lập chi tiết từng công trình nâng cấp")
         self.resize(660, 560)
         self.setMinimumWidth(600)
         self.item_widgets = {}
@@ -106,54 +98,31 @@ class BuildingSelectionDialog(QDialog):
         top_bar.setSpacing(8)
 
         self.txt_search = QLineEdit()
-        self.txt_search.setPlaceholderText("🔍 Tìm nhanh công trình (pháo, bom, mỏ, trạm, cannon, xbow...)")
+        self.txt_search.setPlaceholderText("Tìm nhanh công trình (pháo, bom, mỏ, trạm, cannon, xbow...)")
         self.txt_search.textChanged.connect(self._apply_search_and_filter)
-        self.txt_search.setStyleSheet("""
-            QLineEdit {
-                background-color: #1E293B;
-                color: #F8FAFC;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 5px 10px;
-                font-size: 12px;
-            }
-            QLineEdit:focus {
-                border-color: #38BDF8;
-            }
-        """)
         top_bar.addWidget(self.txt_search, 1)
 
         self.active_resource_filter = "all"
         self.combo_res_filter = QComboBox()
         self.combo_res_filter.addItem("Tất cả tài nguyên", "all")
-        self.combo_res_filter.addItem("🟡 Chỉ Vàng", "gold")
-        self.combo_res_filter.addItem("🟣 Chỉ Dầu hồng", "elixir")
-        self.combo_res_filter.addItem("⚫ Chỉ Dầu đen", "dark_elixir")
+        self.combo_res_filter.addItem("Chỉ Vàng", "gold")
+        self.combo_res_filter.addItem("Chỉ Dầu hồng", "elixir")
+        self.combo_res_filter.addItem("Chỉ Dầu đen", "dark_elixir")
         self.combo_res_filter.currentIndexChanged.connect(
             lambda idx: self._set_resource_filter(self.combo_res_filter.itemData(idx))
         )
-        self.combo_res_filter.setStyleSheet("""
-            QComboBox {
-                background-color: #1E293B;
-                color: #F8FAFC;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 5px 8px;
-                font-size: 12px;
-                min-width: 125px;
-            }
-        """)
+        self.combo_res_filter.setMinimumWidth(150)
         top_bar.addWidget(self.combo_res_filter)
 
         main_layout.addLayout(top_bar)
 
         # 2. Tab Widget with Category Pages (Concise tab titles)
         category_tab_icons = {
-            "traps": "💣 Bẫy",
-            "resource": "🌾 Mỏ & Kho",
-            "defense": "🛡️ Phòng thủ",
-            "army": "⚔️ Binh lính",
-            "heroes": "👑 Tướng",
+            "traps": "Bẫy",
+            "resource": "Mỏ & Kho",
+            "defense": "Phòng thủ",
+            "army": "Binh lính",
+            "heroes": "Tướng",
         }
 
         self.tabs = QTabWidget()
@@ -171,10 +140,10 @@ class BuildingSelectionDialog(QDialog):
             # Quick action row for this category
             btn_row = QHBoxLayout()
             btn_row.setSpacing(6)
-            btn_all = QPushButton("✓ Chọn tất cả")
-            btn_none = QPushButton("✗ Bỏ chọn")
-            btn_gold_only = QPushButton("🟡 Chỉ Vàng")
-            btn_elixir_only = QPushButton("🟣 Chỉ Dầu")
+            btn_all = QPushButton("Chọn tất cả")
+            btn_none = QPushButton("Bỏ chọn")
+            btn_gold_only = QPushButton("Chỉ Vàng")
+            btn_elixir_only = QPushButton("Chỉ Dầu")
 
             btn_all.clicked.connect(lambda _, c=cat_key: self._set_category_all(c, True))
             btn_none.clicked.connect(lambda _, c=cat_key: self._set_category_all(c, False))
@@ -188,7 +157,7 @@ class BuildingSelectionDialog(QDialog):
 
             has_dark = any("dark_elixir" in BUILDING_KEY_TO_RESOURCES.get(k, ()) for k, _, _ in BUILDING_CATALOG.get(cat_key, ()))
             if has_dark:
-                btn_dark_only = QPushButton("⚫ Chỉ Đen")
+                btn_dark_only = QPushButton("Chỉ Đen")
                 btn_dark_only.clicked.connect(lambda _, c=cat_key: self._set_category_by_res(c, "dark_elixir"))
                 btn_row.addWidget(btn_dark_only)
 
@@ -230,17 +199,17 @@ class BuildingSelectionDialog(QDialog):
         # 3. Footer Bar
         footer = QHBoxLayout()
         footer.setSpacing(8)
-        btn_all_global = QPushButton("✨ Chọn tất cả")
+        btn_all_global = QPushButton("Chọn tất cả")
         btn_all_global.clicked.connect(lambda: self._set_all(True))
-        btn_none_global = QPushButton("🧹 Bỏ chọn tất cả")
+        btn_none_global = QPushButton("Bỏ chọn tất cả")
         btn_none_global.clicked.connect(lambda: self._set_all(False))
 
         self.lbl_stats = QLabel("")
-        self.lbl_stats.setStyleSheet("color: #38BDF8; font-weight: bold; font-size: 11px;")
+        self.lbl_stats.setStyleSheet("color: #38BDF8; font-weight: bold; ")
         self._update_dialog_stats()
 
-        btn_close = QPushButton("💾 Đóng & Lưu")
-        btn_close.setStyleSheet("background-color: #2563EB; color: white; font-weight: bold; padding: 5px 14px;")
+        btn_close = QPushButton("Đóng & Lưu")
+        btn_close.setObjectName('btn_primary')
         btn_close.clicked.connect(self.accept)
 
         footer.addWidget(btn_all_global)
@@ -322,9 +291,9 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("CoCAttack — Điều khiển MuMu")
         self.resize(1180, 780)
-        self.setStyleSheet(DARK_THEME_QSS)
-
+        self.setMinimumSize(1040, 620)
         self.settings = BotSettings()
+        self._apply_appearance()
         self._pending_logs = []
         self.bridge = GuiBridge()
         self._io_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='CoCAttackIO')
@@ -332,6 +301,10 @@ class MainWindow(QMainWindow):
         self._control_operation = None
         self._preview_pending = False
         self._closing = False
+        self._force_quit = False
+        self._session_elapsed = 0.0
+        self._session_started_at = None
+        self._subtabs = []
         self._frame_lock = threading.Lock()
         self._latest_frame = None
 
@@ -454,26 +427,51 @@ class MainWindow(QMainWindow):
         starting = self._control_operation == 'start'
         stopping = self._control_operation == 'stop' or (active and not running and not starting)
         idle = not active and not running and not self._operation_pending
-        for control in (self.device_combo, self.btn_connect, self.btn_refresh, self.btn_quick_opt, self.btn_start):
+
+        # The button clock is for this run only; saved uptime remains in the dashboard.
+        clock_active = (starting or running) and not stopping
+        if clock_active and not paused and self._session_started_at is None:
+            self._session_started_at = time.monotonic()
+        elif (paused or not clock_active) and self._session_started_at is not None:
+            self._session_elapsed += max(0.0, time.monotonic() - self._session_started_at)
+            self._session_started_at = None
+        for control in (self.device_combo, self.btn_connect, self.btn_refresh, self.btn_quick_opt):
             control.setEnabled(idle)
-        self.btn_pause.setEnabled(running and not self._operation_pending)
+        self.btn_start.setEnabled((idle or running) and not self._operation_pending)
         self.btn_stop.setEnabled(running and not self._operation_pending)
         dots = '·' * (1 + self._control_frame % 3)
-        self.btn_start.setText(
-            f'Đang mở {dots}' if starting else f'Đang chạy {dots}' if running and not paused and not stopping else 'Bắt đầu'
-        )
-        self.btn_pause.setText('Tiếp tục chạy' if paused else 'Tạm dừng')
+        if clock_active:
+            seconds = int(self._session_elapsed + (max(0.0, time.monotonic() - self._session_started_at)
+                                                   if self._session_started_at is not None else 0.0))
+            hours, rem = divmod(seconds, 3600)
+            minutes, secs = divmod(rem, 60)
+            clock_text = f'{hours:02d}:{minutes:02d}:{secs:02d}'
+            if not paused and self._control_frame % 2:
+                clock_text = clock_text.replace(':', ' ')
+            self.btn_start.setText(clock_text)
+            self.btn_start.setAccessibleName(f'Thời gian phiên chạy {hours:02d}:{minutes:02d}:{secs:02d}')
+            self.btn_start.setToolTip(('Đang mở tool · ' if starting else
+                                       'Đã tạm dừng · ' if paused else 'Đang chạy · ') +
+                                      f'{hours:02d}:{minutes:02d}:{secs:02d}')
+        else:
+            self.btn_start.setText('Bắt đầu')
+            self.btn_start.setAccessibleName('Bắt đầu')
+            self.btn_start.setToolTip('Bắt đầu chu trình tự động')
         self.btn_stop.setText(f'Đang dừng {dots}' if stopping else 'Dừng')
-        self.btn_pause.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay if paused else QStyle.SP_MediaPause))
+        self.btn_start.setIcon(self.style().standardIcon(
+            QStyle.SP_MediaPlay if paused or not running else QStyle.SP_MediaPause))
         for button, highlighted in (
             (self.btn_start, (starting or running) and not paused and not stopping),
-            (self.btn_pause, paused and not stopping),
             (self.btn_stop, stopping),
         ):
             if button.property('active') != highlighted:
                 button.setProperty('active', highlighted)
                 button.style().unpolish(button)
                 button.style().polish(button)
+        if self.btn_start.property('paused') != paused:
+            self.btn_start.setProperty('paused', paused)
+            self.btn_start.style().unpolish(self.btn_start)
+            self.btn_start.style().polish(self.btn_start)
         if starting or (running and not paused) or stopping:
             if not self._control_timer.isActive():
                 self._control_timer.start()
@@ -488,42 +486,99 @@ class MainWindow(QMainWindow):
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
         main_layout = QVBoxLayout(main_widget)
+        main_layout.setSizeConstraint(QLayout.SetNoConstraint)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
         self._compact_mode = False
 
-        navigation = QHBoxLayout()
+        self.navigation_widget = QWidget()
+        navigation_root = QHBoxLayout(self.navigation_widget)
+        navigation_root.setContentsMargins(0, 0, 0, 0)
+        navigation_root.setSpacing(8)
+        self.navigation_root = navigation_root
+        navigation_controls = QWidget()
+        navigation = QHBoxLayout(navigation_controls)
+        navigation.setContentsMargins(0, 0, 0, 0)
+        self.navigation_layout = navigation
+        navigation_root.addWidget(navigation_controls)
         self.tab_selector = QComboBox()
         self.tab_selector.setAccessibleName('Chuyển tab')
         self.tab_selector.setToolTip('Chọn tab muốn hiển thị')
         self.tab_selector.setMinimumWidth(160)
         self.tab_selector.hide()
         navigation.addWidget(self.tab_selector)
-        navigation.addStretch()
         self.btn_compact = QPushButton('Thu gọn')
+        self.btn_compact.setProperty('role', 'headerControl')
         self.btn_compact.setCheckable(True)
         self.btn_compact.setToolTip('Thu nhỏ cửa sổ và chuyển tab bằng ô chọn')
         self.btn_compact.toggled.connect(self._set_compact_mode)
         navigation.addWidget(self.btn_compact)
-        main_layout.addLayout(navigation)
+        self.btn_to_tray = QPushButton('Ẩn xuống khay ngay')
+        self.btn_to_tray.setProperty('role', 'headerControl')
+        self.btn_to_tray.setIcon(self.style().standardIcon(QStyle.SP_TitleBarMinButton))
+        self.btn_to_tray.setToolTip('Thu gọn xuống khay hệ thống')
+        self.btn_to_tray.setAccessibleName('Thu gọn xuống khay hệ thống')
+        self.btn_to_tray.clicked.connect(self._minimize_to_tray)
+        self.btn_pin = QPushButton('Luôn trên cùng')
+        self.btn_pin.setProperty('role', 'headerControl')
+        self.btn_pin.setCheckable(True)
+        self.btn_pin.setToolTip('Giữ cửa sổ CoCAttack trên các cửa sổ khác')
+        self.btn_pin.toggled.connect(self._set_always_on_top)
+        navigation.addWidget(self.btn_pin)
+        self.btn_theme = QPushButton()
+        self.btn_theme.setProperty('role', 'headerControl')
+        self.btn_theme.setAccessibleName('Chuyển theme sáng tối')
+        self.btn_theme.clicked.connect(self._toggle_theme)
+        navigation.addWidget(self.btn_theme)
+        size_label = QLabel('Cỡ chữ')
+        navigation.addWidget(size_label)
+        self.combo_text_size = QComboBox()
+        self.combo_text_size.setAccessibleName('Cỡ chữ giao diện')
+        for label, value in (('Nhỏ', 'small'), ('Vừa', 'medium'), ('Lớn', 'large')):
+            self.combo_text_size.addItem(label, value)
+        self.combo_text_size.setCurrentIndex(max(0, self.combo_text_size.findData(
+            self.settings.get('ui_text_size', 'medium'))))
+        self.combo_text_size.currentIndexChanged.connect(self._change_text_size)
+        navigation.addWidget(self.combo_text_size)
+        self._update_theme_button()
+        self.navigation_scroll = QScrollArea()
+        self.navigation_scroll.setFrameShape(QFrame.NoFrame)
+        self.navigation_scroll.setWidgetResizable(True)
+        self.navigation_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.navigation_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.navigation_scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.navigation_scroll.setFixedHeight(58)
+        self.navigation_scroll.setWidget(self.navigation_widget)
+        main_layout.addWidget(self.navigation_scroll)
 
         # 1. Top Control Bar
         top_bar = self._create_top_bar()
+        navigation_root.insertWidget(0, self.device_row)
+        navigation_root.insertStretch(1)
         main_layout.addLayout(top_bar)
 
         # 2. Main Tab Widget
         self.tabs = QTabWidget()
+        self.tabs.setMinimumWidth(0)
+        self.tabs.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.village_tab_bar = VillageTabBar(self.tabs)
+        self.village_tab_bar.set_theme(self.settings.get('ui_theme', 'dark'))
         self.tabs.setTabBar(self.village_tab_bar)
-        self.tabs.addTab(self._scrollable_tab(self._create_dashboard_tab()), "Tổng quan")
-        self.main_village_tab = self.tabs.addTab(self._scrollable_tab(self._create_village_tab()), "Làng chính")
+        self.tabs.addTab(self._scrollable_tab(self._create_dashboard_tab(), 'Tổng quan',
+                                          'Theo dõi bot, tài nguyên, trận đấu và nhật ký trong một nơi.'), "Tổng quan")
+        self.main_village_tab = self.tabs.addTab(self._scrollable_tab(self._create_village_tab(), 'Làng chính',
+                                          'Chọn mục tiêu và các việc tự động trong làng chính.'), "Làng chính")
         self.village_tab_bar.main_village = self.main_village_tab
         self.main_attack_tab = self.tabs.addTab(
-            self._scrollable_tab(self._create_combat_tab()), "Cài đặt tấn công làng chính"
+            self._scrollable_tab(self._create_combat_tab(), 'Tấn công làng chính',
+                                 'Thiết lập chiến thuật, cách thả quân và điều kiện kết thúc trận.'), "Tấn công"
         )
-        self.builder_village_tab = self.tabs.addTab(self._scrollable_tab(self._create_builder_tab()), "Làng đêm")
-        self.tabs.addTab(self._scrollable_tab(self._create_optimizer_tab()), "Thiết bị")
-        self.tabs.addTab(self._scrollable_tab(self._create_schedule_tab()), 'Hẹn giờ')
+        self.builder_village_tab = self.tabs.addTab(self._scrollable_tab(self._create_builder_tab(), 'Làng đêm',
+                                               'Quản lý farm, quân đội và nâng cấp ở làng đêm.'), "Làng đêm")
+        self.device_tab = self.tabs.addTab(self._scrollable_tab(self._create_optimizer_tab(), 'Thiết bị',
+                                             'Kết nối, tối ưu MuMu và quản lý cấu hình tool.'), "Thiết bị")
+        self.tabs.addTab(self._scrollable_tab(self._create_schedule_tab(), 'Hẹn giờ',
+                                             'Đặt thời điểm tạm dừng hoặc đóng tool.'), 'Hẹn giờ')
         for index in range(self.tabs.count()):
             self.tab_selector.addItem(self.tabs.tabText(index))
         self.tab_selector.activated[int].connect(self._select_tab)
@@ -539,11 +594,22 @@ class MainWindow(QMainWindow):
         update_main_attack_tab(self.chk_main_village.isChecked())
         self.chk_main_village.toggled.connect(update_main_attack_tab)
         self.chk_builder_village.toggled.connect(self._highlight_active_village)
+        subtab_switches = (
+            self.chk_main_village, self.chk_walls, self.chk_farm_finish,
+            self.chk_auto_buildings, self.chk_buy_new, self.chk_upgrade_army,
+            self.chk_auto_surr, self.chk_builder_village,
+            self.chk_restart, self.chk_reconnect, self.chk_periodic_restart,
+            *self.builder_tasks.values(),
+        )
+        for switch in subtab_switches:
+            switch.toggled.connect(self._update_active_subtabs)
+        self._update_active_subtabs()
 
         main_layout.addWidget(self.tabs)
 
         # Status Bar
         self.statusBar().showMessage("Sẵn sàng. Hãy chọn thiết bị và bấm 'Bắt Đầu'")
+        QTimer.singleShot(0, self._update_expanded_minimum)
 
     def _select_tab(self, index):
         if self.tabs.isTabEnabled(index):
@@ -572,89 +638,281 @@ class MainWindow(QMainWindow):
             self.tab_selector.setItemText(tab, f'{label} · {status}')
         self.village_tab_bar.set_village_colors(colors)
 
+    def _update_active_subtabs(self, *_):
+        main = self.chk_main_village.isChecked()
+        builder = self.chk_builder_village.isChecked()
+        main_color, builder_color = '#fb923c', '#aa8ce6'
+        self.village_subtabs.tabBar().set_active_dots({
+            index: main_color for index, active in enumerate((
+                main,
+                main and (self.chk_walls.isChecked() or self.chk_farm_finish.isChecked()),
+                main and (self.chk_auto_buildings.isChecked() or self.chk_buy_new.isChecked()),
+                main and self.chk_upgrade_army.isChecked(),
+            )) if active
+        })
+        self.combat_subtabs.tabBar().set_active_dots({
+            index: main_color for index, active in enumerate((
+                main, main, main, main and self.chk_auto_surr.isChecked(),
+            )) if active
+        })
+        tasks = self.builder_tasks
+        self.builder_subtabs.tabBar().set_active_dots({
+            index: builder_color for index, active in enumerate((
+                builder,
+                builder and tasks['builder_base_upgrade_walls'].isChecked(),
+                builder and tasks['builder_base_upgrade_buildings'].isChecked(),
+                builder,
+            )) if active
+        })
+        self.device_subtabs.tabBar().set_active_dots({
+            1: '#5ec6ef'} if any(check.isChecked() for check in
+                                   (self.chk_restart, self.chk_reconnect, self.chk_periodic_restart)) else {})
+        self.schedule_subtabs.tabBar().set_active_dots(
+            {1: '#fbbf24'} if self.action_timer.remaining() is not None else {})
+
     def _set_compact_mode(self, compact):
         if compact == self._compact_mode:
             return
         self._compact_mode = compact
         if compact:
             self._expanded_geometry = self.saveGeometry()
-        self.tabs.tabBar().setVisible(not compact)
-        self.tab_selector.setVisible(compact)
+            self.navigation_layout.removeWidget(self.btn_compact)
+            self.navigation_layout.removeWidget(self.btn_pin)
+            self.actions_layout.addWidget(self.btn_compact)
+            self.actions_layout.addWidget(self.btn_pin)
+            self.navigation_scroll.hide()
+            self.overview_nav.hide()
+            self.device_row.hide()
+            self.state_badge.hide()
+            self.dashboard_right_layout.removeWidget(self.log_console)
+            self.compact_log_layout.addWidget(self.log_console)
+            self.dashboard_content.hide()
+            self.compact_log_host.show()
+            self.compact_log_host.setMinimumHeight(220)
+            self.overview_title_label.hide()
+            self.overview_hint_label.hide()
+        else:
+            self.actions_layout.removeWidget(self.btn_compact)
+            self.actions_layout.removeWidget(self.btn_pin)
+            self.navigation_layout.insertWidget(1, self.btn_compact)
+            self.navigation_layout.insertWidget(2, self.btn_pin)
+            self.navigation_scroll.show()
+            self.overview_nav.show()
+            self.device_row.show()
+            self.state_badge.show()
+            self.compact_log_layout.removeWidget(self.log_console)
+            self.dashboard_right_layout.addWidget(self.log_console)
+            self.compact_log_host.hide()
+            self.dashboard_content.show()
+        self.tabs.tabBar().show()
+        self.tab_selector.hide()
         self.btn_compact.setText('Mở rộng' if compact else 'Thu gọn')
-        self.btn_compact.setToolTip('Khôi phục giao diện đầy đủ' if compact else
-                                    'Thu nhỏ cửa sổ và chuyển tab bằng ô chọn')
-        self.top_bar.setDirection(QBoxLayout.TopToBottom if compact else QBoxLayout.LeftToRight)
+        self.btn_compact.setToolTip('Khôi phục giao diện đầy đủ' if compact else 'Chỉ hiện điều khiển, tab và nhật ký')
+        self.top_bar.setDirection(QBoxLayout.LeftToRight if compact or self.width() >= 1100
+                                  else QBoxLayout.TopToBottom)
         self.statusBar().setVisible(not compact)
-        # Reuse the same cards and controls so values and running jobs are preserved.
-        for grid, cards in self._dashboard_card_groups:
-            for card in cards:
-                grid.removeWidget(card)
-            columns = 3 if compact else 6
-            for index, card in enumerate(cards):
-                grid.addWidget(card, index // columns, index % columns)
-        self._fit_overview()
-        self.dashboard_splitter.setOrientation(Qt.Vertical if compact else Qt.Horizontal)
         self.centralWidget().layout().activate()
         if compact:
             self.showNormal()
-            # Clear the expanded layout's cached window minimum before resizing.
             self.setMinimumSize(0, 0)
-            self.resize(760, 640)
+            self.setMaximumSize(16777215, 16777215)
+            self.resize(760, 430)
+            self.setFixedSize(760, 430)
         else:
+            self.setMaximumSize(16777215, 16777215)
+            self._update_expanded_minimum()
             self.restoreGeometry(self._expanded_geometry)
+            self._fit_overview()
 
-    def _scrollable_tab(self, content):
+    def _update_expanded_minimum(self):
+        if getattr(self, '_compact_mode', False) or not hasattr(self, 'village_subtabs'):
+            return
+        # Keep the widest village form visible at the selected text size.
+        content_width = max(self.village_subtabs.widget(i).sizeHint().width()
+                            for i in range(self.village_subtabs.count()))
+        self.setMinimumSize(max(1040, content_width + 70), 620)
+
+    def _set_always_on_top(self, enabled):
+        geometry = self.saveGeometry()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, enabled)
+        self.show()
+        self.restoreGeometry(geometry)
+
+    def _minimize_to_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.showMinimized()
+            return
+        if not hasattr(self, '_tray_icon'):
+            tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
+            tray.setToolTip('CoCAttack · Nhấp để mở cửa sổ')
+            menu = QMenu(self)
+            restore_action = QAction('Mở CoCAttack', menu)
+            restore_action.triggered.connect(self._restore_from_tray)
+            menu.addAction(restore_action)
+            exit_action = QAction('Thoát CoCAttack', menu)
+            exit_action.triggered.connect(self._exit_completely)
+            menu.addAction(exit_action)
+            tray.setContextMenu(menu)
+            tray.activated.connect(lambda reason: self._restore_from_tray()
+                                   if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+            self._tray_icon = tray
+        QApplication.instance().setQuitOnLastWindowClosed(False)
+        self._tray_icon.show()
+        self.hide()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _exit_completely(self):
+        self._force_quit = True
+        self.close()
+
+    def _change_startup_mode(self, _index):
+        mode = self.combo_startup_mode.currentData()
+        if mode not in STARTUP_MODES:
+            return
+        previous = self.settings.get('ui_startup_mode', 'off')
+        if mode == previous:
+            return
+        try:
+            configure_startup(mode)
+        except Exception as exc:
+            self.combo_startup_mode.blockSignals(True)
+            self.combo_startup_mode.setCurrentIndex(max(0, self.combo_startup_mode.findData(previous)))
+            self.combo_startup_mode.blockSignals(False)
+            QMessageBox.warning(self, 'Tự khởi động', f'Không cập nhật được chế độ khởi động: {exc}')
+            return
+        self.settings.set('ui_startup_mode', mode)
+        self.statusBar().showMessage('Đã cập nhật chế độ tự khởi động.', 4000)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'top_bar') and not getattr(self, '_compact_mode', False):
+            direction = QBoxLayout.LeftToRight if self.width() >= 1100 else QBoxLayout.TopToBottom
+            if self.top_bar.direction() != direction:
+                self.top_bar.setDirection(direction)
+        if hasattr(self, 'activity_btn'):
+            self._refresh_activity_button()
+
+    def _scrollable_tab(self, content, title, hint):
+        if title != 'Tổng quan':
+            content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            return content
         scroll = QScrollArea()
+        scroll.setMinimumWidth(0)
+        scroll.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll.setWidget(content)
-        return scroll
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        page = QWidget()
+        page.setMinimumWidth(0)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(14, 4 if title == 'Tổng quan' else 12, 14, 14)
+        layout.setSpacing(10)
+        title_label = QLabel(title)
+        title_label.setProperty('role', 'pageTitle')
+        hint_label = QLabel(hint)
+        hint_label.setProperty('role', 'pageHint')
+        hint_label.setWordWrap(True)
+        title_label.hide()
+        hint_label.hide()
+        if title == 'Tổng quan':
+            self.overview_title_label = title_label
+            self.overview_hint_label = hint_label
+        layout.addWidget(title_label)
+        layout.addWidget(hint_label)
+        content.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(content)
+        if title == 'Tổng quan':
+            self.compact_log_host = QGroupBox('Nhật ký hoạt động')
+            self.compact_log_layout = QVBoxLayout(self.compact_log_host)
+            self.compact_log_host.hide()
+            layout.addWidget(self.compact_log_host)
+        layout.addStretch()
+        scroll.setWidget(page)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(self.overview_nav)
+        container_layout.addWidget(scroll, 1)
+        return container
+
+    def _apply_appearance(self):
+        theme = self.settings.get('ui_theme', 'dark')
+        size = self.settings.get('ui_text_size', 'medium')
+        self.setStyleSheet(theme_qss(theme, size))
+        if hasattr(self, 'village_tab_bar'):
+            self.village_tab_bar.set_theme(theme)
+        if hasattr(self, 'overview_nav'):
+            self.overview_nav.set_theme(theme)
+        for tabs in getattr(self, '_subtabs', ()):
+            tabs.tabBar().set_theme(theme)
+            QTimer.singleShot(0, lambda box=tabs: self._fit_subtabs(box))
+        if hasattr(self, 'btn_theme'):
+            self._update_theme_button()
+        if hasattr(self, 'overview'):
+            QTimer.singleShot(0, self._fit_overview)
+        if hasattr(self, 'village_subtabs'):
+            QTimer.singleShot(0, self._update_expanded_minimum)
+
+    def _update_theme_button(self):
+        theme = self.settings.get('ui_theme', 'dark')
+        self.btn_theme.setText('Sáng' if theme == 'dark' else 'Tối')
+        self.btn_theme.setToolTip('Đổi màu giao diện sáng / tối')
+
+    def _toggle_theme(self):
+        theme = 'light' if self.settings.get('ui_theme', 'dark') == 'dark' else 'dark'
+        self.settings.set('ui_theme', theme)
+        self._apply_appearance()
+
+    def _change_text_size(self, index):
+        size = self.combo_text_size.itemData(index)
+        if size in TEXT_SIZES and size != self.settings.get('ui_text_size', 'medium'):
+            self.settings.set('ui_text_size', size)
+            self._apply_appearance()
 
     def _create_top_bar(self) -> QHBoxLayout:
         self._control_frame = 0
         self._control_timer = QTimer(self)
-        self._control_timer.setInterval(320)
+        self._control_timer.setInterval(500)
         self._control_timer.timeout.connect(self._animate_controls)
         bar = QBoxLayout(QBoxLayout.LeftToRight)
         self.top_bar = bar
         bar.setSpacing(10)
-        devices = QHBoxLayout()
+        self.device_row = QWidget()
+        devices = QHBoxLayout(self.device_row)
+        devices.setContentsMargins(0, 0, 0, 0)
         actions = QHBoxLayout()
+        self.actions_layout = actions
 
         # Device selector
         dev_lbl = QLabel("Thiết Bị (ADB):")
-        dev_lbl.setStyleSheet("font-weight: bold; color: #94A3B8;")
+        dev_lbl.setObjectName('sectionDetail')
         self.device_combo = QComboBox()
         self.device_combo.setMinimumWidth(240)
+        self.device_combo.setMaximumWidth(290)
 
         self.btn_refresh = QPushButton("Quét")
+        self.btn_refresh.setProperty('role', 'headerControl')
+        self.btn_refresh.setFixedWidth(78)
         self.btn_refresh.clicked.connect(self._refresh_devices)
 
         self.btn_connect = QPushButton("Kết Nối")
+        self.btn_connect.setProperty('role', 'headerControl')
+        self.btn_connect.setFixedWidth(102)
         self.btn_connect.clicked.connect(self._connect_device)
 
         # State badge
         self.state_badge = QLabel("ĐANG CHỜ")
-        self.state_badge.setStyleSheet("""
-            background-color: #1E293B;
-            color: #94A3B8;
-            font-weight: bold;
-            font-size: 12px;
-            padding: 6px 14px;
-            border-radius: 6px;
-            border: 1px solid #334155;
-        """)
+        self.state_badge.setObjectName('stateBadge')
 
         # Action Buttons
         self.btn_start = QPushButton("Bắt đầu")
         self.btn_start.setObjectName("btn_start")
-        self.btn_start.clicked.connect(self._start_bot)
-
-        self.btn_pause = QPushButton("Tạm dừng")
-        self.btn_pause.setObjectName("btn_pause")
-        self.btn_pause.setEnabled(False)
-        self.btn_pause.clicked.connect(self._pause_bot)
+        self.btn_start.clicked.connect(self._toggle_run_pause)
 
         self.btn_stop = QPushButton("Dừng")
         self.btn_stop.setObjectName("btn_stop")
@@ -662,7 +920,6 @@ class MainWindow(QMainWindow):
         self.btn_stop.clicked.connect(self._stop_bot)
         for button, icon, tooltip in (
             (self.btn_start, QStyle.SP_MediaPlay, 'Bắt đầu chu trình tự động'),
-            (self.btn_pause, QStyle.SP_MediaPause, 'Tạm dừng tại bước hiện tại; có thể tiếp tục'),
             (self.btn_stop, QStyle.SP_MediaStop, 'Kết thúc chu trình và lưu thống kê'),
         ):
             button.setIcon(self.style().standardIcon(icon))
@@ -679,40 +936,61 @@ class MainWindow(QMainWindow):
         devices.addWidget(self.btn_refresh)
         devices.addWidget(self.btn_connect)
         actions.addWidget(self.state_badge)
-        actions.addStretch()
+        self.activity_btn = QPushButton('Sẵn sàng · Chọn thiết bị và bắt đầu')
+        self.activity_btn.setObjectName('activityButton')
+        self.activity_btn.setToolTip('Bấm để mở mục liên quan đến hoạt động hiện tại')
+        self.activity_btn.clicked.connect(self._open_activity_tab)
+        self.activity_btn.setMinimumWidth(180)
+        self.activity_btn.setMaximumWidth(16777215)
+        self.activity_btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._activity_text = self.activity_btn.text()
+        self._activity_section = 'overview'
+        self._activity_village = 'idle'
+        actions.addWidget(self.activity_btn, 1)
         actions.addWidget(self.btn_quick_opt)
         actions.addWidget(self.btn_start)
-        actions.addWidget(self.btn_pause)
         actions.addWidget(self.btn_stop)
-        bar.addLayout(devices)
         bar.addLayout(actions)
 
         return bar
 
     def _create_dashboard_tab(self) -> QWidget:
         widget = QWidget()
+        self.dashboard_content = widget
         layout = QVBoxLayout(widget)
-        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setAlignment(Qt.AlignTop)
+        layout.setContentsMargins(0, 0, 0, 8)
         layout.setSpacing(10)
 
         overview = QTabWidget()
         self.overview = overview
+        overview_bar = BubbleTabBar(overview)
+        overview_bar.set_theme(self.settings.get('ui_theme', 'dark'))
+        overview.setTabBar(overview_bar)
+        overview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(overview)
         common_page, main_page, builder_page = QWidget(), QWidget(), QWidget()
         overview.addTab(common_page, 'Chung')
         overview.addTab(main_page, 'Làng chính')
         overview.addTab(builder_page, 'Làng đêm')
+        self.overview_nav = BubbleTabBar()
+        self.overview_nav.set_theme(self.settings.get('ui_theme', 'dark'))
+        for index in range(overview.count()):
+            self.overview_nav.addTab(overview.tabText(index))
+        self.overview_nav.currentChanged.connect(overview.setCurrentIndex)
+        overview.currentChanged.connect(self.overview_nav.setCurrentIndex)
+        overview.tabBar().hide()
         common_layout = QVBoxLayout(common_page)
         main_layout = QVBoxLayout(main_page)
         builder_layout = QVBoxLayout(builder_page)
 
         common_grid = QGridLayout()
-        self.card_total_battles = StatCard('', 'Tổng trận hoàn tất')
-        self.card_main_total = StatCard('', 'Trận làng chính')
-        self.card_builder_total = StatCard('', 'Trận làng đêm')
-        self.card_uptime = StatCard('', 'Thời gian bot chạy', '00:00', '#10B981')
-        self.card_cpu = StatCard('', 'CPU tool / MuMu', '— / —')
-        self.card_fps = StatCard('', 'FPS game MuMu', '—')
+        self.card_total_battles = StatCard('', 'Tổng trận hoàn tất', tone='blue')
+        self.card_main_total = StatCard('', 'Trận làng chính', tone='blue')
+        self.card_builder_total = StatCard('', 'Trận làng đêm', tone='purple')
+        self.card_uptime = StatCard('', 'Tổng thời gian bot chạy', '00:00', '#10B981', 'green')
+        self.card_cpu = StatCard('', 'CPU tool / MuMu', '— / —', tone='slate')
+        self.card_fps = StatCard('', 'FPS game MuMu', '—', tone='slate')
         common_cards = (self.card_total_battles, self.card_main_total, self.card_builder_total,
                         self.card_uptime, self.card_cpu, self.card_fps)
         for index, card in enumerate(common_cards):
@@ -725,11 +1003,11 @@ class MainWindow(QMainWindow):
 
         cards_layout = QGridLayout()
         cards_layout.setSpacing(8)
-        self.card_battles = StatCard("", "Trận đã đánh", "0", "#38BDF8")
-        self.card_stars = StatCard("⭐", "Sao", "0", "#FBBF24")
-        self.card_gold = StatCard("", "Vàng thu được", "0", "#F59E0B")
-        self.card_elixir = StatCard("", "Dầu thu được", "0", "#EC4899")
-        self.card_dark = StatCard("", "Hắc dầu", "0", "#A855F7")
+        self.card_battles = StatCard("", "Trận đã đánh", "0", "#38BDF8", "blue")
+        self.card_stars = StatCard("⭐", "Sao", "0", "#FBBF24", "amber")
+        self.card_gold = StatCard("", "Vàng thu được", "0", "#F59E0B", "gold")
+        self.card_elixir = StatCard("", "Dầu thu được", "0", "#EC4899", "elixir")
+        self.card_dark = StatCard("", "Hắc dầu", "0", "#A855F7", "dark_elixir")
         main_cards = (self.card_battles, self.card_stars, self.card_gold,
                       self.card_elixir, self.card_dark)
         for index, card in enumerate(main_cards):
@@ -738,10 +1016,10 @@ class MainWindow(QMainWindow):
 
         rates_layout = QGridLayout()
         rates_layout.setSpacing(8)
-        self.card_gold_hour = StatCard('', 'Vàng RPH', '—')
-        self.card_elixir_hour = StatCard('', 'Tiên dược RPH', '—')
-        self.card_dark_hour = StatCard('', 'Hắc tiên dược RPH', '—')
-        self.card_attack_scan = StatCard('', 'Lượt đánh / đã quét', '0 / 0')
+        self.card_gold_hour = StatCard('', 'Vàng RPH', '—', tone='gold')
+        self.card_elixir_hour = StatCard('', 'Tiên dược RPH', '—', tone='elixir')
+        self.card_dark_hour = StatCard('', 'Hắc tiên dược RPH', '—', tone='dark_elixir')
+        self.card_attack_scan = StatCard('', 'Lượt đánh / đã quét', '0 / 0', tone='blue')
         for card in (self.card_gold_hour, self.card_elixir_hour, self.card_dark_hour):
             card.setToolTip('RPH lấy tài nguyên tối đa 50 trận làng chính đã xác nhận, chia theo thời gian chu kỳ làng chính. Chỉ dùng mẫu ghi từ khi tool tách thời gian hai làng.')
         self.card_attack_scan.setToolTip('Số lượt triển khai tấn công mới / tổng căn cứ đã đánh giá, gồm cả đánh và bỏ qua. Trận đã đánh ở hàng trên là số trận xác nhận kết thúc.')
@@ -762,14 +1040,15 @@ class MainWindow(QMainWindow):
         self.lbl_fastest_50.setToolTip('Thời gian nhanh nhất tool đã xác minh từ lúc bắt đầu thả quân đến 50%. Không ghi số đo dưới 5 giây hoặc trận bắt đầu theo dõi giữa chừng.')
         main_layout.addWidget(self.lbl_fastest_50)
         self.btn_reset_fastest=QPushButton('Đặt lại số đo kỷ lục 50%')
+        self.btn_reset_fastest.setObjectName('recordReset')
         self.btn_reset_fastest.setToolTip('Xóa số đo kỷ lục đã lưu, giữ nguyên loot, lượt đánh và thời gian.')
         self.btn_reset_fastest.clicked.connect(self._reset_fastest_record)
         main_layout.addWidget(self.btn_reset_fastest, alignment=Qt.AlignLeft)
 
         builder_grid = QGridLayout()
-        self.card_builder_started = StatCard('', 'Trận đã vào')
-        self.card_builder_stars = StatCard('', 'Sao đạt được')
-        self.card_builder_uptime = StatCard('', 'Thời gian làng đêm', '00:00')
+        self.card_builder_started = StatCard('', 'Trận đã vào', tone='purple')
+        self.card_builder_stars = StatCard('', 'Sao đạt được', tone='amber')
+        self.card_builder_uptime = StatCard('', 'Thời gian làng đêm', '00:00', tone='green')
         for index, card in enumerate((self.card_builder_started, self.card_builder_stars, self.card_builder_uptime)):
             builder_grid.addWidget(card, 0, index)
         builder_layout.addLayout(builder_grid)
@@ -792,6 +1071,7 @@ class MainWindow(QMainWindow):
 
         right_box = QGroupBox("Nhật ký")
         right_layout = QVBoxLayout(right_box)
+        self.dashboard_right_layout = right_layout
         self.log_console = LogConsole()
         right_layout.addWidget(self.log_console)
 
@@ -800,13 +1080,46 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 4)
 
-        layout.addWidget(splitter)
+        layout.addWidget(splitter, 1)
         return widget
 
     def _fit_overview(self):
         page_height = self.overview.currentWidget().sizeHint().height()
-        tabs_height = self.overview.tabBar().sizeHint().height()
-        self.overview.setFixedHeight(page_height + tabs_height + 6)
+        self.overview.setFixedHeight(page_height + 6)
+        if hasattr(self, 'dashboard_content'):
+            self.dashboard_content.setMaximumHeight(16777215)
+            self.dashboard_content.setFixedHeight(self.dashboard_content.sizeHint().height())
+
+    def _make_subtabs(self, sections):
+        tabs = QTabWidget()
+        bar = BubbleTabBar(tabs)
+        bar.set_theme(self.settings.get('ui_theme', 'dark'))
+        tabs.setTabBar(bar)
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        for name, widgets in sections:
+            page = QWidget()
+            column = QVBoxLayout(page)
+            column.setContentsMargins(8, 8, 8, 8)
+            column.setSpacing(8)
+            for item in widgets:
+                column.addWidget(item)
+            column.addStretch()
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            scroll.setWidget(page)
+            tabs.addTab(scroll, name)
+        self._subtabs.append(tabs)
+        return tabs
+
+    @staticmethod
+    def _fit_subtabs(tabs):
+        page = tabs.currentWidget()
+        if isinstance(page, QScrollArea):
+            return
+        if page is not None:
+            tabs.setFixedHeight(page.sizeHint().height() + tabs.tabBar().sizeHint().height() + 14)
 
     def _create_village_tab(self) -> QWidget:
         widget = QWidget()
@@ -862,12 +1175,14 @@ class MainWindow(QMainWindow):
             check.toggled.connect(lambda checked,name=key:self.settings.set('loot_filter_'+name,checked))
             self.loot_filter_checks[key]=check
             form_loot.addRow(check,control)
+            control.setEnabled(check.isChecked())
+            check.toggled.connect(control.setEnabled)
         form_loot.addRow("Số lần bỏ qua tối đa:", self.spin_skips)
         reset_loot_row = QHBoxLayout()
         reset_loot_row.addStretch()
         reset_loot_row.addWidget(self._make_reset_button(self._reset_loot_defaults))
         form_loot.addRow(reset_loot_row)
-        layout.addWidget(grp_loot, 1, 0)
+        self.grp_loot = grp_loot
 
         # Group 2: Automation Toggles
         grp_auto = QGroupBox("Chăm sóc làng")
@@ -932,6 +1247,8 @@ class MainWindow(QMainWindow):
         form_treasury=QFormLayout()
         form_treasury.addRow('Kiểm tra dự phòng khi chưa rõ giờ (phút):',self.spin_treasury_interval)
         vbox_treasury.addLayout(form_treasury)
+        self.spin_treasury_interval.setEnabled(self.chk_treasury.isChecked())
+        self.chk_treasury.toggled.connect(self.spin_treasury_interval.setEnabled)
         treasury_note=QLabel('Lưu riêng giờ Star Bonus và hội chiến, cùng trạng thái đã thu/kho trống. Hai ô chọn thời điểm kiểm tra; Treasury thu chung tài nguyên đang có trong kho.')
         treasury_note.setWordWrap(True)
         vbox_treasury.addWidget(treasury_note)
@@ -946,6 +1263,8 @@ class MainWindow(QMainWindow):
         self.spin_train_slot.setValue(self.settings.get('quick_train_slot', 1))
         self.spin_train_slot.valueChanged.connect(lambda value: self.settings.set('quick_train_slot', value))
         form_auto.addRow('Đội quân nhanh:', self.spin_train_slot)
+        self.spin_train_slot.setEnabled(self.chk_train.isChecked())
+        self.chk_train.toggled.connect(self.spin_train_slot.setEnabled)
         self.spin_maintenance = QSpinBox()
         self.spin_maintenance.setRange(10, 600)
         self.spin_maintenance.setValue(self.settings.get('maintenance_interval_sec', 45))
@@ -968,7 +1287,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(grp_auto, 2, 0)
 
         # Group 3: Wall Upgrades
-        grp_wall = QGroupBox("Nâng tường · ưu tiên level thấp nhất")
+        grp_wall = QGroupBox("Nâng tường")
         form_wall = QFormLayout(grp_wall)
 
         self.chk_walls = QCheckBox("Nâng tường khi đạt ngưỡng")
@@ -996,27 +1315,16 @@ class MainWindow(QMainWindow):
         self.spin_wall_elixir.valueChanged.connect(lambda v: self.settings.set('min_elixir_to_upgrade_wall', v))
         for control in (self.spin_wall_gold, self.spin_wall_elixir):
             control.setToolTip('Ngưỡng để mở một lượt nâng. Tài nguyên đã đạt ngưỡng được dùng đến khi không đủ nâng thêm; vàng và dầu được xét riêng.')
-        self.spin_wall_limit = QSpinBox()
-        self.spin_wall_limit.setRange(0, 100)
-        self.spin_wall_limit.setSpecialValueText('Tối đa theo tiền (Max)')
-        self.spin_wall_limit.setValue(self.settings.get('wall_max_upgrades_per_cycle', 5))
-        self.spin_wall_limit.valueChanged.connect(lambda v: self.settings.set('wall_max_upgrades_per_cycle', v))
-        self.spin_wall_limit.setToolTip('Giới hạn số đoạn trong một giao dịch. Bot tiếp tục giao dịch kế tiếp trong cùng lượt nếu còn đủ tài nguyên.')
-
-        self.chk_wall_max_money = QCheckBox('Nâng tối đa theo số tiền hiện có')
-        self.chk_wall_max_money.setChecked(self.settings.get('wall_upgrade_max_by_money', False))
-        def on_max_money_toggled(checked):
-            self.settings.set('wall_upgrade_max_by_money', checked)
-            self.spin_wall_limit.setEnabled(not checked)
-        self.chk_wall_max_money.toggled.connect(on_max_money_toggled)
-        self.spin_wall_limit.setEnabled(not self.chk_wall_max_money.isChecked())
+        self.chk_wall_lowest = QCheckBox('Ưu tiên nâng tường cấp thấp nhất')
+        self.chk_wall_lowest.setChecked(self.settings.get('wall_lowest_first', True))
+        self.chk_wall_lowest.toggled.connect(lambda checked: self.settings.set('wall_lowest_first', checked))
+        self.chk_wall_lowest.setToolTip('Bật: dùng cấp thấp nhất đã quét qua Layout Editor. Tắt: chọn nhóm tường đầu tiên OCR thấy trong Menu thợ.')
 
         form_wall.addRow(self.chk_walls)
+        form_wall.addRow(self.chk_wall_lowest)
         form_wall.addRow("Tài nguyên dùng để nâng:", self.combo_wall_res)
         form_wall.addRow("Ngưỡng vàng để bắt đầu nâng:", self.spin_wall_gold)
         form_wall.addRow('Ngưỡng dầu để bắt đầu nâng:', self.spin_wall_elixir)
-        form_wall.addRow('Số đoạn tối đa mỗi lần nâng:', self.spin_wall_limit)
-        form_wall.addRow('', self.chk_wall_max_money)
         self.combo_wall_quantity_mode=QComboBox()
         self.combo_wall_quantity_mode.addItems(['Nhận diện nút như hiện tại (OCR/ảnh)','Tọa độ cố định +10 / +1 / -1'])
         self.combo_wall_quantity_mode.setCurrentIndex(1 if self.settings.get('wall_quantity_button_mode','ocr')=='fixed' else 0)
@@ -1037,23 +1345,23 @@ class MainWindow(QMainWindow):
         self.chk_wall_hold.toggled.connect(lambda enabled: self.settings.set('wall_hold_enabled', enabled))
         self.chk_wall_hold.setToolTip('Khi nâng lỗi và tài nguyên đạt 125% ngưỡng nâng: ngừng tìm trận, thử lại mỗi 30 giây. Chạy tiếp sau 2 lần đọc dưới 110%. Đây không phải phần trăm dung lượng kho.')
         form_wall.addRow(self.chk_wall_hold)
-        self.chk_farm_finish = QCheckBox('Tường đã tối đa: dùng hết thợ → cày full kho → dừng tool')
+        self.chk_farm_finish = QCheckBox('Tường đã tối đa: cày đầy kho rồi dừng')
         self.chk_farm_finish.setChecked(self.settings.get('farm_finish_enabled', False))
         self.chk_farm_finish.setToolTip('Bật khi tường đã tối đa: tự động dùng hết số thợ rảnh để nâng công trình (duy trì 0 thợ), sau đó farm cày full 100% kho tài nguyên (vàng/dầu) rồi mới dừng tool.')
         self.lbl_farm_finish_max_badge = QLabel('')
-        self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; font-size: 11px;')
+        self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; ')
         row_farm_finish = QHBoxLayout()
         row_farm_finish.addWidget(self.chk_farm_finish)
         row_farm_finish.addWidget(self.lbl_farm_finish_max_badge)
         row_farm_finish.addStretch(1)
         form_wall.addRow(row_farm_finish)
         self.chk_farm_finish.toggled.connect(self._on_farm_finish_toggled)
-        self.chk_farm_finish_close = QCheckBox('Đóng hẳn ứng dụng khi hoàn tất (nếu bỏ chọn sẽ tạm dừng bot)')
+        self.chk_farm_finish_close = QCheckBox('Đóng ứng dụng khi hoàn tất')
         self.chk_farm_finish_close.setChecked(self.settings.get('farm_finish_close_app', False))
         self.chk_farm_finish_close.toggled.connect(lambda enabled: self.settings.set('farm_finish_close_app', enabled))
         self.chk_farm_finish_close.setToolTip('Nếu bật: đóng toàn bộ tool khi đạt full kho và hết thợ. Nếu tắt: chỉ tạm dừng bot và giữ nguyên tool.')
         form_wall.addRow(self.chk_farm_finish_close)
-        self.chk_farm_finish_wait_builders = QCheckBox('Hết thợ & full kho: Đóng game, chờ thợ rảnh gần nhất rồi tự chạy tiếp')
+        self.chk_farm_finish_wait_builders = QCheckBox('Hết thợ và đầy kho: chờ thợ rồi chạy tiếp')
         self.chk_farm_finish_wait_builders.setChecked(self.settings.get('farm_finish_wait_builders', True))
         self.chk_farm_finish_wait_builders.toggled.connect(lambda enabled: self.settings.set('farm_finish_wait_builders', enabled))
         self.chk_farm_finish_wait_builders.setToolTip('Khi full kho tài nguyên và không còn thợ rảnh: đóng game Clash of Clans, tạm dừng bot đúng thời gian công trình đang nâng gần nhất hoàn thành, sau đó tự mở lại game để kiểm tra và tiếp tục nâng cấp. Chỉ dừng bot hẳn khi không còn công trình nào phù hợp sau lọc.')
@@ -1072,14 +1380,14 @@ class MainWindow(QMainWindow):
         self.combo_farm_finish_resources.currentIndexChanged.connect(lambda i: self.settings.set('farm_finish_resources', finish_modes[i]))
         form_wall.addRow('Kho cần đạt:', self.combo_farm_finish_resources)
         self.lbl_wall_status.setWordWrap(True)
-        self.lbl_wall_status.setStyleSheet('color: #aeb8c6; font-size: 12px;')
+        self.lbl_wall_status.setStyleSheet('color: #aeb8c6; ')
         form_wall.addRow('Trạng thái:', self.lbl_wall_status)
-        self.btn_wall_recheck = QPushButton('Kiểm tra thợ ở lượt về làng kế tiếp')
+        self.btn_wall_recheck = QPushButton('Kiểm tra thợ lượt tới')
         self.btn_wall_recheck.clicked.connect(self._recheck_wall_builders)
-        self.btn_verify_layout_now = QPushButton('🔍 Quét xác minh Max tường ngay (Layout Editor)')
+        self.btn_verify_layout_now = QPushButton('🔍 Quét Max tường ngay')
         self.btn_verify_layout_now.setToolTip('Mở Layout Editor kiểm tra chính xác toàn bộ tường của tài khoản đang mở trên màn hình xem đã Max hay chưa.')
         self.btn_verify_layout_now.clicked.connect(self._manual_verify_layout_editor)
-        wall_btn_row = QHBoxLayout()
+        wall_btn_row = QVBoxLayout()
         wall_btn_row.addWidget(self.btn_verify_layout_now)
         wall_btn_row.addWidget(self.btn_wall_recheck)
         form_wall.addRow('', wall_btn_row)
@@ -1088,6 +1396,27 @@ class MainWindow(QMainWindow):
         reset_wall_row.addWidget(self._make_reset_button(self._reset_wall_defaults))
         form_wall.addRow(reset_wall_row)
         layout.addWidget(grp_wall, 1, 1, 2, 1)
+        wall_options = (self.chk_wall_lowest, self.combo_wall_res, self.spin_wall_gold,
+                        self.spin_wall_elixir, self.combo_wall_quantity_mode,
+                        self.spin_wall_fixed_gap, self.chk_wall_hold,
+                        self.btn_wall_recheck, self.btn_verify_layout_now)
+        def update_wall_options():
+            for control in wall_options:
+                control.setEnabled(self.chk_walls.isChecked())
+            self.spin_wall_fixed_gap.setEnabled(
+                self.chk_walls.isChecked() and self.combo_wall_quantity_mode.currentIndex() == 1)
+        self.chk_walls.toggled.connect(update_wall_options)
+        self.combo_wall_quantity_mode.currentIndexChanged.connect(update_wall_options)
+        update_wall_options()
+
+        farm_finish_options = (self.chk_farm_finish_close, self.chk_farm_finish_wait_builders,
+                               self.spin_farm_finish_percent, self.combo_farm_finish_resources)
+        def update_farm_finish_options():
+            for control in farm_finish_options:
+                control.setEnabled(self.chk_farm_finish.isChecked())
+        self._update_farm_finish_options = update_farm_finish_options
+        self.chk_farm_finish.toggled.connect(update_farm_finish_options)
+        update_farm_finish_options()
 
         # Group 4: Custom Building Upgrades
         grp_bldg = QGroupBox("Nâng cấp công trình tùy chọn · phân công thợ xây")
@@ -1221,13 +1550,13 @@ class MainWindow(QMainWindow):
 
         self.lbl_bldg_count = QLabel("")
         self.lbl_bldg_count.setWordWrap(True)
-        self.lbl_bldg_count.setStyleSheet("color: #94A3B8; font-size: 11px;")
+        self.lbl_bldg_count.setStyleSheet("color: #94A3B8; ")
         self._update_building_selection_summary()
         form_bldg.addRow("Đang chọn:", self.lbl_bldg_count)
 
         self.lbl_bldg_status = QLabel("Chưa kiểm tra nâng công trình.")
         self.lbl_bldg_status.setWordWrap(True)
-        self.lbl_bldg_status.setStyleSheet("color: #aeb8c6; font-size: 12px;")
+        self.lbl_bldg_status.setStyleSheet("color: #aeb8c6; ")
         form_bldg.addRow("Trạng thái thợ:", self.lbl_bldg_status)
 
         reset_bldg_row = QHBoxLayout()
@@ -1235,6 +1564,16 @@ class MainWindow(QMainWindow):
         reset_bldg_row.addWidget(self._make_reset_button(self._reset_building_upgrade_defaults))
         form_bldg.addRow(reset_bldg_row)
         layout.addWidget(grp_bldg, 3, 1)
+        building_options = (self.combo_bldg_priority, self.combo_specific_target,
+                            self.combo_bldg_wait_mode, self.chk_bldg_menu_filter,
+                            self.combo_bldg_preset, self.btn_bldg_details,
+                            *self.chk_bldg_resources.values(), *self.chk_bldg_categories.values())
+        def update_building_options():
+            for control in building_options:
+                control.setEnabled(self.chk_auto_buildings.isChecked())
+        self._update_building_options = update_building_options
+        self.chk_auto_buildings.toggled.connect(update_building_options)
+        update_building_options()
 
         # Army research has its own settings, independent of builder upgrades.
         grp_army = QGroupBox("Nâng cấp quân đội · phòng nghiên cứu")
@@ -1267,19 +1606,39 @@ class MainWindow(QMainWindow):
         self.army_priority.setCurrentIndex(max(0, self.army_priority.findData(self.settings.get("army_upgrade_priority", "suggested"))))
         self.army_priority.currentIndexChanged.connect(lambda _: self.settings.set("army_upgrade_priority", self.army_priority.currentData()))
         form_army.addRow("Ưu tiên nâng quân:", self.army_priority)
+        army_options = (*self.army_resource_checks.values(), *self.army_type_checks.values(), self.army_priority)
+        def update_army_options():
+            for control in army_options:
+                control.setEnabled(self.chk_upgrade_army.isChecked())
+        self.chk_upgrade_army.toggled.connect(update_army_options)
+        update_army_options()
 
         grp_army.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         left_upgrade_column = QVBoxLayout()
         left_upgrade_column.setContentsMargins(0, 0, 0, 0)
         left_upgrade_column.addWidget(grp_army)
         left_upgrade_column.addWidget(grp_treasury)
+        main_village_groups = (grp_auto, grp_treasury, grp_wall, grp_bldg, grp_army)
+        self._main_village_groups = main_village_groups
+        def update_main_village_options(enabled):
+            for group in main_village_groups:
+                group.setEnabled(enabled)
+        self.chk_main_village.toggled.connect(update_main_village_options)
+        update_main_village_options(self.chk_main_village.isChecked())
         left_upgrade_column.addStretch()
         layout.addLayout(left_upgrade_column, 3, 0)
 
-        layout.setRowStretch(3, 1)
-        layout.setColumnStretch(0, 1)
-        layout.setColumnStretch(1, 1)
-        return widget
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.village_subtabs = self._make_subtabs((
+            ('Chăm sóc làng', (self.chk_main_village, grp_auto, grp_treasury)),
+            ('Nâng tường', (grp_wall,)),
+            ('Nâng công trình', (grp_bldg,)),
+            ('Nâng quân', (grp_army,)),
+        ))
+        root.addWidget(self.village_subtabs)
+        return page
 
     def _create_combat_tab(self) -> QWidget:
         widget = QWidget()
@@ -1419,6 +1778,8 @@ class MainWindow(QMainWindow):
         grid_heroes.addWidget(self.chk_abilities, 3, 0, 1, 2)
         grid_heroes.addWidget(QLabel('Dùng kỹ năng sau khi thả tướng (giây):'), 4, 0)
         grid_heroes.addWidget(self.spin_ability_delay, 4, 1)
+        self.spin_ability_delay.setEnabled(self.chk_abilities.isChecked())
+        self.chk_abilities.toggled.connect(self.spin_ability_delay.setEnabled)
         reset_heroes_row = QHBoxLayout()
         reset_heroes_row.addStretch()
         reset_heroes_row.addWidget(self._make_reset_button(self._reset_heroes_defaults))
@@ -1513,6 +1874,25 @@ class MainWindow(QMainWindow):
         self.combo_end_mode.setCurrentIndex(1 if self.settings.get('end_condition_mode','any')=='all' else 0)
         self.combo_end_mode.currentIndexChanged.connect(lambda i:self.settings.set('end_condition_mode','all' if i else 'any'))
         form_surr.addRow('Kết hợp điều kiện:',self.combo_end_mode)
+        end_conditions = (self.chk_end_stars, self.chk_end_time,
+                          self.chk_end_loot, self.chk_end_destruction)
+        def update_end_conditions():
+            enabled = self.chk_auto_surr.isChecked()
+            for check in end_conditions:
+                check.setEnabled(enabled)
+            for check, control in ((self.chk_end_stars, self.spin_stars),
+                                   (self.chk_end_time, self.spin_timeout),
+                                   (self.chk_end_loot, self.spin_loot_percent),
+                                   (self.chk_end_destruction, self.spin_destruction),
+                                   (self.chk_end_stars, self.combo_star_source),
+                                   (self.chk_end_loot, self.combo_loot_resource)):
+                control.setEnabled(enabled and check.isChecked())
+            self.combo_end_mode.setEnabled(enabled)
+        self._update_end_conditions = update_end_conditions
+        self.chk_auto_surr.toggled.connect(update_end_conditions)
+        for check in end_conditions:
+            check.toggled.connect(update_end_conditions)
+        update_end_conditions()
         note=QLabel('Thời gian đã tích luôn là giới hạn trên. Tỷ lệ farm tính trên tài nguyên có thể cướp lúc bắt đầu trận; thay đổi áp dụng từ trận tiếp theo.')
         note.setWordWrap(True);form_surr.addRow(note)
         reset_surr_row = QHBoxLayout()
@@ -1521,15 +1901,25 @@ class MainWindow(QMainWindow):
         form_surr.addRow(reset_surr_row)
         layout.insertWidget(1, grp_surr)
 
-        layout.addStretch()
-        return widget
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.combat_subtabs = self._make_subtabs((
+            ('Đối thủ', (self.grp_loot,)),
+            ('Chiến thuật', (grp_strat, grp_ultra)),
+            ('Lực lượng', (grp_heroes, grp_siege)),
+            ('Kết thúc trận', (grp_surr,)),
+        ))
+        root.addWidget(self.combat_subtabs)
+        return page
 
     def _create_builder_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        grp_builder = QGroupBox("Tự Động Hóa Làng Đêm (Builder Base)")
+        grp_builder = QGroupBox("Tự động hóa làng đêm")
         form_builder = QFormLayout(grp_builder)
+        form_general = form_builder
 
         enabled = QCheckBox("Bật tự động farm làng đêm")
         self.chk_builder_village = enabled
@@ -1544,7 +1934,10 @@ class MainWindow(QMainWindow):
             checkbox.toggled.connect(lambda checked, option=key: self.settings.set(option, checked))
             form_builder.addRow(checkbox)
             tasks[key] = checkbox
+        self._builder_task_controls = tuple(tasks.values())
 
+        grp_builder_wall = QGroupBox("Nâng tường làng đêm")
+        form_builder = QFormLayout(grp_builder_wall)
         self.builder_wall_thresholds = {}
         self.chk_builder_wall_lowest = QCheckBox("Ưu tiên nâng tường cấp thấp nhất")
         self.chk_builder_wall_lowest.setChecked(self.settings.get("builder_base_wall_lowest_first", False))
@@ -1585,6 +1978,8 @@ class MainWindow(QMainWindow):
             self.builder_wall_thresholds[key] = threshold
 
         # Tùy chọn nâng công trình làng đêm
+        grp_builder_buildings = QGroupBox("Nâng công trình làng đêm")
+        form_builder = QFormLayout(grp_builder_buildings)
         self.spin_builder_reserve = QSpinBox()
         self.spin_builder_reserve.setRange(0, 4)
         self.spin_builder_reserve.setValue(self.settings.get("builder_base_reserve_builders", 0))
@@ -1618,6 +2013,8 @@ class MainWindow(QMainWindow):
 
         enabled.toggled.connect(toggle_farm)
 
+        grp_builder_battle = QGroupBox("Đánh trận làng đêm")
+        form_builder = QFormLayout(grp_builder_battle)
         combo = QComboBox()
         self.combo_builder_combo = combo
         for key, (label, _) in COMBOS.items():
@@ -1643,6 +2040,7 @@ class MainWindow(QMainWindow):
         obstacle.setChecked(self.settings.get("builder_base_obstacle_attack", False))
         obstacle.toggled.connect(lambda checked: self.settings.set("builder_base_obstacle_attack", checked))
         form_builder.addRow(obstacle)
+        form_builder = form_general
         clear_trees = QCheckBox("Dọn cây và chướng ngại vật (chưa khả dụng)")
         clear_trees.setEnabled(False)
         form_builder.addRow(clear_trees)
@@ -1673,10 +2071,28 @@ class MainWindow(QMainWindow):
         reset_builder_row.addStretch()
         reset_builder_row.addWidget(self._make_reset_button(self._reset_builder_base_defaults))
         form_builder.addRow(reset_builder_row)
+        builder_groups = (grp_builder_wall, grp_builder_buildings, grp_builder_battle)
+        self._builder_groups = builder_groups
+        builder_general_options = (*self._builder_task_controls, self.chk_builder_pause,
+                                   self.spin_builder_int, self.chk_builder_obstacle)
+        def update_builder_options(checked):
+            for control in (*builder_general_options, *builder_groups):
+                control.setEnabled(checked)
+        self._update_builder_options = update_builder_options
+        enabled.toggled.connect(update_builder_options)
+        update_builder_options(enabled.isChecked())
 
-        layout.addWidget(grp_builder)
-        layout.addStretch()
-        return widget
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.builder_subtabs = self._make_subtabs((
+            ('Tác vụ', (grp_builder,)),
+            ('Nâng tường', (grp_builder_wall,)),
+            ('Công trình', (grp_builder_buildings,)),
+            ('Trận đấu', (grp_builder_battle,)),
+        ))
+        root.addWidget(self.builder_subtabs)
+        return page
 
     def _create_optimizer_tab(self) -> QWidget:
         widget = QWidget()
@@ -1691,7 +2107,7 @@ class MainWindow(QMainWindow):
             'Bắt đầu sẽ mở game nếu MuMu đang ở màn hình chính. Tùy chọn bên dưới dùng khi game bị kẹt.'
         )
         info_lbl.setWordWrap(True)
-        info_lbl.setStyleSheet("color: #94A3B8; font-size: 13px; line-height: 1.6;")
+        info_lbl.setStyleSheet("color: #94A3B8; line-height: 1.6;")
         vbox_opt.addWidget(info_lbl)
 
         btn_run_opt = QPushButton(" Chạy Tối Ưu Hóa MuMu Ngay")
@@ -1728,6 +2144,8 @@ class MainWindow(QMainWindow):
         self.spin_restart_interval.valueChanged.connect(lambda value: self.settings.set('periodic_restart_interval_mins', value))
         form_anti.addRow(self.chk_periodic_restart)
         form_anti.addRow('Chu kỳ restart game:', self.spin_restart_interval)
+        self.spin_restart_interval.setEnabled(self.chk_periodic_restart.isChecked())
+        self.chk_periodic_restart.toggled.connect(self.spin_restart_interval.setEnabled)
         reset_antiban_row = QHBoxLayout()
         reset_antiban_row.addStretch()
         reset_antiban_row.addWidget(self._make_reset_button(self._reset_antiban_defaults))
@@ -1742,7 +2160,7 @@ class MainWindow(QMainWindow):
             "Lưu nhanh cấu hình hiện tại đang dùng vào config.json, hoặc xuất ra tệp dự phòng / nhập cấu hình từ máy tính để áp dụng ngay vào tool."
         )
         cfg_info.setWordWrap(True)
-        cfg_info.setStyleSheet("color: #94A3B8; font-size: 13px; line-height: 1.5; margin-bottom: 6px;")
+        cfg_info.setStyleSheet("color: #94A3B8; line-height: 1.5; margin-bottom: 6px;")
         vbox_config.addWidget(cfg_info)
 
         cfg_btn_row = QHBoxLayout()
@@ -1767,8 +2185,43 @@ class MainWindow(QMainWindow):
         vbox_config.addLayout(cfg_btn_row)
         layout.addWidget(grp_config)
 
-        layout.addStretch()
-        return widget
+        grp_window = QGroupBox('Cửa sổ & khởi động')
+        form_window = QFormLayout(grp_window)
+        form_window.addRow(self.btn_to_tray)
+        self.combo_startup_mode = QComboBox()
+        for title, mode in (('Không tự khởi động', 'off'),
+                            ('Khởi động cùng Windows', 'windows'),
+                            ('Mở khi MuMu chạy', 'mumu')):
+            self.combo_startup_mode.addItem(title, mode)
+        self.combo_startup_mode.setCurrentIndex(max(0, self.combo_startup_mode.findData(
+            self.settings.get('ui_startup_mode', 'off'))))
+        self.combo_startup_mode.currentIndexChanged.connect(self._change_startup_mode)
+        form_window.addRow('Tự khởi động:', self.combo_startup_mode)
+        self.combo_close_behavior = QComboBox()
+        self.combo_close_behavior.addItem('Thoát hẳn', 'quit')
+        self.combo_close_behavior.addItem('Ẩn xuống khay hệ thống', 'tray')
+        self.combo_close_behavior.setCurrentIndex(max(0, self.combo_close_behavior.findData(
+            self.settings.get('ui_close_behavior', 'quit'))))
+        self.combo_close_behavior.currentIndexChanged.connect(
+            lambda _: self.settings.set('ui_close_behavior', self.combo_close_behavior.currentData()))
+        form_window.addRow('Khi bấm X:', self.combo_close_behavior)
+        startup_note = QLabel('Chế độ MuMu chạy nền từ lúc đăng nhập Windows và chỉ mở giao diện khi phát hiện MuMu. '
+                              'Bot vẫn cần bấm Bắt đầu. Có thể chọn Thoát hẳn trong menu khay.')
+        startup_note.setWordWrap(True)
+        form_window.addRow(startup_note)
+        layout.addWidget(grp_window)
+
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.device_subtabs = self._make_subtabs((
+            ('Tối ưu MuMu', (grp_opt,)),
+            ('Khôi phục', (grp_antiban,)),
+            ('Cấu hình', (grp_config,)),
+            ('Cửa sổ', (grp_window,)),
+        ))
+        root.addWidget(self.device_subtabs)
+        return page
 
     def _create_schedule_tab(self):
         widget = QWidget()
@@ -1802,20 +2255,28 @@ class MainWindow(QMainWindow):
         self.btn_timer_cancel.clicked.connect(self._cancel_action_timer)
         buttons = QHBoxLayout()
         buttons.addWidget(self.btn_timer_arm)
-        buttons.addWidget(self.btn_timer_cancel)
         form.addRow('Kiểu hẹn:', self.combo_timer_mode)
         form.addRow('Thời gian chờ:', self.spin_timer_minutes)
         form.addRow('Ngày và giờ:', self.edit_timer_at)
         form.addRow('Hành động:', self.combo_timer_action)
         form.addRow(self.chk_timer_finish_battle)
         form.addRow(buttons)
-        form.addRow('Trạng thái:', self.lbl_timer_state)
         note = QLabel('Lịch hẹn áp dụng cho lần mở tool này. Đóng tool sẽ lưu thống kê; MuMu và game vẫn mở.')
         note.setWordWrap(True)
-        layout.addWidget(group)
-        layout.addWidget(note)
-        layout.addStretch()
-        return widget
+        status_group = QGroupBox('Lịch đang áp dụng')
+        status_layout = QVBoxLayout(status_group)
+        status_layout.addWidget(self.lbl_timer_state)
+        status_layout.addWidget(self.btn_timer_cancel, alignment=Qt.AlignLeft)
+        status_layout.addWidget(note)
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        self.schedule_subtabs = self._make_subtabs((
+            ('Thiết lập', (group,)),
+            ('Trạng thái', (status_group,)),
+        ))
+        root.addWidget(self.schedule_subtabs)
+        return page
 
     def _arm_action_timer(self):
         now = time.time()
@@ -1834,6 +2295,7 @@ class MainWindow(QMainWindow):
         self._timer_action_label = self.combo_timer_action.currentText()
         self.settings.set('timer_minutes', self.spin_timer_minutes.value())
         self.btn_timer_cancel.setEnabled(True)
+        self._update_active_subtabs()
         self._on_log(f'[Hẹn giờ] {self._timer_action_label} lúc {self._timer_finish_label} (giờ Việt Nam).')
         self._check_action_timer()
 
@@ -1841,6 +2303,7 @@ class MainWindow(QMainWindow):
         self.action_timer.cancel()
         self.lbl_timer_state.setText('Đã hủy lịch hẹn.')
         self.btn_timer_cancel.setEnabled(False)
+        self._update_active_subtabs()
         self._on_log('[Hẹn giờ] Đã hủy lịch.')
 
     def _check_action_timer(self):
@@ -1852,9 +2315,11 @@ class MainWindow(QMainWindow):
         action = self.action_timer.take_due_action(in_battle=waiting)
         if action:
             self.btn_timer_cancel.setEnabled(False)
+            self._update_active_subtabs()
             self.lbl_timer_state.setText('Đã thực hiện lịch hẹn.')
             self._on_log(f'[Hẹn giờ] Đến giờ: {self._timer_action_label}.')
             if action == 'close':
+                self._force_quit = True
                 self.close()
             elif self.bot.is_running and not self.bot.is_paused:
                 self._pause_bot()
@@ -2013,9 +2478,9 @@ class MainWindow(QMainWindow):
         if isinstance(wall_status, str) and self.lbl_wall_status.text() != wall_status:
             self.lbl_wall_status.setText(wall_status)
             if getattr(self.bot.village, 'walls_confirmed_maxed', False):
-                self.lbl_wall_status.setStyleSheet('color: #34d399; font-weight: bold; font-size: 12px;')
+                self.lbl_wall_status.setStyleSheet('color: #34d399; font-weight: bold; ')
             else:
-                self.lbl_wall_status.setStyleSheet('color: #aeb8c6; font-size: 12px;')
+                self.lbl_wall_status.setStyleSheet('color: #aeb8c6; ')
         if hasattr(self, 'lbl_bldg_status') and hasattr(self.bot, 'farm_finish') and self.bot.farm_finish is not None:
             bldg_worker = getattr(self.bot.farm_finish, 'builder', None)
             if bldg_worker is not None:
@@ -2027,6 +2492,8 @@ class MainWindow(QMainWindow):
             if getattr(self.bot.village, 'walls_confirmed_maxed', False):
                 snap['walls_confirmed_maxed'] = True
             self.village_status.update_state(snap, self.settings.data)
+            if self.dashboard_content.sizeHint().height() != self.dashboard_content.height():
+                self._fit_overview()
         self._update_farm_finish_badge()
         if self.tabs.currentIndex() != 0 or self.isMinimized():
             self._idle_preview_wait = 0
@@ -2045,23 +2512,31 @@ class MainWindow(QMainWindow):
             return
         if self._is_walls_maxed():
             self.lbl_farm_finish_max_badge.setText('(Tường đã Max ✅)')
-            self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; font-size: 11px;')
+            self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; ')
             if not self.chk_farm_finish.isChecked():
                 self.chk_farm_finish.blockSignals(True)
                 self.chk_farm_finish.setChecked(True)
                 self.chk_farm_finish.blockSignals(False)
                 self.settings.set('farm_finish_enabled', True)
+                if hasattr(self, '_update_farm_finish_options'):
+                    self._update_farm_finish_options()
+                if hasattr(self, 'village_subtabs'):
+                    self._update_active_subtabs()
         else:
             self.lbl_farm_finish_max_badge.setText('')
 
     def _on_farm_finish_toggled(self, enabled: bool):
         if not enabled and self._is_walls_maxed():
             self.lbl_farm_finish_max_badge.setText('(Tường đã Max — Tự động bật lại ✅)')
-            self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; font-size: 11px;')
+            self.lbl_farm_finish_max_badge.setStyleSheet('color: #34d399; font-weight: bold; ')
             self.chk_farm_finish.blockSignals(True)
             self.chk_farm_finish.setChecked(True)
             self.chk_farm_finish.blockSignals(False)
             self.settings.set('farm_finish_enabled', True)
+            if hasattr(self, '_update_farm_finish_options'):
+                self._update_farm_finish_options()
+            if hasattr(self, 'village_subtabs'):
+                self._update_active_subtabs()
             self._on_log('[Wall] Tường đã Max hoàn toàn: tự động duy trì bật chế độ cày full kho & dừng tool.')
             QTimer.singleShot(3500, self._update_farm_finish_badge)
             return
@@ -2139,10 +2614,21 @@ class MainWindow(QMainWindow):
 
     def _start_bot(self):
         serial = self.device_combo.currentData() or '127.0.0.1:5555'
+        self._session_elapsed = 0.0
+        self._session_started_at = time.monotonic()
         self.statusBar().showMessage('Đang kết nối và chuẩn bị game…')
         def done(ok):
+            if not ok:
+                self._session_elapsed = 0.0
+                self._session_started_at = None
             self.statusBar().showMessage('Bot đang chạy' if ok else 'Chưa khởi động được. Xem nhật ký.')
         self._run_job(lambda: self.bot.start_bot(device_serial=serial), done, control='start')
+
+    def _toggle_run_pause(self):
+        if self.bot.is_running:
+            self._pause_bot()
+        else:
+            self._start_bot()
 
     def _pause_bot(self):
         if self.bot.is_paused:
@@ -2192,10 +2678,18 @@ class MainWindow(QMainWindow):
         if self.bot.is_alive():
             QTimer.singleShot(200, self._close_after_farm)
             return
-        self.close()
+        self._exit_completely()
 
     def closeEvent(self, event):
+        if (not self._force_quit and self.settings.get('ui_close_behavior', 'quit') == 'tray'
+                and QSystemTrayIcon.isSystemTrayAvailable()):
+            event.ignore()
+            self._minimize_to_tray()
+            return
         self._closing = True
+        if hasattr(self, '_tray_icon'):
+            self._tray_icon.hide()
+            QApplication.instance().setQuitOnLastWindowClosed(True)
         self.preview_timer.stop()
         self.performance_timer.stop()
         self.action_timer_tick.stop()
@@ -2209,6 +2703,48 @@ class MainWindow(QMainWindow):
             self._pending_logs.append(text)
             return
         self.log_console.append_log(text)
+        village = self.bot.village_state.get_snapshot().get('active_village', 'main')
+        activity = activity_from_log(text, village)
+        if activity:
+            self._set_activity(*activity)
+
+    def _set_activity(self, village, section, summary, detail=None):
+        self._activity_village = village
+        self._activity_section = section
+        self._activity_text = summary
+        self.activity_btn.setToolTip((detail or summary) + '\nBấm để mở mục liên quan')
+        self.activity_btn.setAccessibleName(f'Hoạt động {"làng đêm" if village == "builder" else "làng chính"}: {summary}')
+        for item in (self.activity_btn, self.state_badge):
+            if item.property('village') != village:
+                item.setProperty('village', village)
+                item.style().unpolish(item)
+                item.style().polish(item)
+        self._refresh_activity_button()
+
+    def _refresh_activity_button(self):
+        if not hasattr(self, 'activity_btn'):
+            return
+        width = max(120, self.activity_btn.width() - 24)
+        self.activity_btn.setText(self.activity_btn.fontMetrics().elidedText(
+            getattr(self, '_activity_text', 'Sẵn sàng'), Qt.ElideRight, width))
+
+    def _open_activity_tab(self):
+        section = self._activity_section
+        village = self._activity_village
+        if village == 'builder':
+            self._select_tab(self.builder_village_tab)
+            index = {'wall': 1, 'building': 2, 'battle': 3, 'search': 3}.get(section, 0)
+            self.builder_subtabs.setCurrentIndex(index)
+        elif section in {'search', 'battle'}:
+            self._select_tab(self.main_attack_tab)
+            self.combat_subtabs.setCurrentIndex(0 if section == 'search' else 1)
+        elif section == 'device':
+            self._select_tab(self.device_tab)
+        elif section == 'overview':
+            self._select_tab(0)
+        else:
+            self._select_tab(self.main_village_tab)
+            self.village_subtabs.setCurrentIndex({'wall': 1, 'building': 2, 'army': 3}.get(section, 0))
 
     def _on_screen(self, screen_img: np.ndarray):
         self._queue_frame(screen_img)
@@ -2275,9 +2811,7 @@ class MainWindow(QMainWindow):
             self.combo_wall_res.setCurrentIndex(wall_keys.index(def_res))
         self.spin_wall_gold.setValue(DEFAULT_CONFIG["min_gold_to_upgrade_wall"])
         self.spin_wall_elixir.setValue(DEFAULT_CONFIG["min_elixir_to_upgrade_wall"])
-        self.chk_wall_max_money.setChecked(DEFAULT_CONFIG["wall_upgrade_max_by_money"])
-        self.spin_wall_limit.setValue(DEFAULT_CONFIG["wall_max_upgrades_per_cycle"])
-        self.spin_wall_limit.setEnabled(not DEFAULT_CONFIG["wall_upgrade_max_by_money"])
+        self.chk_wall_lowest.setChecked(DEFAULT_CONFIG["wall_lowest_first"])
         self.combo_wall_quantity_mode.setCurrentIndex(1 if DEFAULT_CONFIG["wall_quantity_button_mode"] == 'fixed' else 0)
         self.spin_wall_fixed_gap.setValue(DEFAULT_CONFIG["wall_quantity_fixed_gap_ms"])
         self.chk_wall_hold.setChecked(DEFAULT_CONFIG["wall_hold_enabled"])
@@ -2290,7 +2824,7 @@ class MainWindow(QMainWindow):
         if def_finish in finish_modes:
             self.combo_farm_finish_resources.setCurrentIndex(finish_modes.index(def_finish))
         for k in ("auto_upgrade_walls", "wall_resource", "min_gold_to_upgrade_wall",
-                  "min_elixir_to_upgrade_wall", "wall_max_upgrades_per_cycle", "wall_upgrade_max_by_money",
+                  "min_elixir_to_upgrade_wall", "wall_lowest_first",
                   "wall_quantity_button_mode", "wall_quantity_fixed_gap_ms", "wall_hold_enabled",
                   "farm_finish_enabled", "farm_finish_target_percent", "farm_finish_resources"):
             self.settings.set(k, DEFAULT_CONFIG[k])
@@ -2644,6 +3178,10 @@ class MainWindow(QMainWindow):
             self.settings.data.update(imported)
             self.settings.save()
             self._apply_settings_to_ui()
+            try:
+                configure_startup(self.settings.get('ui_startup_mode', 'off'))
+            except Exception as startup_error:
+                self._on_log(f'[Cấu hình] Chưa áp dụng tự khởi động Windows: {startup_error}')
 
             msg = f"Đã nạp thành công cấu hình từ:\n{path}\n\nToàn bộ thông số trên giao diện đã được cập nhật!"
             self.statusBar().showMessage(f"Đã nhập cấu hình từ {os.path.basename(path)}.", 4000)
@@ -2657,11 +3195,29 @@ class MainWindow(QMainWindow):
 
     def _apply_settings_to_ui(self):
         """Update all UI controls across all tabs to reflect the current self.settings."""
+        if hasattr(self, 'combo_text_size'):
+            self.combo_text_size.blockSignals(True)
+            self.combo_text_size.setCurrentIndex(max(0, self.combo_text_size.findData(
+                self.settings.get('ui_text_size', 'medium'))))
+            self.combo_text_size.blockSignals(False)
+            self._apply_appearance()
+        if hasattr(self, 'combo_startup_mode'):
+            self.combo_startup_mode.blockSignals(True)
+            self.combo_startup_mode.setCurrentIndex(max(0, self.combo_startup_mode.findData(
+                self.settings.get('ui_startup_mode', 'off'))))
+            self.combo_startup_mode.blockSignals(False)
+        if hasattr(self, 'combo_close_behavior'):
+            self.combo_close_behavior.blockSignals(True)
+            self.combo_close_behavior.setCurrentIndex(max(0, self.combo_close_behavior.findData(
+                self.settings.get('ui_close_behavior', 'quit'))))
+            self.combo_close_behavior.blockSignals(False)
         # 1. Top bar & general
         if hasattr(self, 'chk_main_village'):
             self.chk_main_village.blockSignals(True)
             self.chk_main_village.setChecked(self.settings.get("main_village_enabled", True))
             self.chk_main_village.blockSignals(False)
+            for group in getattr(self, '_main_village_groups', ()):
+                group.setEnabled(self.chk_main_village.isChecked())
 
         # 2. Loot & Scouting
         if hasattr(self, 'spin_gold'):
@@ -2726,11 +3282,8 @@ class MainWindow(QMainWindow):
             self.spin_wall_gold.setValue(self.settings.get("min_gold_to_upgrade_wall", 4000000))
         if hasattr(self, 'spin_wall_elixir'):
             self.spin_wall_elixir.setValue(self.settings.get("min_elixir_to_upgrade_wall", 4000000))
-        if hasattr(self, 'chk_wall_max_money'):
-            self.chk_wall_max_money.setChecked(self.settings.get("wall_upgrade_max_by_money", False))
-        if hasattr(self, 'spin_wall_limit'):
-            self.spin_wall_limit.setValue(self.settings.get("wall_max_upgrades_per_cycle", 5))
-            self.spin_wall_limit.setEnabled(not self.settings.get("wall_upgrade_max_by_money", False))
+        if hasattr(self, 'chk_wall_lowest'):
+            self.chk_wall_lowest.setChecked(self.settings.get("wall_lowest_first", True))
         if hasattr(self, 'combo_wall_quantity_mode'):
             self.combo_wall_quantity_mode.setCurrentIndex(1 if self.settings.get("wall_quantity_button_mode") == 'fixed' else 0)
         if hasattr(self, 'spin_wall_fixed_gap'):
@@ -2770,6 +3323,10 @@ class MainWindow(QMainWindow):
                 self.army_priority.setCurrentIndex(index)
 
         # 6. Buildings
+        if hasattr(self, 'chk_auto_buildings'):
+            self.chk_auto_buildings.setChecked(self.settings.get('auto_upgrade_buildings', False))
+        if hasattr(self, 'chk_lock_townhall'):
+            self.chk_lock_townhall.setChecked(self.settings.get('lock_townhall_upgrade', True))
         if hasattr(self, 'chk_buildings'):
             self.chk_buildings.setChecked(self.settings.get("auto_upgrade_buildings", False))
         if hasattr(self, 'chk_lock_th'):
@@ -2798,6 +3355,8 @@ class MainWindow(QMainWindow):
                 chk.setChecked(wl_dict.get(k, True))
         if hasattr(self, '_update_building_selection_summary'):
             self._update_building_selection_summary()
+        if hasattr(self, '_update_building_options'):
+            self._update_building_options()
 
         # 7. Combat & Strategy
         if hasattr(self, 'combo_strategy'):
@@ -2868,6 +3427,7 @@ class MainWindow(QMainWindow):
         # 9. Builder Base
         if hasattr(self, 'chk_builder_village'):
             self.chk_builder_village.setChecked(self.settings.get("builder_base_enabled", False))
+            self._update_builder_options(self.chk_builder_village.isChecked())
         if hasattr(self, 'spin_builder_interval'):
             self.spin_builder_interval.setValue(self.settings.get("builder_base_interval_mins", 30))
         if hasattr(self, 'builder_tasks'):
@@ -2911,6 +3471,7 @@ class MainWindow(QMainWindow):
         # 11. Schedule
         if hasattr(self, 'spin_timer_minutes'):
             self.spin_timer_minutes.setValue(self.settings.get("timer_minutes", 60))
+        self._update_active_subtabs()
 
     def _on_stats(self, stats: dict):
         main_battles = stats.get('battles_completed', 0)
@@ -2987,12 +3548,19 @@ class MainWindow(QMainWindow):
         }
         text, bg, fg = state_map.get(state, (state, "#1E293B", "#94A3B8"))
         self.state_badge.setText(text)
-        self.state_badge.setStyleSheet(f"""
-            background-color: {bg};
-            color: {fg};
-            font-weight: bold;
-            font-size: 12px;
-            padding: 6px 14px;
-            border-radius: 6px;
-            border: 1px solid {fg};
-        """)
+        village = ('builder' if state == 'BUILDER_BASE' else
+                   self.bot.village_state.get_snapshot().get('active_village', 'main'))
+        if state == 'IDLE':
+            village = 'idle'
+        summary = {
+            'IDLE': ('overview', 'Sẵn sàng · Chọn thiết bị và bắt đầu'),
+            'VILLAGE': ('care', 'Đang kiểm tra làng chính'),
+            'TRAINING': ('army', 'Đang chuẩn bị đội quân'),
+            'SEARCHING': ('search', 'Đang tìm đối thủ'),
+            'COMBAT': ('battle', 'Đang triển khai quân'),
+            'BUILDER_BASE': ('care', 'Đang xử lý làng đêm'),
+            'RECOVERY': ('device', 'Đang phục hồi game'),
+            'ADB_DISCONNECTED': ('device', 'Mất kết nối MuMu'),
+            'PAUSED': (self._activity_section, 'Tạm dừng · ' + self._activity_text),
+        }.get(state, (self._activity_section, text))
+        self._set_activity(village, *summary)

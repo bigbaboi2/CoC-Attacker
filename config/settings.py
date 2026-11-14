@@ -186,6 +186,11 @@ DEFAULT_BUILDING_WHITELIST: Dict[str, bool] = {
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
+    # Interface preferences (also travel with exported configurations).
+    "ui_theme": "dark",
+    "ui_text_size": "medium",
+    "ui_startup_mode": "off",
+    "ui_close_behavior": "quit",
     # Device connection
     "device_serial": "127.0.0.1:5555",
     "auto_reconnect": True,
@@ -295,8 +300,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "heroes": True,
     },
     "building_upgrade_whitelist": dict(DEFAULT_BUILDING_WHITELIST),
-    "wall_max_upgrades_per_cycle": 5,
-    "wall_upgrade_max_by_money": False,
+    "wall_lowest_first": True,
     "wall_quantity_button_mode": "ocr",  # ocr (existing recognition), fixed
     "wall_quantity_fixed_gap_ms": 120,
     "maintenance_interval_sec": 45,
@@ -355,6 +359,8 @@ class BotSettings:
                     saved.pop("builder_base_only", None)
                     saved.pop("builder_base_battle", None)
                     saved.pop("wall_verify_layout_editor", None)
+                    saved.pop("wall_max_upgrades_per_cycle", None)
+                    saved.pop("wall_upgrade_max_by_money", None)
                     self.data.update(saved)
             except Exception as e:
                 print(f"[Settings] Warning loading settings: {e}")

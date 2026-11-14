@@ -15,6 +15,17 @@ class NewBuildingBuyer:
         self.pending = False
         self.target = None
 
+    @staticmethod
+    def has_build_clock(screen, y):
+        """The white clock face distinguishes an unread timer from an instant build."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return True
+        icon = screen[max(0, y-12):min(900, y+12), 1565:1592]
+        if icon.shape[:2] != (24, 27):
+            return True
+        hsv = cv2.cvtColor(icon, cv2.COLOR_BGR2HSV)
+        return int(((hsv[:, :, 1] < 85) & (hsv[:, :, 2] > 185)).sum()) >= 15
+
     def rows(self, screen, words, free, reserve):
         result = []
         for text, x, y in words:
@@ -29,6 +40,8 @@ class NewBuildingBuyer:
             duration_text = ''.join(t for t, dx, dy in sorted(words, key=lambda v: v[1])
                                     if dx > 1410 and abs(dy-y) <= 18)
             duration = self.worker.parse_duration(duration_text)
+            if duration is None and not self.has_build_clock(screen, y):
+                duration = 0
             if free <= reserve and (duration is None or duration >= 60):
                 continue
             tokens = []
@@ -57,30 +70,176 @@ class NewBuildingBuyer:
         return sorted(result, key=lambda row: row['y'])
 
     @staticmethod
-    def placement_buttons(screen):
+    def _cancel_hit(screen):
         if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
             return None
         root = Path(__file__).resolve().parents[1] / 'local_assets'
-        hits = []
-        for name in ('new_building_confirm.png', 'new_building_cancel.png'):
+        area = screen[50:750, 100:1450]
+        best = None
+        for name in ('new_building_cancel_live.png', 'new_building_cancel.png'):
             template = cv2.imread(str(root / name))
             if template is None:
-                return None
-            found = []
-            for scale in (.65, .75, .85, 1., 1.1, 1.2, 1.35, 1.5):
+                continue
+            for scale in (.75, 1., 1.25, 1.5, 2., 2.3, 2.5, 2.7, 3.):
                 needle = cv2.resize(template, None, fx=scale, fy=scale)
-                scores = cv2.matchTemplate(screen, needle, cv2.TM_CCOEFF_NORMED)
-                _, score, _, point = cv2.minMaxLoc(scores)
+                _, score, _, point = cv2.minMaxLoc(cv2.matchTemplate(area, needle, cv2.TM_CCOEFF_NORMED))
                 if score >= .88:
-                    found.append((score, point[0] + needle.shape[1]//2, point[1] + needle.shape[0]//2, needle.shape[1]))
-            if not found:
-                return None
-            hits.append(max(found))
-        _, x, y, width = hits[0]
-        _, cx, cy, cwidth = hits[1]
-        if abs(y-cy) > max(width, cwidth)*.35 or not .7*width < x-cx < 2.3*width:
+                    hit = (score, 100+point[0]+needle.shape[1]//2,
+                           50+point[1]+needle.shape[0]//2, needle.shape[1])
+                    if best is None or hit[0] > best[0]:
+                        best = hit
+                if best is not None and best[0] >= .96:
+                    return best
+        return best
+
+    @staticmethod
+    def placement_buttons(screen):
+        hit = NewBuildingBuyer._cancel_hit(screen)
+        if hit is None:
             return None
-        return (x, y)
+        _, cx, cy, width = hit
+        left = max(0, cx + width//2)
+        right = min(1600, cx + int(width*2.6))
+        top = max(0, cy - width)
+        bottom = min(900, cy + width)
+        area = screen[top:bottom, left:right]
+        root = Path(__file__).resolve().parents[1] / 'local_assets'
+        best = None
+        for name in ('new_building_confirm_live.png', 'new_building_confirm.png'):
+            template = cv2.imread(str(root / name))
+            if template is None:
+                continue
+            base_scale = width / template.shape[1]
+            for scale in (base_scale*.9, base_scale, base_scale*1.1):
+                needle = cv2.resize(template, None, fx=scale, fy=scale)
+                if needle.shape[0] > area.shape[0] or needle.shape[1] > area.shape[1]:
+                    continue
+                _, score, _, point = cv2.minMaxLoc(cv2.matchTemplate(area, needle, cv2.TM_CCOEFF_NORMED))
+                if score < .8:
+                    continue
+                crop = area[point[1]:point[1]+needle.shape[0],
+                            point[0]:point[0]+needle.shape[1]]
+                green = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV),
+                                    (35, 110, 90), (90, 255, 255))
+                if np.mean(green > 0) < .15:
+                    continue
+                x, y = left+point[0]+needle.shape[1]//2, top+point[1]+needle.shape[0]//2
+                if abs(y-cy) <= width*.35 and .7*width < x-cx < 2.3*width:
+                    if best is None or score > best[0]:
+                        best = (score, x, y)
+        return best[1:] if best else None
+
+    @staticmethod
+    def cancel_button(screen):
+        """Find the red X even when the adjacent confirm button is disabled."""
+        hit = NewBuildingBuyer._cancel_hit(screen)
+        return hit[1:3] if hit else None
+
+    @staticmethod
+    def has_new(words):
+        return any(re.fullmatch(r'new', text.strip(), re.I)
+                   and 1230 <= x <= 1460 and 50 < y < 795 for text, x, y in words)
+
+    def visible_new(self, free, reserve):
+        screen = self.adb.screencap()
+        words = self.worker.words(screen, (1170, 50, 430, 755))
+        return screen, words, self.rows(screen, words, free, reserve)
+
+    @staticmethod
+    def same_row(left, right):
+        return (re.sub(r'\s+', ' ', left['name']).strip().casefold() ==
+                re.sub(r'\s+', ' ', right['name']).strip().casefold()
+                and left['cost'] == right['cost']
+                and left['resource'] == right['resource'])
+
+    def reread_row(self, candidate, free, reserve):
+        """OCR can miss one frame while the builder list is settling."""
+        for retry in range(3):
+            _, _, rows = self.visible_new(free, reserve)
+            match = next((row for row in rows if self.same_row(row, candidate)), None)
+            if match is not None:
+                return match
+            if retry < 2:
+                time.sleep(.2)
+        return None
+
+    def seek_new(self, free, reserve, *, target=None, wallet=None):
+        """Scan down in place; never scroll away from a row before selecting it."""
+        previous = None
+        seen_new = False
+        first_unaffordable = None
+        pages_without_new = 0
+        for page in range(20):
+            screen, words, rows = self.visible_new(free, reserve)
+            has_new = self.has_new(words)
+            seen_new |= has_new
+            pages_without_new = 0 if has_new else pages_without_new + 1
+            for row in rows:
+                if target is not None and self.same_row(row, target):
+                    return row, seen_new
+                if target is None:
+                    if wallet is None or wallet.get(row['resource'], -1) >= row['cost']:
+                        return row, seen_new
+                    if first_unaffordable is None:
+                        first_unaffordable = row
+            signature = self.worker.ui.menu_signature(words) if hasattr(self.worker.ui, 'menu_signature') else tuple(words)
+            if signature == previous or pages_without_new >= 2:
+                break
+            previous = signature
+            self.worker.ui.scroll_menu('down', fast=True)
+        return first_unaffordable if target is None else None, seen_new
+
+    def move_empty_ground_to_center(self):
+        """Pan a clear grass patch toward the center before asking the game to place again."""
+        self.adb.zoom_out_map(times=2)
+        time.sleep(.4)
+        screen = self.adb.screencap()
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        hsv = cv2.cvtColor(screen, cv2.COLOR_BGR2HSV)
+        grass = cv2.inRange(hsv, (30, 40, 35), (95, 255, 255))
+        # A large, mostly green rectangle avoids buildings and the HUD.
+        density = cv2.boxFilter((grass > 0).astype(np.float32), -1, (210, 150), normalize=True)
+        choices = [(float(density[y, x]), x, y) for y in range(260, 641, 55)
+                   for x in range(280, 1151, 55)]
+        score, x, y = max(choices, key=lambda item: (item[0], -abs(item[1]-800)-abs(item[2]-450)))
+        if score < .72:
+            return False
+        if abs(x-800) + abs(y-450) < 120:
+            # Start on confirmed grass; a small pan changes the suggested placement.
+            end_x = min(1120, x + 145) if x < 800 else max(320, x - 145)
+            self.adb.swipe(x, y, end_x, y, duration_ms=500, jitter=0)
+        else:
+            self.adb.swipe(x, y, 800, 450, duration_ms=500, jitter=0)
+        time.sleep(.5)
+        return True
+
+    def select_for_placement(self, candidate, free, reserve, log):
+        """Confirm a green check or retry a grey one after repositioning the map."""
+        for attempt in range(4):
+            if attempt:
+                if not self.move_empty_ground_to_center():
+                    return None
+                if not self.worker.ui.ensure_menu_open():
+                    return None
+                candidate, _ = self.seek_new(free, reserve, target=candidate)
+                if candidate is None:
+                    return None
+            match = self.reread_row(candidate, free, reserve)
+            if match is None:
+                return None
+            self.adb.tap(1380, match['y'] + 8, jitter=0, delay_after=.7)
+            first = self.adb.screencap()
+            point = self.placement_buttons(first)
+            second = self.adb.screencap()
+            if point and self.placement_buttons(second) == point:
+                return point
+            cancel = self.cancel_button(second)
+            if not cancel:
+                return None
+            self.adb.tap(*cancel, jitter=0, delay_after=.4)
+            log(f'[Công trình mới] Vị trí đặt chưa hợp lệ; đổi vùng đất trống ({attempt+1}/4).')
+        return None
 
     def step(self, log, free, reserve, *, keep_menu_open=False):
         if self.pending:
@@ -98,32 +257,8 @@ class NewBuildingBuyer:
             return dict(status='blocked', reason='Không mở được menu thợ.')
         handoff = False
         try:
-            # Keep the player's current menu filters untouched and inspect the
-            # initially visible list. Accounts may have no New entries at all.
-            screen = self.adb.screencap()
-            words = w.words(screen, (1170, 50, 430, 755))
-            first_rows = self.rows(screen, words, free, reserve)
-            has_new = any(re.fullmatch(r'new', text.strip(), re.I)
-                          and 1230 <= x <= 1460 and 50 < y < 795
-                          for text, x, y in words)
-            second_rows = []
-            if has_new:
-                w.ui.scroll_menu('down', fast=True)
-                screen = self.adb.screencap()
-                words = w.words(screen, (1170, 50, 430, 755))
-                second_rows = self.rows(screen, words, free, reserve)
-            rows = first_rows or second_rows
-            if rows:
-                candidate = rows[0]
-                if first_rows and has_new:
-                    w.ui.scroll_menu('up', fast=True)
-                    screen = self.adb.screencap()
-                    current = self.rows(screen, w.words(screen, (1170, 50, 430, 755)), free, reserve)
-                    candidate = next((r for r in current
-                                      if r['name'] == candidate['name'] and r['cost'] == candidate['cost']
-                                      and r['resource'] == candidate['resource']), None)
-                    if candidate is None:
-                        return dict(status='blocked', reason='Chưa tìm lại được hàng New sau khi cuộn; chưa mua.')
+            candidate, has_new = self.seek_new(free, reserve, wallet=wallet)
+            if candidate:
                 resource, cost = candidate['resource'], candidate['cost']
                 self.target = candidate
                 if wallet.get('valid', {}).get(resource) is not True or before.get('valid', {}).get(resource) is not True or wallet[resource] != before[resource]:
@@ -131,15 +266,9 @@ class NewBuildingBuyer:
                 if wallet[resource] < cost:
                     return dict(status='needs_resources', resources=[resource], costs={resource: cost}, target=candidate,
                                 reason=f'Chờ farm {cost:,} {resource} cho {candidate["name"]}.')
-                live = self.adb.screencap()
-                live_rows = self.rows(live, w.words(live, (1170, 50, 430, 755)), free, reserve)
-                match = next((r for r in live_rows if r == candidate), None)
-                if not match:
-                    return dict(status='blocked', reason='Hàng công trình mới chưa ổn định.')
-                self.adb.tap(1380, candidate['y'] + 8, jitter=0, delay_after=.7)
-                point = self.placement_buttons(self.adb.screencap())
-                if not point or point != self.placement_buttons(self.adb.screencap()):
-                    return dict(status='blocked', reason='Chưa xác minh được nút đặt công trình; không xác nhận.')
+                point = self.select_for_placement(candidate, free, reserve, log)
+                if not point:
+                    return dict(status='blocked', reason='Chưa xác minh được nút tích xanh sau tối đa 3 lần đổi vị trí.')
                 self.pending = True
                 self.adb.tap(*point, jitter=0, delay_after=1)
                 for _ in range(6):
@@ -156,7 +285,7 @@ class NewBuildingBuyer:
             stable = all(wallet.get('valid', {}).get(r) is True and before.get('valid', {}).get(r) is True
                          and wallet.get(r) == before.get(r) for r in ('gold', 'elixir', 'dark_elixir'))
             handoff = bool(keep_menu_open and stable)
-            return dict(status='idle', no_new=not has_new,
+            return dict(status='idle', no_new=not has_new, no_eligible=True,
                         preopened=(wallet, before) if handoff else None,
                         reason='Không thấy công trình New phù hợp; tiếp tục việc khác.')
         finally:

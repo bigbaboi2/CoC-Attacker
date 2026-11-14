@@ -297,6 +297,7 @@ class BotEngine:
                 return False
             self._new_scan_empty_until = 0
             self._new_scan_empty_account = None
+            self._new_scan_empty_snapshot = None
             self._army_lab_busy_until = 0
             self._army_lab_busy_account = None
             self._identity_restart_used = False
@@ -938,6 +939,26 @@ class BotEngine:
             # Vào chu trình soi nhà
             self._run_scouting_loop()
 
+    def _verify_builder_walls_once(self, builder):
+        """Verify both Builder Base stages before the first action in this village."""
+        if getattr(self, '_night_layout_scan_done', False):
+            return True
+        scan = getattr(builder, 'scan_initial_layout_walls', None)
+        if not callable(scan):
+            self.log('[BH] Không có chức năng xác minh tường Layout Editor.')
+            return False
+        self.log('[BH] Đang quét tường hai Stage qua Layout Editor.')
+        verified = scan(self.log)
+        if not builder.is_home(self.adb.screencap()):
+            self.log('[BH] Chưa về được làng sau khi quét; dừng bot để kiểm tra.')
+            self.stop_bot()
+            return False
+        if not verified:
+            self.log('[BH] Chưa xác minh đủ tường hai Stage; hoãn tác vụ làng đêm và thử lại.')
+            return False
+        self._night_layout_scan_done = True
+        return True
+
     def _handle_builder_base(self, screen):
         builder = getattr(self, "builder", None)
         if builder is None:
@@ -986,16 +1007,8 @@ class BotEngine:
                 village.check_and_sync_account(screen, self.log)
             if callable(getattr(builder, 'restore_builder_waits', None)):
                 builder.restore_builder_waits(self.log)
-            if not getattr(self, '_night_layout_scan_done', False):
-                scan = getattr(builder, 'scan_initial_layout_walls', None)
-                if callable(scan):
-                    self.log('[BH] Đang quét tường hai Stage qua Layout Editor.')
-                    scan(self.log)
-                    if not builder.is_home(self.adb.screencap()):
-                        self.log('[BH] Chưa về được làng sau khi quét; dừng bot để kiểm tra.')
-                        self.stop_bot()
-                        return True
-                self._night_layout_scan_done = True
+            if not BotEngine._verify_builder_walls_once(self, builder):
+                return True
             first_night = (getattr(self, '_startup_origin', None) == 'night'
                            and not getattr(self, '_startup_night_pass_done', False))
             if first_night:
@@ -1428,6 +1441,24 @@ class BotEngine:
 
         return False
 
+    def _defer_finished_main_to_builder(self, wait_seconds):
+        """Keep Builder Base running while Home Village waits for its next builder."""
+        builder = getattr(self, 'builder', None)
+        if (builder is None or not self.settings.get('main_village_enabled', True)
+                or not self.settings.get('builder_base_enabled', False)):
+            return False
+        seconds = wait_seconds if type(wait_seconds) is int and wait_seconds > 0 else 300
+        builder.main_builders_wait_until = time.monotonic() + seconds + 15
+        builder.main_schedule_checked = True
+        builder.main_turn_until = 0
+        if callable(getattr(builder, 'remember_builder_waits', None)):
+            builder.remember_builder_waits()
+        if type(wait_seconds) is int and wait_seconds > 0:
+            self.log(f'[Điều phối] Làng chính full kho và hết thợ; kiểm tra lại sau khoảng {max(1, seconds//60)} phút. Tiếp tục làng đêm.')
+        else:
+            self.log('[Điều phối] Chưa đọc chắc giờ thợ làng chính; kiểm tra lại sau 5 phút. Tiếp tục làng đêm.')
+        return True
+
     def _farm_finish_gate(self, screen, attack_menu=False):
         if not FarmFinishController.enabled(self.settings):
             controller = getattr(self, 'farm_finish', None)
@@ -1440,6 +1471,16 @@ class BotEngine:
         controller = getattr(self, 'farm_finish', None)
         if controller is None:
             controller = self.farm_finish = FarmFinishController(self.village)
+        builder = getattr(self, 'builder', None)
+        if (builder is not None and self.settings.get('farm_finish_wait_builders', False) is True
+                and self.settings.get('main_village_enabled', True)
+                and self.settings.get('builder_base_enabled', False)
+                and controller.completed
+                and time.monotonic() < getattr(builder, 'main_builders_wait_until', 0)):
+            if self._service_cross_village_sleep():
+                controller.completed = False
+                controller.ready_reads = 0
+            return True
         action = controller.observe_home(self.settings, screen, self.log)
         if (getattr(self.village, 'player_tag_failures', 0) >= 3
                 and not getattr(self.village, '_session_legacy_key', None)):
@@ -1517,6 +1558,11 @@ class BotEngine:
                         if type(saved_sec) is int and saved_sec > 0:
                             shortest_sec = saved_sec
                 if type(shortest_sec) is int and shortest_sec > 0:
+                    if self._defer_finished_main_to_builder(shortest_sec):
+                        if self._service_cross_village_sleep():
+                            controller.completed = False
+                            controller.ready_reads = 0
+                        return True
                     slept_ok = self._sleep_wait_for_builders(shortest_sec)
                     if slept_ok:
                         controller.completed = False
@@ -1525,6 +1571,8 @@ class BotEngine:
                     else:
                         self.stop_bot()
                         return True
+                if self._defer_finished_main_to_builder(shortest_sec):
+                    return True
 
             # All regular builders must be confirmed busy before auto-closing.
             self.log('[Hoàn tất] '+controller.status)
@@ -1580,11 +1628,15 @@ class BotEngine:
             return False
         self.set_state(self.STATE_WALL_HOLD)
         now = time.time()
+        retry_delay = 5 if result.get('status') == 'transaction_pending' else 30
         if not was_active:
             # The triggering maintenance has already used its recovery budget.
-            # Do not immediately spend another 30 seconds on the same failure.
-            guard.next_retry = now + 30
+            # An uncertain purchase needs prompt verification; ordinary
+            # selection failures keep the slower recovery interval.
+            guard.next_retry = now + retry_delay
             self.log('[Wall] Giữ làng — chờ nâng tường: ' + str(result.get('reason', 'Chưa nâng được')))
+        elif result.get('status') == 'transaction_pending':
+            guard.next_retry = min(guard.next_retry, now + retry_delay)
         retry_at = getattr(self.village, '_wall_builder_retry_at', 0)
         if not isinstance(retry_at, (int, float)):
             retry_at = 0
@@ -1592,9 +1644,9 @@ class BotEngine:
             if self.village.refresh_wall_builder_wait(screen) is True:
                 retry_at = 0
             else:
-                guard.next_retry = min(retry_at, now + 30)
+                guard.next_retry = min(retry_at, now + retry_delay)
         if now >= max(guard.next_retry, retry_at) and guard.low_reads == 0:
-            guard.next_retry = now + 30
+            guard.next_retry = now + retry_delay
             # Never convert an invalid resource reading into a spendable zero.
             if all(readings.get('valid', {}).get(name) is True for name in guard.resources):
                 self.log('[Wall] Giữ làng: thử nâng lại; ' + str(result.get('reason', '')))
@@ -1603,7 +1655,9 @@ class BotEngine:
                                            readings.get('elixir', 0)
                                            if readings.get('valid', {}).get('elixir') else 0,
                                            log_callback=self.log)
-            guard.next_retry = time.time() + 30
+            next_status = getattr(self.village, 'wall_result', {})
+            next_delay = 5 if isinstance(next_status, dict) and next_status.get('status') == 'transaction_pending' else 30
+            guard.next_retry = time.time() + next_delay
             self.log('[Wall] Giữ làng — chờ nâng tường: ' + self.village.wall_status)
         return True
 
@@ -1753,6 +1807,23 @@ class BotEngine:
                 break
         return attempted
 
+    @staticmethod
+    def _new_only_mode(settings):
+        if not settings.get('auto_buy_new_buildings', False):
+            return False
+        other_tasks = ('auto_collect', 'auto_train_army', 'auto_request_troops',
+                       'auto_collect_treasury', 'auto_assign_apprentice',
+                       'auto_upgrade_walls', 'auto_upgrade_buildings',
+                       'auto_upgrade_army', 'farm_finish_enabled', 'builder_base_enabled')
+        return not any(settings.get(key, False) for key in other_tasks)
+
+    @staticmethod
+    def _new_scan_snapshot(readings, free, reserve):
+        valid = readings.get('valid', {})
+        resources = tuple((name, readings.get(name) if valid.get(name) is True else None)
+                          for name in ('gold', 'elixir', 'dark_elixir'))
+        return free, reserve, resources
+
     def _service_optional_upgrades(self, fresh):
         self._upgrade_resource_hold = False
         builder = getattr(self, 'builder', None)
@@ -1803,15 +1874,28 @@ class BotEngine:
                 return dict(status='blocked', reason='Chưa trở về làng chính.')
         no_new_cached = (account == getattr(self, '_new_scan_empty_account', None)
                          and time.monotonic() < getattr(self, '_new_scan_empty_until', 0))
+        readings = None
+        free = None
+        reserve = None
+        if no_new_cached and getattr(self, '_new_scan_empty_snapshot', None) is not None:
+            readings = self.vision.read_village_resources(fresh)
+            free = worker.observe_home_builders(fresh)
+            reserve = (0 if (FarmFinishController.enabled(self.settings)
+                             or getattr(self.village, 'walls_confirmed_maxed', False))
+                       else int(self.settings.get('reserve_builders', 0)))
+            no_new_cached = (BotEngine._new_scan_snapshot(readings, free, reserve)
+                             == self._new_scan_empty_snapshot)
         if self.settings.get('auto_buy_new_buildings', False) and not no_new_cached:
             from bot.new_buildings import NewBuildingBuyer
             if not hasattr(self, '_new_building_buyer'):
                 self._new_building_buyer = NewBuildingBuyer(worker)
             # Read the resource HUD and the ordinary-builder HUD from the
             # same home frame; share the fresh builder count with maintenance.
-            readings = self.vision.read_village_resources(fresh)
+            if readings is None:
+                readings = self.vision.read_village_resources(fresh)
             self.village_state.update_resources('main', readings)
-            free = worker.observe_home_builders(fresh)
+            if free is None:
+                free = worker.observe_home_builders(fresh)
             self._home_builder_snapshot = (time.monotonic(), free, account)
             if free is None:
                 self.log('[Thợ] Chưa đọc được số thợ từ ảnh làng; tiếp tục các việc khác.')
@@ -1820,15 +1904,27 @@ class BotEngine:
             shown = ', '.join(f'{r}={readings[r]:,}' for r in ('gold', 'elixir', 'dark_elixir')
                               if valid.get(r) is True)
             self.log(f'[Làng] Thợ thường rảnh: {free}; tài nguyên: {shown or "chưa đọc được"}.')
-            reserve = 0 if (FarmFinishController.enabled(self.settings) or getattr(self.village, 'walls_confirmed_maxed', False)) else int(self.settings.get('reserve_builders', 0))
+            if reserve is None:
+                reserve = (0 if (FarmFinishController.enabled(self.settings)
+                                 or getattr(self.village, 'walls_confirmed_maxed', False))
+                           else int(self.settings.get('reserve_builders', 0)))
             handoff = (bool(self.settings.get('auto_upgrade_buildings', False)) and free > reserve
                        and self.settings.get('building_upgrade_wait_mode', 'target_cost') == 'target_cost'
                        and worker.pending is None)
             result = self._new_building_buyer.step(self.log, free, reserve, keep_menu_open=handoff)
-            if result.get('no_new'):
+            if result.get('no_eligible') or result.get('no_new'):
                 self._new_scan_empty_account = account
                 self._new_scan_empty_until = time.monotonic() + 300
+                self._new_scan_empty_snapshot = (None if result.get('no_new') else
+                                                 BotEngine._new_scan_snapshot(readings, free, reserve))
+                # A later wall/treasury branch may exit maintenance early. Keep
+                # the normal maintenance interval instead of reopening New each loop.
+                self.last_village_maintenance = time.time()
             self.log('[Công trình mới] ' + result['reason'])
+            if result.get('no_eligible') and BotEngine._new_only_mode(self.settings):
+                self.log('[Công trình mới] Không còn mục New phù hợp; tạm dừng vì không bật công việc khác.')
+                self.pause_bot()
+                return dict(status='paused', reason=result['reason'])
             if result.get('preopened'):
                 self.log('[Thợ] Dùng lại menu đang mở để kiểm tra nâng công trình.')
                 result = worker.step(self.log, maintain_reserve=not FarmFinishController.enabled(self.settings),

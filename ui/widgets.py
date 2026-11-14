@@ -7,13 +7,115 @@ from bot.builder_army import COMBOS, REINFORCEMENT_CHOICES, REINFORCEMENT_KEYS
 from core.village_state import STRATEGY_NAMES
 from PyQt5.QtWidgets import (
     QWidget, QLabel, QVBoxLayout, QHBoxLayout, QFrame,
-    QPlainTextEdit, QPushButton, QSizePolicy, QTabBar, QLayout
+    QPlainTextEdit, QPushButton, QSizePolicy, QTabBar, QLayout,
+    QSpinBox, QComboBox, QDateTimeEdit, QApplication, QScrollArea
 )
-from PyQt5.QtGui import QImage, QPixmap, QFont, QColor, QPainter
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
+from PyQt5.QtGui import QImage, QPixmap, QColor, QPainter, QWheelEvent, QLinearGradient, QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QPointF, QSize, QLocale
+from ui.styles import PALETTES
 
 
-class VillageTabBar(QTabBar):
+def _scroll_parent(widget, event):
+    """Pass wheel input to the containing page without changing a field."""
+    parent = widget.parentWidget()
+    while parent is not None and not isinstance(parent, QScrollArea):
+        parent = parent.parentWidget()
+    if parent is None:
+        event.ignore()
+        return
+    viewport = parent.viewport()
+    position = widget.mapTo(viewport, event.pos())
+    forwarded = QWheelEvent(QPointF(position), event.globalPosF(), event.pixelDelta(),
+                            event.angleDelta(), event.buttons(), event.modifiers(),
+                            event.phase(), event.inverted())
+    QApplication.sendEvent(viewport, forwarded)
+    event.setAccepted(forwarded.isAccepted())
+
+
+class NoWheelSpinBox(QSpinBox):
+    """Keep page scrolling independent of numeric editing."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setLocale(QLocale(QLocale.English, QLocale.UnitedStates))
+        self.setGroupSeparatorShown(True)
+
+    def wheelEvent(self, event):
+        _scroll_parent(self, event)
+
+
+class NoWheelComboBox(QComboBox):
+    def wheelEvent(self, event):
+        _scroll_parent(self, event)
+
+
+class NoWheelDateTimeEdit(QDateTimeEdit):
+    def wheelEvent(self, event):
+        _scroll_parent(self, event)
+
+
+class BubbleTabBar(QTabBar):
+    """Game-like rounded tabs, painted directly to avoid Qt5 style clipping."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.theme_name = 'dark'
+        self.active_dots = {}
+        self.setDrawBase(False)
+        self.setExpanding(False)
+        self.setUsesScrollButtons(True)
+
+    def set_theme(self, theme):
+        self.theme_name = theme
+        self.update()
+
+    def set_active_dots(self, dots):
+        if self.active_dots != dots:
+            self.active_dots = dict(dots)
+            self.update()
+
+    def tabSizeHint(self, index):
+        hint = super().tabSizeHint(index)
+        return QSize(max(88, hint.width() + 22), max(43, hint.height() + 12))
+
+    def paintEvent(self, event):
+        p = PALETTES.get(self.theme_name, PALETTES['dark'])
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        font = QFont('Baloo 2', max(10, self.font().pointSize()))
+        font.setWeight(QFont.Bold)
+        painter.setFont(font)
+        for index in range(self.count()):
+            bounds = self.tabRect(index).adjusted(3, 3, -3, -6)
+            if not bounds.intersects(event.rect()):
+                continue
+            selected = index == self.currentIndex()
+            enabled = self.isTabEnabled(index)
+            shadow = bounds.translated(0, 3)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor('#0b1827' if self.theme_name == 'dark' else '#8dafc8'))
+            painter.drawRoundedRect(shadow, 11, 11)
+            top = QColor('#b6efff' if selected else p['selected'])
+            bottom = QColor(p['accent'] if selected else p['raised'])
+            if not enabled:
+                top.setAlpha(115)
+                bottom.setAlpha(115)
+            fill = QLinearGradient(bounds.topLeft(), bounds.bottomLeft())
+            fill.setColorAt(0, top)
+            fill.setColorAt(1, bottom)
+            painter.setBrush(fill)
+            painter.setPen(QColor(p['accent'] if selected else p['border']))
+            painter.drawRoundedRect(bounds, 11, 11)
+            painter.setPen(QColor('#17324b' if selected else p['text'] if enabled else p['disabled']))
+            painter.drawText(bounds.adjusted(10, 0, -10, -1), Qt.AlignCenter, self.tabText(index))
+            if index in self.active_dots and enabled:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor(self.active_dots[index]))
+                painter.drawEllipse(bounds.right() - 10, bounds.top() + 6, 7, 7)
+        painter.end()
+
+
+class VillageTabBar(BubbleTabBar):
     disabled_clicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
@@ -66,33 +168,27 @@ class VillageTabBar(QTabBar):
 class StatCard(QFrame):
     """Sleek metric card showing an icon, value, and description."""
 
-    def __init__(self, icon: str, title: str, default_val: str = "0", color: str = "#38BDF8"):
+    def __init__(self, icon: str, title: str, default_val: str = "0", color: str = "#38BDF8",
+                 tone: str = "blue"):
         super().__init__()
         self.setObjectName('statCard')
-        self.setMaximumHeight(92)
+        self.setProperty('tone', tone)
+        self.setMinimumHeight(92)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setStyleSheet(f"""
-            QFrame#statCard {{
-                background-color: #20252c;
-                border: 1px solid #343b45;
-                border-radius: 3px;
-            }}
-        """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(7)
 
         header_layout = QHBoxLayout()
         self.icon_lbl = QLabel(icon)
-        self.icon_lbl.setStyleSheet(f"font-size: 16px;")
         self.title_lbl = QLabel(title)
-        self.title_lbl.setStyleSheet("color: #94A3B8; font-size: 12px; font-weight: 500;")
+        self.title_lbl.setObjectName('statTitle')
         self.icon_lbl.hide()
         header_layout.addWidget(self.title_lbl)
         header_layout.addStretch()
 
         self.value_lbl = QLabel(default_val)
-        self.value_lbl.setStyleSheet("color: #edf0f3; font-size: 20px; font-weight: 600;")
+        self.value_lbl.setObjectName('statValue')
 
         layout.addLayout(header_layout)
         layout.addWidget(self.value_lbl)
@@ -112,15 +208,8 @@ class LiveScreenViewer(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(480, 270)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.setStyleSheet("""
-            QLabel {
-                background-color: #0A0C14;
-                border: 1px solid #20263D;
-                border-radius: 8px;
-            }
-        """)
         self.setText("Đang chờ kết nối giả lập...")
-        self.setStyleSheet("background: #101318; color: #8c98a8; border: 1px solid #343b45; font-size: 13px;")
+        self.setObjectName('liveViewer')
 
     def update_frame(self, cv_img: np.ndarray):
         """Converts OpenCV BGR image to QPixmap and renders with fast C++ SIMD scaling."""
@@ -157,15 +246,13 @@ class LogConsole(QWidget):
 
         header = QHBoxLayout()
         title = QLabel("Hoạt động gần đây")
-        title.setStyleSheet("color: #aeb8c6; font-size: 12px;")
+        title.setObjectName('sectionDetail')
         self.clear_btn = QPushButton("Xóa Nhật Ký")
-        self.clear_btn.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.clear_btn.clicked.connect(self.clear_logs)
 
         header.addWidget(title)
         header.addStretch()
         self.new_logs_btn = QPushButton("↓ Log mới")
-        self.new_logs_btn.setStyleSheet("padding: 4px 10px; font-size: 11px;")
         self.new_logs_btn.clicked.connect(self.scroll_to_latest)
         self.new_logs_btn.hide()
         header.addWidget(self.new_logs_btn)
@@ -214,22 +301,14 @@ class ResourceItemCard(QFrame):
         self.setObjectName("villageMetric")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setMinimumHeight(56)
-        self.setStyleSheet(f"""
-            QFrame#villageMetric {{
-                background-color: {bg_color};
-                border: 1px solid {border_color};
-                border-radius: 5px;
-                padding: 4px;
-            }}
-        """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(2)
 
         self.lbl_title = QLabel(label)
-        self.lbl_title.setStyleSheet("color: #94A3B8; font-size: 11px; font-weight: 500;")
+        self.lbl_title.setObjectName('metricTitle')
         self.lbl_val = QLabel(default_val)
-        self.lbl_val.setStyleSheet(f"color: {color}; font-size: 15px; font-weight: bold;")
+        self.lbl_val.setObjectName('metricValue')
         layout.addWidget(self.lbl_title)
         layout.addWidget(self.lbl_val)
 
@@ -257,10 +336,6 @@ class VillageLiveStatusWidget(QWidget):
         for key, name in (('main', 'Làng chính'), ('builder', 'Làng đêm')):
             button = QPushButton(name)
             button.setCheckable(True)
-            button.setStyleSheet("""
-                QPushButton { padding: 5px 12px; border-radius: 4px; }
-                QPushButton:checked { background: #334155; border-color: #64748b; color: #f8fafc; }
-            """)
             button.clicked.connect(lambda checked, village=key: self._select_village(village))
             self.village_buttons[key] = button
             header.addWidget(button)
@@ -283,6 +358,7 @@ class VillageLiveStatusWidget(QWidget):
             ('dark_elixir', 'Hắc dầu', '#c4b5fd'), ('gems', 'Gem', '#6ee7b7'),
         ):
             card = ResourceItemCard(name, '—', color, '#202832', '#303b4b')
+            card.setProperty('resource', key)
             self.resource_cards[key] = card
             row.addWidget(card, 1)
         self.resource_cards['gems'].setToolTip('Gem dùng chung cho hai làng.')
@@ -340,27 +416,20 @@ class VillageLiveStatusWidget(QWidget):
         label = QLabel(text)
         label.setTextFormat(Qt.PlainText)
         label.setWordWrap(wrap)
-        label.setStyleSheet(f'color: {color}; font-size: 12px;')
+        label.setObjectName('sectionDetail')
         return label
 
     @classmethod
     def _section(cls, root, title):
         frame = QFrame()
         frame.setObjectName('villageSection')
-        frame.setStyleSheet("""
-            QFrame#villageSection {
-                background: #181e27;
-                border: 1px solid #303b4b;
-                border-radius: 6px;
-            }
-        """)
         layout = QVBoxLayout(frame)
         layout.setSizeConstraint(QLayout.SetMinimumSize)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
         header = QHBoxLayout()
         label = cls._label(title, '#e2e8f0')
-        label.setStyleSheet('color: #e2e8f0; font-size: 13px; font-weight: 600;')
+        label.setObjectName('sectionTitle')
         header.addWidget(label)
         header.addStretch()
         layout.addLayout(header)
@@ -478,10 +547,10 @@ class VillageLiveStatusWidget(QWidget):
 
             if auto_bldg:
                 self.lbl_bldg_mode_badge.setText("● Tự động nâng: Đang BẬT")
-                self.lbl_bldg_mode_badge.setStyleSheet("color: #34d399; font-size: 11px; font-weight: 600;")
+                self.lbl_bldg_mode_badge.setStyleSheet("color: #34d399; font-weight: 600;")
             else:
                 self.lbl_bldg_mode_badge.setText("○ Tự động nâng: Đã TẮT")
-                self.lbl_bldg_mode_badge.setStyleSheet("color: #94a3b8; font-size: 11px;")
+                self.lbl_bldg_mode_badge.setStyleSheet("color: #94a3b8; ")
 
             if free is None:
                 self.card_builder_free.set_value("—")
@@ -554,10 +623,10 @@ class VillageLiveStatusWidget(QWidget):
 
             if lock_th:
                 self.lbl_builder_lock.setText("🛡️ Chốt an toàn: Cấm nâng Nhà chính (Town Hall) [Đang BẬT]")
-                self.lbl_builder_lock.setStyleSheet("color: #34d399; font-size: 11px;")
+                self.lbl_builder_lock.setStyleSheet("color: #34d399; ")
             else:
                 self.lbl_builder_lock.setText("⚠️ Chốt an toàn: Cấm nâng Nhà chính đã TẮT (có thể nâng TH)")
-                self.lbl_builder_lock.setStyleSheet("color: #f87171; font-size: 11px;")
+                self.lbl_builder_lock.setStyleSheet("color: #f87171; ")
         walls = state.get('wall_inventory', {}).get(village, {})
         th_level = state.get('th_level')
         max_allowed = (th_level if th_level <= 8 else th_level + 1) if (isinstance(th_level, int) and th_level >= 2) else None
@@ -583,14 +652,14 @@ class VillageLiveStatusWidget(QWidget):
                 f"🏰 Tường: Toàn bộ {total_walls} đoạn đã đạt Cấp {target_lvl}{th_str} · ĐÃ MAX HOÀN TOÀN ✅\n"
                 f"⚡ Trạng thái thợ: Sử dụng hết toàn bộ số thợ xây khả dụng (duy trì 0 thợ dự phòng)"
             )
-            self.lbl_wall_breakdown.setStyleSheet("color: #34d399; font-size: 12px; font-weight: bold;")
+            self.lbl_wall_breakdown.setStyleSheet("color: #34d399; font-weight: bold;")
         elif walls:
             levels = ' · '.join(f'Cấp {level} · {walls[level]:,} đoạn' for level in sorted(walls))
             self.lbl_wall_breakdown.setText(f'Tường đã thấy · {levels}')
-            self.lbl_wall_breakdown.setStyleSheet('color: #cbd5e1; font-size: 12px;')
+            self.lbl_wall_breakdown.setStyleSheet('color: #cbd5e1; ')
         else:
             self.lbl_wall_breakdown.setText('Tường · Chưa có dữ liệu')
-            self.lbl_wall_breakdown.setStyleSheet('color: #94a3b8; font-size: 12px;')
+            self.lbl_wall_breakdown.setStyleSheet('color: #94a3b8; ')
 
         if is_maxed:
             actions = tuple(

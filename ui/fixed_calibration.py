@@ -2,9 +2,10 @@
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
-    QPushButton, QSpinBox, QVBoxLayout,
+    QDialog, QDialogButtonBox, QHBoxLayout, QLabel,
+    QPushButton, QVBoxLayout,
 )
+from ui.widgets import NoWheelSpinBox as QSpinBox, NoWheelComboBox as QComboBox
 
 from core.fixed_attack import FixedAttackPlan
 

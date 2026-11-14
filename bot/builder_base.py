@@ -57,6 +57,7 @@ class BuilderBaseManager:
         self._wall_verified_groups = {}
         self._wall_verified_signature = None
         self._wall_verified_at = 0
+        self._elixir_wall_unavailable_at = 0
         self._building_transaction_pending_until = 0
 
     def pause_tool(self, log, reason):
@@ -399,6 +400,7 @@ class BuilderBaseManager:
                 totals[level] = totals.get(level, 0) + count
         if self.village_state is not None:
             self.village_state.replace_wall_inventory('builder', totals)
+        self._elixir_wall_unavailable_at = 0
         log('[BH] Tổng tường hai Stage: ' +
             ', '.join(f'cấp {level} x{count}' for level, count in sorted(totals.items())) + '.')
         return True
@@ -544,6 +546,14 @@ class BuilderBaseManager:
             return None
         if eligible == {'elixir'}:
             log("[BH] Chỉ Builder Elixir đạt điều kiện: sẽ tìm tường cấp 6 trở lên trước khi chọn nâng.")
+            unavailable_at = getattr(self, '_elixir_wall_unavailable_at', 0)
+            if unavailable_at and time.monotonic() - unavailable_at < 900:
+                log("[BH] Bảng thợ vừa xác nhận không có tường cấp 6 trở lên để nâng bằng dầu; bỏ lượt quét, tiếp tục kiếm vàng.")
+                return None
+            gold = balances.get('gold')
+            gold_threshold = self.settings.get('builder_base_wall_min_gold', 0)
+            if type(gold) is int and 0 < gold < gold_threshold:
+                log(f"[BH] Có {gold:,} Builder Gold nhưng chưa đạt ngưỡng {gold_threshold:,} trong cài đặt; chưa dùng vàng cho tường cấp thấp.")
         elif eligible == {'gold'}:
             log("[BH] Chỉ Builder Gold đạt điều kiện: tìm tường theo tùy chọn ưu tiên hiện tại.")
         else:
@@ -572,6 +582,7 @@ class BuilderBaseManager:
             upgraded = True
             self._wall_verified_groups = {}
             self._wall_verified_signature = None
+            self._elixir_wall_unavailable_at = 0
             self.consecutive_no_wall_count = 0
             screen = self.adb.screencap()
             if not self.is_home(screen):
@@ -1025,6 +1036,8 @@ class BuilderBaseManager:
                 log('[BH] Đã xác nhận bảng thợ báo hoàn tất toàn bộ nâng cấp; ưu tiên làng chính.')
                 return None, screen
             if not unknown and not known and groups:
+                if min_level == 6:
+                    self._elixir_wall_unavailable_at = time.monotonic()
                 log(f"[BH] Bảng thợ không có nhóm tường từ cấp {min_level} có thể nâng. "
                     "Tường đã đạt cấp tối đa không xuất hiện trong danh sách nâng cấp.")
                 return None, screen
@@ -1402,11 +1415,6 @@ class BuilderBaseManager:
         return (button, price) if type(price) is int and price > 0 else None
 
     def prepare_wall_quantity(self, screen, row, log, eligible_resources=None):
-        max_by_money = self.settings.get("wall_upgrade_max_by_money", False)
-        limit = int(self.settings.get("wall_max_upgrades_per_cycle", 5))
-        max_by_money = max_by_money or limit <= 0
-        if not max_by_money and limit == 1:
-            return screen, 1
         balances = self.wall_balances(screen, eligible_resources)
         level = self.walls.level(screen)
         if level is None:
@@ -1438,8 +1446,6 @@ class BuilderBaseManager:
             if offer and offer[1] == row["cost"]:
                 affordable.append(balance // offer[1])
         target = min(cap, max(affordable, default=1))
-        if not max_by_money:
-            target = min(target, limit)
         if target <= 1:
             return screen, 1
         log(f"[BH] Dự kiến chọn tối đa {target} đoạn; kiểm tra nút chọn và số tiền trước khi nâng.")
@@ -1733,6 +1739,10 @@ class BuilderBaseManager:
             log("[BH] Chưa xác nhận sang làng đêm. Sẽ thử lại sau 60 giây.")
             return
         self.active = True
+        engine = getattr(self, 'engine', None)
+        if engine is not None and not engine._verify_builder_walls_once(self):
+            self.retry_after = time.monotonic() + 60
+            return
         if self.village_state is not None:
             self.village_state.set_active_village('builder')
             self.village_state.update_attack_strategy('builder', {

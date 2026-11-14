@@ -422,6 +422,35 @@ class VisionEngine:
         self._phase_frame, self._phase_result = screen, result
         return result
 
+    @staticmethod
+    def parse_battle_seconds(texts):
+        """Parse the battle HUD countdown without using local elapsed time."""
+        header = ' '.join(str(part).lower() for part in texts)
+        header = re.sub(r'(?<=\d)[oO](?=\s*s\b)', '0', header)
+        match = re.search(r'(?<!\d)(\d{1,2})\s*m(?:in)?\s*(?:(\d{1,2})\s*s)?\b', header)
+        if match:
+            seconds = int(match.group(1)) * 60 + int(match.group(2) or 0)
+        else:
+            match = re.search(r'(?<!\d)(\d{1,2}):([0-5]\d)(?!\d)', header)
+            if match:
+                seconds = int(match.group(1)) * 60 + int(match.group(2))
+            else:
+                match = re.search(r'(?<!\d)(\d{1,3})\s*s\b', header)
+                seconds = int(match.group(1)) if match else None
+        return seconds if seconds is not None and 0 < seconds <= 240 else None
+
+    def battle_seconds_remaining(self, screen):
+        if screen is None or screen.shape[:2] != (900, 1600):
+            return None
+        ocr = self._get_ocr()
+        if ocr is None:
+            return None
+        try:
+            result = ocr(screen[5:115, 530:1070], use_det=True)
+            return self.parse_battle_seconds(getattr(result, 'txts', None) or [])
+        except Exception:
+            return None
+
     def _detect_battle_phase(self, screen):
         """Only a Next button/start countdown identifies scouting; ends identifies combat."""
         if screen is None or screen.shape[:2] != (900, 1600):
@@ -635,8 +664,6 @@ class VisionEngine:
             original_texts=getattr(original,'txts',None)
             original_digits=''.join(c for text in (original_texts if original_texts is not None else []) for c in text if c in '0123456789')
             if digits and original_digits==digits:return int(digits)
-            if len(components)==1 and components[0][2]/components[0][3]<.48:
-                return 1
         except Exception:pass
         return None
 
