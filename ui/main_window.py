@@ -768,6 +768,7 @@ class MainWindow(QMainWindow):
     def _exit_completely(self):
         self._force_quit = True
         self.close()
+        QApplication.instance().quit()
 
     def _change_startup_mode(self, _index):
         mode = self.combo_startup_mode.currentData()
@@ -2319,8 +2320,7 @@ class MainWindow(QMainWindow):
             self.lbl_timer_state.setText('Đã thực hiện lịch hẹn.')
             self._on_log(f'[Hẹn giờ] Đến giờ: {self._timer_action_label}.')
             if action == 'close':
-                self._force_quit = True
-                self.close()
+                self._exit_completely()
             elif self.bot.is_running and not self.bot.is_paused:
                 self._pause_bot()
                 self.bot.save_stats(force=True)
@@ -3175,13 +3175,20 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Nhập cấu hình", "Tệp đã chọn không đúng định dạng JSON cấu hình hợp lệ.")
                 return
 
+            old_startup = self.settings.get('ui_startup_mode', 'off')
+            requested_startup = imported.get('ui_startup_mode', old_startup)
+            if requested_startup not in STARTUP_MODES:
+                requested_startup = old_startup
+            if requested_startup != old_startup:
+                try:
+                    configure_startup(requested_startup)
+                except Exception as startup_error:
+                    requested_startup = old_startup
+                    self._on_log(f'[Cấu hình] Chưa áp dụng tự khởi động Windows: {startup_error}')
+            imported['ui_startup_mode'] = requested_startup
             self.settings.data.update(imported)
             self.settings.save()
             self._apply_settings_to_ui()
-            try:
-                configure_startup(self.settings.get('ui_startup_mode', 'off'))
-            except Exception as startup_error:
-                self._on_log(f'[Cấu hình] Chưa áp dụng tự khởi động Windows: {startup_error}')
 
             msg = f"Đã nạp thành công cấu hình từ:\n{path}\n\nToàn bộ thông số trên giao diện đã được cập nhật!"
             self.statusBar().showMessage(f"Đã nhập cấu hình từ {os.path.basename(path)}.", 4000)

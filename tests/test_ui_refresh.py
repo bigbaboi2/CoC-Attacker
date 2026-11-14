@@ -220,6 +220,20 @@ class AppearanceTests(unittest.TestCase):
                 page_scroll.verticalScrollBar().setValue(page_scroll.verticalScrollBar().maximum())
                 self.app.processEvents()
                 self.assertEqual(window.village_subtabs.tabBar().mapTo(window.tabs, QPoint(0, 0)).y(), pinned_y)
+                for tab_index, subtabs in ((window.main_attack_tab, window.combat_subtabs),
+                                           (window.builder_village_tab, window.builder_subtabs),
+                                           (window.device_tab, window.device_subtabs),
+                                           (5, window.schedule_subtabs)):
+                    window.tabs.setCurrentIndex(tab_index)
+                    subtabs.setCurrentIndex(0)
+                    self.app.processEvents()
+                    fixed_y = subtabs.tabBar().mapTo(window.tabs, QPoint(0, 0)).y()
+                    content_scroll = subtabs.currentWidget()
+                    self.assertIsInstance(content_scroll, QScrollArea)
+                    content_scroll.verticalScrollBar().setValue(content_scroll.verticalScrollBar().maximum())
+                    self.app.processEvents()
+                    self.assertEqual(subtabs.tabBar().mapTo(window.tabs, QPoint(0, 0)).y(), fixed_y)
+                window.tabs.setCurrentIndex(window.main_village_tab)
                 window.btn_compact.setChecked(True)
                 self.app.processEvents()
                 self.assertEqual(window.minimumSize(), window.maximumSize())
