@@ -49,6 +49,15 @@ def theme_qss(theme='dark', text_size='medium'):
         'green': ('#e2f8e9', '#62ae7e', '#1d6240'),
         'slate': ('#e7f1f7', '#739ab0', '#284b60'),
     })
+    status_colors = ({'normal': '#d5e0ee', 'muted': '#b8c9de',
+                      'success': '#70e3a6', 'danger': '#ffa1a8'} if theme == 'dark' else
+                     {'normal': '#23425f', 'muted': '#355574',
+                      'success': '#126b43', 'danger': '#a82e3e'})
+    light_readability = ("""
+    QLabel#sectionDetail, QLabel#metricTitle, QLabel#statTitle { color: #254766; font-weight: 600; }
+    QLabel#sectionTitle { color: #143c5e; font-weight: 700; }
+    QPlainTextEdit, QTextBrowser { color: #18324d; font-weight: 600; }
+    """ if theme == 'light' else '')
     qss = """
     QWidget { background: __WINDOW__; color: __TEXT__; font-family: 'Nunito Sans'; font-size: __BASE__px; }
     QMainWindow, QDialog { background: __WINDOW__; }
@@ -99,6 +108,8 @@ def theme_qss(theme='dark', text_size='medium'):
     BuildingItemWidget:hover { background: __SELECTED__; border-color: __ACCENT__; }
     QLabel#liveViewer { background: __LOG__; color: __MUTED__; border: 1px solid __BORDER__; border-radius: 8px; }
     QLabel#metricTitle, QLabel#statTitle, QLabel#sectionDetail { color: __MUTED__; }
+    __LIGHT_READABILITY__
+    __STATUS_TONES__
     QLabel#metricValue, QLabel#sectionTitle { color: __TEXT__; font-size: __METRIC__px; font-weight: 700; }
     __RESOURCE_STYLES__
     QLabel#statValue { color: __TEXT__; font-size: __STAT__px; font-weight: 700; }
@@ -132,6 +143,10 @@ def theme_qss(theme='dark', text_size='medium'):
             f'QFrame#statCard[tone="{tone}"] QLabel#statValue {{ color: {foreground}; }}'
         )
     qss = qss.replace('__STAT_TONE_STYLES__', '\n'.join(stat_rules))
+    qss = qss.replace('__LIGHT_READABILITY__', light_readability)
+    qss = qss.replace('__STATUS_TONES__', '\n'.join(
+        f'QLabel#sectionDetail[statusTone="{tone}"] {{ color: {color}; font-weight: 600; }}'
+        for tone, color in status_colors.items()))
     for key, value in values.items():
         qss = qss.replace('__' + key.upper() + '__', str(value))
     return qss

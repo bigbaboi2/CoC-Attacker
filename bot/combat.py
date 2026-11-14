@@ -77,11 +77,13 @@ class CombatExecutor:
         self.adb.zoom_out_map(times=times)
         time.sleep(.3)
 
-    def _find_drop_points_after_pan(self, count):
+    def _find_drop_points_after_pan(self, count, card=None):
         """Move the map at most twice before a troop is deployed, then rescan."""
         for start_y, end_y in ((370, 550), (550, 370)):
             self.adb.swipe(1000, start_y, 1000, end_y, duration_ms=450, jitter=0)
             time.sleep(.3)
+            if card is not None:
+                self.select_slot_pos(card['x'],card['y'])
             frame = self.adb.screencap()
             if frame is None or self.vision.battle_phase(frame) not in ('scouting', 'combat'):
                 return []
@@ -90,6 +92,23 @@ class CombatExecutor:
                 self._log(f"[Deploy] Đã dịch bản đồ {'xuống' if end_y > start_y else 'lên'} và tìm lại {len(points)} điểm thả.")
                 return points
         return []
+
+    def _recover_legal_drop_points(self, card, count):
+        """Reposition once in each direction and keep only count-proven points."""
+        for start_y,end_y in ((550,370),(370,550)):
+            self.adb.swipe(1000,start_y,1000,end_y,duration_ms=450,jitter=0)
+            time.sleep(.3)
+            self.select_slot_pos(card['x'],card['y'])
+            frame=self.adb.screencap()
+            if frame is None or self.vision.battle_phase(frame) not in ('scouting','combat'):
+                break
+            candidates=self.planner.points(frame,count)
+            if not candidates:continue
+            legal,left=self._verify_drop_points(card,candidates)
+            if legal:
+                self._log(f"[Deploy] Đã dịch bản đồ và xác minh {len(legal)} điểm thả {card['name']}.")
+                return legal,left,candidates
+        return [],card['count'],[]
 
     def interpolate_line_points(self,p1,p2,count):
         if count<=0:return []
@@ -148,7 +167,7 @@ class CombatExecutor:
             self._abilities()
             if slot is not None and getattr(self, '_selected_slot', None) != slot:
                 self.select_slot_pos(*slot)
-        self.adb.tap_batch(points,jitter=0,interval_ms=self.settings.get('troop_drop_delay_ms',80),
+        self.adb.tap_batch(points,jitter=0,interval_ms=min(40,self.settings.get('troop_drop_delay_ms',80)),
                            delay_after=.03,before_chunk=before_chunk)
         self._abilities()
 
@@ -179,7 +198,7 @@ class CombatExecutor:
 
     def _update_loot(self,screen):
         if not self._loot_initial:return
-        loot=self.vision.read_loot(screen)
+        loot=self.vision.read_loot(screen,dimmed=self._surrender_armed)
         if isinstance(loot,dict):
             for key in ('gold','elixir','dark_elixir'):
                 if not self._loot_initial.get('known',{}).get(key,True) or not loot.get('known',{}).get(key,True):continue
@@ -310,35 +329,48 @@ class CombatExecutor:
             time.sleep(.15)
         self._surrender_empty_checks=0
 
-    def _cast_pending_spells(self, screen=None):
+    def _cast_pending_spells(self, screen=None, force=False):
         now=time.monotonic()
         first_delay=.3 if self._ultra_active else float(self.settings.get('spell_first_delay_sec',1))
-        if now-self.battle_start_time<first_delay:return
-        gap=.4 if self._ultra_active else max(0,float(self.settings.get('spell_wave_gap_sec',2)))
-        if now-self.last_spell_at<gap or not any(card['count']>0 for card in self.pending_spells):return
+        if not force and now-self.battle_start_time<first_delay:return
+        gap=.4 if self._ultra_active else min(1,max(0,float(self.settings.get('spell_wave_gap_sec',2))))
+        if (not force and now-self.last_spell_at<gap) or not any(card['count']>0 for card in self.pending_spells):return
         if screen is None:
             screen=self.adb.screencap()
         if screen is None or self._home_button(screen):return
         if self.vision.battle_phase(screen)!='combat':return
         if not self.targeter.previous:
             self.targeter.target(screen,'no',now)
-        for card in self.pending_spells:
-            if card['count']<=0:continue
-            if card['name'] not in self.CASTABLE_SPELLS:
-                continue
-            now=time.monotonic()
-            target=self.targeter.target(screen,card['name'],now)
-            if target is None:continue
-            self._abilities()
-            if self._ultra_active:
-                self.send_ultra_blocks([dict(card=card,points=[target])])
-            else:
-                self.select_slot_pos(card['x'],card['y'])
-                self._drops([target],spell=True)
-            card['count']-=1
-            self.targeter.mark(target,card['name'],now)
-            self.last_spell_at=now
-            self._log(f"[Spell] {card['name']} tại {target}, theo cụm quân đã nhận diện; còn {card['count']}.")
+        for _ in range(sum(card['count'] for card in self.pending_spells) if force else 1):
+            cast=False
+            for card in self.pending_spells:
+                if card['count']<=0 or card['name'] not in self.CASTABLE_SPELLS:continue
+                now=time.monotonic()
+                target=self.targeter.target(screen,card['name'],now)
+                if target is None:
+                    # Use a prepared inward point when health bars are hidden.
+                    entries=list(dict.fromkeys(self._verified_drop_points))
+                    choices=[self._prepared_spell_targets.get(point) for point in entries]
+                    choices=[point for point in choices if point is not None]
+                    group=SpellTargeter.effect_group(card['name'])
+                    target=next((point for point in choices if not any(
+                        SpellTargeter.effect_group(zone['spell'])==group and
+                        (point[0]-zone['point'][0])**2+(point[1]-zone['point'][1])**2<90**2
+                        for zone in self.targeter.active if zone['until']>now)),None)
+                if target is None:continue
+                self._abilities()
+                if self._ultra_active:
+                    self.send_ultra_blocks([dict(card=card,points=[target])])
+                else:
+                    self.select_slot_pos(card['x'],card['y'])
+                    self._drops([target],spell=True)
+                card['count']-=1
+                self.targeter.mark(target,card['name'],now)
+                self.last_spell_at=now
+                self._log(f"[Spell] {card['name']} tại {target}; còn {card['count']}.")
+                cast=True
+                break
+            if not cast:break
 
     def cast_opening_support(self,entries):
         if self._opening_support_sent or not entries:return
@@ -738,51 +770,52 @@ class CombatExecutor:
     def _verify_drop_points(self,card,points,preferred=None):
         """A count decrease proves that a point accepts this troop type."""
         remaining=card['count'];valid=[]
-        priorities=list(preferred or [])+[points[i*len(points)//4] for i in range(4)]
+        priorities=list(preferred or [])+[points[i*len(points)//4] for i in range(4)]+list(points)
         unique=[]
         for point in priorities:
             if point not in unique:unique.append(point)
-        for point in unique[:4]:
+        for point in unique:
             if remaining<=0:break
             self.select_slot_pos(card['x'],card['y'])
+            self._wait(.08)
             self._drops([point])
             frame = self.adb.screencap()
             if frame is not None and getattr(self, '_live_callback', None):
                 self._live_callback(frame)
             after=self.recognizer.read_count(frame,card['x'])
-            if after is None or (after is not None and after<remaining-1):
-                self._wait(.35)
+            if after is None or after!=remaining-1:
+                self._wait(.15)
                 after=self.recognizer.read_count(self.adb.screencap(),card['x'],scale=3)
-            if after is not None and after==remaining-1:
+            if after is not None and 0<=after<remaining:
+                # The badge may update after an earlier tap. Keep its newest
+                # count as the baseline instead of rejecting every later tap.
                 valid.append(point)
                 remaining=after
-                if card['count']<=6:break
+                if card['count']<=6 or len(valid)>=4:break
         self._log(f"[Deploy] {card['name']}: {len(valid)} điểm đã giảm số quân; còn {remaining}.")
         return valid,remaining
 
     def _spread_verified_card(self, card, points, legal, remaining):
-        """Cover the requested perimeter in batches, checking actual count deltas."""
+        """Send the remaining army promptly, then check its count once."""
+        if remaining<=0:return legal,remaining
         candidates=[point for point in dict.fromkeys(points) if point not in legal]
-        for offset in range(0,len(candidates),4):
-            if remaining<=0:
-                break
-            batch=candidates[offset:offset+min(4,remaining)]
-            self._abilities();self.select_slot_pos(card['x'],card['y'])
-            self._drops(batch)
-            frame=self.adb.screencap()
-            after=self.recognizer.read_count(frame,card['x'])
-            if after is None or not 0 <= after <= remaining:
-                self._wait(.25)
-                frame=self.adb.screencap()
-                after=self.recognizer.read_count(frame,card['x'],scale=3)
-            if after is None or not 0 <= remaining-after <= len(batch):
-                self._log(f"[Deploy] Chưa xác minh số quân {card['name']} sau đợt rải; để lượt quét quân còn lại xử lý.")
-                return legal,None
-            if remaining-after==len(batch):
-                legal.extend(batch)
-            remaining=after
-            self._cast_pending_spells(screen=frame)
-        return legal,remaining
+        route=(candidates+legal) or list(points)
+        if not route:return legal,remaining
+        batch=[route[i%len(route)] for i in range(remaining)]
+        self._abilities();self.select_slot_pos(card['x'],card['y'])
+        self._drops(batch)
+        frame=self.adb.screencap()
+        after=self.recognizer.read_count(frame,card['x'])
+        if after is None:
+            after=self.recognizer.read_count(frame,card['x'],scale=3)
+        if after is None or not 0<=after<=remaining:
+            self._log(f"[Deploy] Chưa đọc chắc số quân {card['name']} sau lượt rải; chuyển sang lượt vét.")
+            return legal,None
+        sent=remaining-after
+        if sent:
+            legal.extend(point for point in batch[:sent] if point not in legal)
+        self._cast_pending_spells(screen=frame)
+        return legal,after
 
     def _deploy_resource_dragons(self, screen, card, legal_points):
         if self.resource_detector is None:
@@ -940,9 +973,15 @@ class CombatExecutor:
         cards=self.scan_deck_cards(screen,self._log)
         UltraAttackPlan.remember(self.settings,cards,serial=self._fixed_serial())
         point_count=int(self.settings.get('attack_spread_points',16))
+        # Selecting a troop makes the forbidden red boundary visible. A map
+        # scan without that overlay can mistake scenery for a legal perimeter.
+        scout_card=cards['troops'][0] if cards['troops'] else None
+        if scout_card:
+            self.select_slot_pos(scout_card['x'],scout_card['y'])
+            screen=self.adb.screencap()
         points=self.planner.points(screen,max(32,point_count) if strategy=='resource_dragons' else point_count)
         if cards['troops'] and not points:
-            points=self._find_drop_points_after_pan(max(32,point_count) if strategy=='resource_dragons' else point_count)
+            points=self._find_drop_points_after_pan(max(32,point_count) if strategy=='resource_dragons' else point_count,scout_card)
             if points:
                 screen=self.adb.screencap()
         if not cards['troops'] or not points:
@@ -979,16 +1018,25 @@ class CombatExecutor:
             card_points=(strategy_points(base_points,'perimeter',rotation)
                          if effective=='hybrid' and card is not main else points)
             legal,remaining=self._verify_drop_points(card,card_points,preferred if effective!='hybrid' else None)
+            if not legal and not self._verified_drop_points:
+                legal,remaining,recovered=self._recover_legal_drop_points(card,point_count)
+                if recovered:
+                    card_points=recovered
+                    points=recovered
+                    self._prepared_spell_targets.update({point:UltraAttackPlan.spell_points([point],1,self.settings)[0]
+                                                         for point in recovered})
             if not legal:
-                self._log(f"[Deploy] Chưa đọc chắc số quân {card['name']}; chuyển thẻ này sang lượt quét dự phòng.")
+                self._log(f"[Deploy] Chưa có điểm hợp lệ cho {card['name']}; không rải quân vào điểm chưa xác minh.")
                 continue
             preferred=legal
+            self._verified_drop_points.extend(point for point in legal if point not in self._verified_drop_points)
             if not heroes_started:
                 self.cast_opening_support(legal)
                 self.deploy_siege_machines(cards['siege'], points, preferred=legal)
-                self.deploy_heroes_early(cards['heroes'],points)
+                self.deploy_heroes_early(cards['heroes'],legal)
                 heroes_started=True
             legal,remaining=self._spread_verified_card(card,card_points,legal,remaining)
+            self._verified_drop_points.extend(point for point in legal if point not in self._verified_drop_points)
             self._troop_points_by_name[card['name']]=list(legal)
             if remaining is not None and remaining>0:
                 self._abilities();self.select_slot_pos(card['x'],card['y'])
@@ -997,8 +1045,11 @@ class CombatExecutor:
             # The scouting frame predates deployment and would suppress spells.
             self._cast_pending_spells()
         if not heroes_started:
-            self.deploy_siege_machines(cards['siege'], points, preferred=preferred)
-            self.deploy_heroes_early(cards['heroes'],points)
+            if preferred:
+                self.deploy_siege_machines(cards['siege'], points, preferred=preferred)
+                self.deploy_heroes_early(cards['heroes'],preferred)
+            else:
+                self._log('[Deploy] Không xác minh được vùng thả; giữ quân/phép và tiếp tục kiểm tra trận.')
         self._cast_pending_spells()
         self.run_backup_sweep(self._log,callback,points)
         return self._monitor(self._log,callback)
@@ -1064,19 +1115,26 @@ class CombatExecutor:
 
     def run_backup_sweep(self,log_callback=None,screen_callback=None,points=None):
         log=log_callback or self._log
-        screen=self.adb.screencap()
-        if screen is None or self._home_button(screen):return
-        cards=self.scan_deck_cards(screen)
-        remaining=cards['troops']
-        if not remaining:
-            log('[Deck] Không đọc được thẻ còn quân/phép sau triển khai.');return
-        log('[Deck] Còn: '+', '.join(f"{c['name']} x{c['count']}" for c in remaining))
-        points=getattr(self,'_verified_drop_points',[]) or points or self.planner.points(screen)
-        if not points:return
-        for card in remaining:
-            self._abilities();self.select_slot_pos(card['x'],card['y'])
-            card_points=self._troop_points_by_name.get(card['name']) or points
-            self._drops([card_points[i%len(card_points)] for i in range(card['count'])])
+        for attempt in range(2):
+            screen=self.adb.screencap()
+            if screen is None or self._home_button(screen) or self.vision.battle_phase(screen)!='combat':return
+            cards=self.scan_deck_cards(screen)
+            remaining=cards['troops']
+            if cards['spells']:
+                self.pending_spells=[dict(card) for card in cards['spells']]
+            if not remaining and not any(card['count']>0 for card in self.pending_spells):
+                log('[Deck] Không đọc thấy quân/phép còn số lượng sau triển khai.')
+                return
+            log('[Deck] Còn: '+', '.join(f"{c['name']} x{c['count']}" for c in remaining+self.pending_spells if c['count']>0))
+            safe_points=getattr(self,'_verified_drop_points',[])
+            for card in remaining:
+                card_points=self._troop_points_by_name.get(card['name']) or safe_points
+                if not card_points:
+                    log(f"[Deck] Giữ {card['name']} x{card['count']}: chưa có điểm thả đã xác minh.")
+                    continue
+                self._abilities();self.select_slot_pos(card['x'],card['y'])
+                self._drops([card_points[i%len(card_points)] for i in range(card['count'])])
+            self._cast_pending_spells(force=True)
         after=self.scan_deck_cards(self.adb.screencap())
         leftovers=after['troops']+after['spells']
         log('[Deck] Sau kiểm tra: '+(', '.join(f"{c['name']} x{c['count']}" for c in leftovers) if leftovers else 'không đọc thấy thẻ còn số lượng.'))

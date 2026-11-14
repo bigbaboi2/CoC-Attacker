@@ -42,6 +42,15 @@ class PrearmedSurrenderTests(unittest.TestCase):
         combat.scan_deck_cards.assert_not_called()
         combat.adb.tap.assert_not_called()
 
+    def test_loot_goal_keeps_prearmed_dialog(self):
+        combat = self.manager()
+        combat.scan_deck_cards.return_value = {'troops': [], 'spells': []}
+        policy = BattleEndPolicy(loot_enabled=True)
+        combat._arm_surrender_if_ready(object(), policy, Mock())
+        combat._next_surrender_arm_check_at = 0
+        combat._arm_surrender_if_ready(object(), policy, Mock())
+        self.assertTrue(combat._surrender_armed)
+
     def test_armed_exit_confirms_existing_dialog_without_reopening_it(self):
         combat = self.manager()
         combat._surrender_armed = True

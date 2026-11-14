@@ -36,6 +36,10 @@ class AppearanceTests(unittest.TestCase):
             self.assertEqual(restored.get('ui_text_size'), 'large')
             self.assertIn('#eff7ff', theme_qss('light', 'large'))
             self.assertIn('font-size: 16px', theme_qss('light', 'large'))
+            self.assertIn('QLabel#sectionDetail, QLabel#metricTitle, QLabel#statTitle { color: #254766; font-weight: 600; }',
+                          theme_qss('light', 'medium'))
+            self.assertIn('QLabel#sectionDetail[statusTone="normal"] { color: #23425f; font-weight: 600; }',
+                          theme_qss('light', 'medium'))
             for resource in ('gold', 'elixir', 'dark_elixir', 'gems'):
                 self.assertIn(f'resource="{resource}"', theme_qss('dark', 'medium'))
             for tone in ('blue', 'amber', 'gold', 'elixir', 'dark_elixir', 'green'):
@@ -195,6 +199,8 @@ class AppearanceTests(unittest.TestCase):
                 self.assertIsInstance(window.overview_nav, BubbleTabBar)
                 self.assertEqual(window.card_gold.property('tone'), 'gold')
                 self.assertEqual(window.card_elixir_hour.property('tone'), 'elixir')
+                self.assertIn(window.village_status.lbl_wall_breakdown.property('statusTone'),
+                              ('normal', 'muted', 'success'))
                 self.assertLessEqual(
                     window.overview_nav.mapTo(window.tabs, QPoint(0, 0)).y()
                     - window.tabs.tabBar().height(), 12)

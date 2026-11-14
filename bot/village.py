@@ -618,17 +618,29 @@ class VillageManager:
             return False
         return self.vision.is_in_main_village(screen)
 
-    def deselect_all(self):
+    def has_selected_building(self, screen):
+        """Return True when a building's bottom action toolbar is visible on the village screen."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        from bot.walls import WallUpgrader
+        return len(WallUpgrader.toolbar_tiles(self, screen)) > 0
+
+    def deselect_all(self, log_callback=None, only_if_selected=False):
         """Click a clear grass patch; fixed map coordinates can hit buildings after a pan."""
         screen=self.adb.screencap()
         if screen is None or self.vision.has_open_dialog(screen):return False
+        if only_if_selected and not self.has_selected_building(screen):
+            return False
         area=screen[280:600,550:1100]
         hsv=cv2.cvtColor(area,cv2.COLOR_BGR2HSV)
         mask=cv2.inRange(hsv,(30,40,70),(85,190,220))
         distance=cv2.distanceTransform(mask,cv2.DIST_L2,3)
         _,score,_,position=cv2.minMaxLoc(distance)
         if score<10:return False
-        self.adb.tap(position[0]+550,position[1]+280,jitter=0,delay_after=.3)
+        tx, ty = position[0]+550, position[1]+280
+        if log_callback:
+            log_callback(f'[Village] Tap bãi cỏ ({tx}, {ty}) để bỏ chọn công trình.')
+        self.adb.tap(tx,ty,jitter=0,delay_after=.3)
         return True
 
     def dismiss_notification_prompt(self, screen):
@@ -754,18 +766,20 @@ class VillageManager:
             original = self.vision.load_template(path)
             if original is None:
                 continue
-            for scale in (.65, .75, .8, .85, .9, .95, 1., 1.05, 1.15, 1.3):
+            for scale in (.75, .85, .95, 1., 1.05, 1.15, 1.3):
                 candidate = cv2.resize(original, None, fx=scale, fy=scale)
                 h, w = candidate.shape[:2]
                 if h > area.shape[0] or w > area.shape[1]:
                     continue
                 scores = cv2.matchTemplate(gray, cv2.cvtColor(candidate, cv2.COLOR_BGR2GRAY), cv2.TM_CCOEFF_NORMED)
-                for _ in range(16):
+                for _ in range(12):
                     _, score, _, position = cv2.minMaxLoc(scores)
-                    if score < (.75 if resource == 'dark_elixir' else .80):
+                    if score < .78:
                         break
                     px, py = position
                     x, y = px + 160 + w//2, py + 80 + h//2
+                    patch=area[py:py+h,px:px+w]
+                    color_score=float(cv2.matchTemplate(patch,candidate,cv2.TM_CCOEFF_NORMED)[0,0])
                     inner = area[py+int(h*.15):py+int(h*.65), px+int(w*.2):px+int(w*.8)]
                     hsv = cv2.cvtColor(inner, cv2.COLOR_BGR2HSV)
                     bounds = {'gold': ((15, 90, 120), (40, 255, 255)),
@@ -773,9 +787,9 @@ class VillageManager:
                               'dark_elixir': ((0, 0, 0), (180, 255, 90))}
                     color = cv2.inRange(hsv, *bounds[resource])
                     # Resource HUD and the expanded lower dock are not collectors.
-                    if ((color > 0).mean() > .25 and not (x >= 1230 and y < 340)
+                    if (color_score >= .78 and (color > 0).mean() > .35 and not (x >= 1230 and y < 340)
                             and not (x < 820 and y >= 790)):
-                        matches.append(dict(resource=resource, x=x, y=y, score=float(score)))
+                        matches.append(dict(resource=resource, x=x, y=y, score=min(float(score),color_score)))
                     scores[max(0, py-h//2):py+h//2+1, max(0, px-w//2):px+w//2+1] = -1
         selected = []
         for match in sorted(matches, key=lambda item: item['score'], reverse=True):
@@ -789,33 +803,76 @@ class VillageManager:
         interval = max(1, int(self.settings.get('collect_interval_min', 60))) * 60
         if self.last_collect_time is not None and now - self.last_collect_time < interval:
             return 0
+        if now < getattr(self,'_next_collect_scan_at',0):
+            return 0
         screen = screen if screen is not None else self.adb.screencap()
         if not self.is_in_main_village(screen):
             return 0
 
-        self.last_collect_time = now
         attempted = []
-        for _ in range(30):
+        verified = []
+        candidates=self.find_collectors(screen)
+        names={'gold':'vàng','elixir':'dầu','dark_elixir':'dầu đen'}
+        if log_callback:
+            counts={name:sum(item['resource']==name for item in candidates) for name in names}
+            log_callback('[Collect] Quét: '+', '.join(f'{names[name]} {count}' for name,count in counts.items())
+                         +'; tối đa 8 giây/8 lần tap.')
+        deadline=time.monotonic()+8
+        for _ in range(8):
+            if time.monotonic()>=deadline:
+                if log_callback:log_callback('[Collect] Hết ngân sách 8 giây; để lại mục tiêu chưa thu cho lượt sau.')
+                break
             self.adb._guard_input()
-            # One tap can clear neighboring bubbles. Scan for the next visible
-            # target and avoid tapping a persistent bubble twice.
-            item = next((item for item in self.find_collectors(screen)
+            item = next((item for item in candidates
                          if all((item['x']-x)**2 + (item['y']-y)**2 > 28**2
                                 for x, y in attempted)), None)
             if item is None:
                 break
-            point = (item['x'], item['y'])
+            # Require the same resource bubble in a fresh frame. A single
+            # animated frame can resemble the small collector templates.
+            fresh = self.adb.screencap()
+            if not self.is_in_main_village(fresh):
+                if log_callback:log_callback('[Collect] Màn hình không còn là Làng chính trước tap; dừng.')
+                break
+            confirmed=self.find_collectors(fresh)
+            confirmation = next((other for other in confirmed
+                                 if other['resource'] == item['resource']
+                                 and (other['x']-item['x'])**2 + (other['y']-item['y'])**2 <= 8**2), None)
+            if confirmation is None:
+                if log_callback:
+                    log_callback(f"[Collect] Bỏ {names[item['resource']]} tại ({item['x']}, {item['y']}): không ổn định giữa hai ảnh.")
+                break
+            point = (confirmation['x'], confirmation['y'])
+            if log_callback:
+                log_callback(f"[Collect] Tap {names[item['resource']]} tại {point}, khớp {confirmation['score']:.3f}.")
             self.adb.tap(*point, jitter=0, delay_after=.15)
             attempted.append(point)
             screen = self.adb.screencap()
             if not self.is_in_main_village(screen):
+                if log_callback:log_callback(f'[Collect] Màn hình đổi sau tap tại {point}; dừng để kiểm tra.')
                 break
+            candidates=self.find_collectors(screen)
+            still_visible = any(other['resource'] == item['resource']
+                                and (other['x']-point[0])**2 + (other['y']-point[1])**2 <= 20**2
+                                for other in candidates)
+            if still_visible:
+                if log_callback:
+                    log_callback(f"[Collect] {names[item['resource']]} tại {point} không biến mất sau tap; dừng để tránh bấm sai.")
+                break
+            verified.append(point)
+            if log_callback:
+                log_callback(f"[Collect] Xác minh {names[item['resource']]} tại {point} đã biến mất.")
+        if verified and not candidates:
+            self.last_collect_time = now
+        else:
+            self._next_collect_scan_at=now+30
         if log_callback:
-            if attempted:
-                log_callback(f'[Collect] Đã bấm {len(attempted)} biểu tượng thu hoạch.')
+            if verified:
+                wait='theo cài đặt' if self.last_collect_time == now else 'sau ít nhất 30 giây'
+                log_callback(f'[Collect] Xong lượt: {len(verified)} xác minh, còn {len(candidates)} biểu tượng nhận diện; quét lại {wait}.')
             else:
-                log_callback('[Collect] Chưa thấy biểu tượng mỏ sẵn sàng thu.')
-        return len(attempted)
+                log_callback(f'[Collect] Chưa xác minh được biểu tượng nào; quét lại sau ít nhất 30 giây.')
+        return len(verified)
 
     def train_army(self, force: bool = False):
         """

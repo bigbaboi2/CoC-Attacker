@@ -896,9 +896,7 @@ class BotEngine:
 
             # Thực hiện chu trình chăm sóc làng (Luyện quân, Thu hoạch, Nâng tường)
             self._run_village_maintenance()
-            if getattr(self, '_startup_main_work_pending', False):
-                self._startup_main_work_pending = False
-                self._defer_battle_after_maintenance = True
+            self._startup_main_work_pending = False
             if getattr(self, '_defer_battle_after_maintenance', False):
                 self._force_builder_maintenance = True
                 return
@@ -1999,7 +1997,7 @@ class BotEngine:
         self.log("[Village] Kiểm tra thu hoạch, đội quân và tường.")
         if hasattr(self.village, 'check_and_sync_account'):
             self.village.check_and_sync_account(screen, self.log)
-        self.village.deselect_all()
+        self.village.deselect_all(log_callback=self.log, only_if_selected=True)
 
         # 1. Tự động luyện quân nhanh (Quick Train)
         if self.settings.get("auto_train_army", True):
@@ -2087,6 +2085,7 @@ class BotEngine:
                     self.village.wall_result = dict(status='paused_for_builders', reason=self.village.wall_status)
                     self.log('[Wall] ' + self.village.wall_status)
                 elif res['gold'] > 0 or res['elixir'] > 0:
+                    self.log('[Wall] Bắt đầu luồng kiểm tra/nâng tường; các tap tiếp theo thuộc luồng tường.')
                     self.village.upgrade_walls(fresh, res['gold'], res['elixir'], log_callback=self.log)
 
         fresh=self.adb.screencap()
@@ -2098,5 +2097,5 @@ class BotEngine:
             return
 
         self.last_village_maintenance = time.time()
-        self.village.deselect_all()
+        self.village.deselect_all(log_callback=self.log, only_if_selected=True)
         self.log("[Village] Hoàn tất bảo trì.")

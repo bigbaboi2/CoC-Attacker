@@ -551,12 +551,18 @@ class VisionEngine:
 
         return False, None
 
-    def read_loot(self, screen):
+    def read_loot(self, screen, dimmed=False):
         loot={'gold':0,'elixir':0,'dark_elixir':0,'valid':False,'valid_dark':False}
-        if screen is None or self.battle_phase(screen) not in ('scouting','combat'):return loot
+        if screen is None or screen.shape[:2] != (900,1600):return loot
+        # A confirmed Surrender dialog darkens the live battle but leaves the
+        # Available Loot HUD visible. Its dim pixels fail the normal white mask.
+        if not dimmed and self.battle_phase(screen) not in ('scouting','combat'):return loot
         values={}
         for key,(x,y,w,h) in {'gold':(80,105,225,40),'elixir':(80,150,225,42),'dark_elixir':(80,200,180,42)}.items():
-            value=self.read_enemy_resource_number(screen[y:y+h,x:x+w])
+            crop=screen[y:y+h,x:x+w]
+            if dimmed:
+                crop=cv2.convertScaleAbs(crop,alpha=2.25,beta=0)
+            value=self.read_enemy_resource_number(crop)
             values[key]=value
             loot[key]=value if value is not None else 0
         loot['known']={key:value is not None for key,value in values.items()}

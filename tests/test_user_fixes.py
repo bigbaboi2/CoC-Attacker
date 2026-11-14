@@ -305,5 +305,33 @@ class FixTests(unittest.TestCase):
         self.assertTrue(ArmyUpgrader(worker).configure_filter())
         self.assertEqual(adb.tap.call_count, 2)
 
+    def test_deselect_all_skips_when_only_if_selected_and_no_building_selected(self):
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(tap=Mock(), screencap=lambda: frame)
+        village = VillageManager.__new__(VillageManager)
+        village.adb = adb
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False)
+        village.has_selected_building = Mock(return_value=False)
+        logs = []
+        self.assertFalse(village.deselect_all(log_callback=logs.append, only_if_selected=True))
+        adb.tap.assert_not_called()
+        self.assertEqual(logs, [])
+
+    def test_apprentice_logs_when_no_ready_badge(self):
+        from bot.apprentice import ApprenticeAssigner
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        village = SimpleNamespace(settings={'auto_assign_apprentice': True},
+                                  is_in_main_village=lambda _: True,
+                                  vision=Mock(), adb=Mock())
+        assigner = ApprenticeAssigner(village)
+        assigner.ui = SimpleNamespace(ensure_menu_open=Mock(return_value=True),
+                                      close_dialog=Mock())
+        assigner.wait_for = Mock(return_value=(None, None))
+        logs = []
+        self.assertTrue(assigner.run(frame, logs.append))
+        self.assertTrue(any('Mở menu Thợ xây tại (1455, 690)' in line for line in logs))
+        self.assertTrue(any('Không thấy Phụ tá thợ xây rảnh; đóng menu Thợ xây.' in line for line in logs))
+        assigner.ui.close_dialog.assert_called_once()
+
 if __name__ == '__main__':
     unittest.main()

@@ -419,6 +419,13 @@ class VillageLiveStatusWidget(QWidget):
         label.setObjectName('sectionDetail')
         return label
 
+    @staticmethod
+    def _set_status_tone(label, tone):
+        if label.property('statusTone') != tone:
+            label.setProperty('statusTone', tone)
+            label.style().unpolish(label)
+            label.style().polish(label)
+
     @classmethod
     def _section(cls, root, title):
         frame = QFrame()
@@ -547,10 +554,10 @@ class VillageLiveStatusWidget(QWidget):
 
             if auto_bldg:
                 self.lbl_bldg_mode_badge.setText("● Tự động nâng: Đang BẬT")
-                self.lbl_bldg_mode_badge.setStyleSheet("color: #34d399; font-weight: 600;")
+                self._set_status_tone(self.lbl_bldg_mode_badge, 'success')
             else:
                 self.lbl_bldg_mode_badge.setText("○ Tự động nâng: Đã TẮT")
-                self.lbl_bldg_mode_badge.setStyleSheet("color: #94a3b8; ")
+                self._set_status_tone(self.lbl_bldg_mode_badge, 'muted')
 
             if free is None:
                 self.card_builder_free.set_value("—")
@@ -623,10 +630,10 @@ class VillageLiveStatusWidget(QWidget):
 
             if lock_th:
                 self.lbl_builder_lock.setText("🛡️ Chốt an toàn: Cấm nâng Nhà chính (Town Hall) [Đang BẬT]")
-                self.lbl_builder_lock.setStyleSheet("color: #34d399; ")
+                self._set_status_tone(self.lbl_builder_lock, 'success')
             else:
                 self.lbl_builder_lock.setText("⚠️ Chốt an toàn: Cấm nâng Nhà chính đã TẮT (có thể nâng TH)")
-                self.lbl_builder_lock.setStyleSheet("color: #f87171; ")
+                self._set_status_tone(self.lbl_builder_lock, 'danger')
         walls = state.get('wall_inventory', {}).get(village, {})
         th_level = state.get('th_level')
         max_allowed = (th_level if th_level <= 8 else th_level + 1) if (isinstance(th_level, int) and th_level >= 2) else None
@@ -652,14 +659,14 @@ class VillageLiveStatusWidget(QWidget):
                 f"🏰 Tường: Toàn bộ {total_walls} đoạn đã đạt Cấp {target_lvl}{th_str} · ĐÃ MAX HOÀN TOÀN ✅\n"
                 f"⚡ Trạng thái thợ: Sử dụng hết toàn bộ số thợ xây khả dụng (duy trì 0 thợ dự phòng)"
             )
-            self.lbl_wall_breakdown.setStyleSheet("color: #34d399; font-weight: bold;")
+            self._set_status_tone(self.lbl_wall_breakdown, 'success')
         elif walls:
             levels = ' · '.join(f'Cấp {level} · {walls[level]:,} đoạn' for level in sorted(walls))
             self.lbl_wall_breakdown.setText(f'Tường đã thấy · {levels}')
-            self.lbl_wall_breakdown.setStyleSheet('color: #cbd5e1; ')
+            self._set_status_tone(self.lbl_wall_breakdown, 'normal')
         else:
             self.lbl_wall_breakdown.setText('Tường · Chưa có dữ liệu')
-            self.lbl_wall_breakdown.setStyleSheet('color: #94a3b8; ')
+            self._set_status_tone(self.lbl_wall_breakdown, 'muted')
 
         if is_maxed:
             actions = tuple(

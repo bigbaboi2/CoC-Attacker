@@ -92,24 +92,33 @@ class ApprenticeAssigner:
                 or not self.village.settings.get('auto_assign_apprentice', False)
                 or not self.village.is_in_main_village(screen)):
             return False
+        log = log or (lambda message: None)
         self.next_check = time.monotonic() + 120
+        log('[Phụ tá] Mở menu Thợ xây tại (1455, 690) để kiểm tra Phụ tá rảnh...')
         if not self.ui.ensure_menu_open():
+            log('[Phụ tá] Chưa mở được menu Thợ xây; sẽ kiểm tra lại sau 2 phút.')
             return True
         _, badge = self.wait_for(self.ready_badge)
         if not badge:
+            log('[Phụ tá] Không thấy Phụ tá thợ xây rảnh; đóng menu Thợ xây.')
             self.ui.close_dialog()
             return True
+        log(f'[Phụ tá] Phát hiện Phụ tá sẵn sàng tại {badge}; bấm mở bảng giao việc.')
         self.tap(badge)
         _, first = self.wait_for(self.first_assignment)
         if first is None:
+            log('[Phụ tá] Không thấy nút giao việc ở dòng đầu tiên; đóng bảng Phụ tá.')
             self.ui.close_dialog()
             return True
+        pt_first = (int(first[0]), int(first[1]))
+        log(f'[Phụ tá] Bấm chọn công trình đầu tiên tại {pt_first}.')
         self.tap(first)
 
         screen, confirm = self.wait_for(self.confirm_button)
         if confirm:
             checkbox, checked = self.keep_checkbox(screen)
             if checked is True:
+                log(f'[Phụ tá] Ô "Giữ phân công" đang bật; bấm tại {checkbox} để bỏ chọn.')
                 self.tap(checkbox)
                 screen = self.adb.screencap()
                 confirm = self.confirm_button(screen)
@@ -118,6 +127,8 @@ class ApprenticeAssigner:
                     and self.village.settings.get('main_village_enabled', True)):
                 # A delayed transition must never result in a second confirmation.
                 self.next_check = time.monotonic() + 900
+                pt_confirm = (int(confirm[0]), int(confirm[1]))
+                log(f'[Phụ tá] Bấm nút Xác nhận tại {pt_confirm} để giao Phụ tá.')
                 self.tap(confirm)
                 screen = self.adb.screencap()
                 if screen is not None and not self.confirm_button(screen):
@@ -126,8 +137,11 @@ class ApprenticeAssigner:
                     log('[Phụ tá] Chưa xác minh giao việc; sẽ kiểm tra lại sau.')
             elif checked is None:
                 log('[Phụ tá] Chưa đọc rõ ô giữ phân công; hoãn xác nhận.')
+        else:
+            log('[Phụ tá] Không thấy hộp thoại xác nhận giao việc; đóng bảng.')
         self.ui.close_dialog()
         # The apprentice dialog can return to the builder list after closing.
         if self.ui.is_menu_open(self.adb.screencap()):
+            log('[Phụ tá] Đóng danh sách Thợ xây còn mở để quay về màn hình làng.')
             self.ui.close_dialog()
         return True
