@@ -3,6 +3,9 @@ from pathlib import Path
 
 FONT_DIR = Path(__file__).resolve().parents[1] / 'assets' / 'fonts'
 FONT_FILES = (FONT_DIR / 'Baloo2.ttf', FONT_DIR / 'NunitoSans.ttf')
+UI_DIR = Path(__file__).resolve().parents[1] / 'assets' / 'ui'
+APP_ICON_ICO = UI_DIR / 'app_icon.ico'
+APP_ICON_PNG = UI_DIR / 'app_icon.png'
 TEXT_SIZES = {'small': 12, 'medium': 14, 'large': 16}
 
 PALETTES = {

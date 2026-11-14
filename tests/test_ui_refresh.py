@@ -14,7 +14,7 @@ from PyQt5.QtWidgets import QApplication, QScrollArea, QSystemTrayIcon, QVBoxLay
 
 from config.settings import BotSettings
 from ui.activity import activity_from_log
-from ui.styles import FONT_FILES, theme_qss
+from ui.styles import FONT_FILES, APP_ICON_ICO, APP_ICON_PNG, theme_qss
 from ui.widgets import BubbleTabBar, NoWheelComboBox, NoWheelDateTimeEdit, NoWheelSpinBox
 import ui.main_window as ui
 
@@ -302,6 +302,17 @@ class AppearanceTests(unittest.TestCase):
             finally:
                 window._exit_completely()
                 self.assertTrue(self.app.quitOnLastWindowClosed())
+
+    def test_app_icon_files_and_window_icon_loaded(self):
+        self.assertTrue(APP_ICON_ICO.is_file())
+        self.assertTrue(APP_ICON_PNG.is_file())
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            with patch.object(ui, 'BotSettings', side_effect=lambda: BotSettings(str(Path(directory) / 'config.json'))):
+                window = ui.MainWindow()
+            try:
+                self.assertFalse(window.windowIcon().isNull())
+            finally:
+                window._exit_completely()
 
 
 if __name__ == '__main__':

@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QTimer, QDateTime, pyqtSignal, QObject
 from PyQt5.QtGui import QIcon
 
-from ui.styles import theme_qss, TEXT_SIZES
+from ui.styles import theme_qss, TEXT_SIZES, APP_ICON_ICO, APP_ICON_PNG
 from ui.activity import activity_from_log
 from ui.widgets import StatCard, LiveScreenViewer, LogConsole, VillageTabBar, VillageLiveStatusWidget, BubbleTabBar
 from ui.widgets import NoWheelSpinBox as QSpinBox, NoWheelComboBox as QComboBox, NoWheelDateTimeEdit as QDateTimeEdit
@@ -290,6 +290,9 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CoCAttack — Điều khiển MuMu")
+        icon_file = APP_ICON_ICO if APP_ICON_ICO.is_file() else APP_ICON_PNG
+        if icon_file.is_file():
+            self.setWindowIcon(QIcon(str(icon_file)))
         self.resize(1180, 780)
         self.setMinimumSize(1040, 620)
         self.settings = BotSettings()
@@ -743,7 +746,10 @@ class MainWindow(QMainWindow):
             self.showMinimized()
             return
         if not hasattr(self, '_tray_icon'):
-            tray = QSystemTrayIcon(self.style().standardIcon(QStyle.SP_ComputerIcon), self)
+            tray_icon = self.windowIcon()
+            if tray_icon.isNull():
+                tray_icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
+            tray = QSystemTrayIcon(tray_icon, self)
             tray.setToolTip('CoCAttack · Nhấp để mở cửa sổ')
             menu = QMenu(self)
             restore_action = QAction('Mở CoCAttack', menu)

@@ -59,10 +59,17 @@ class GuiOutput:
 def run_gui(output):
     _preload_ocr()
     from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtGui import QFontDatabase
+    from PyQt5.QtGui import QFontDatabase, QIcon
     from PyQt5.QtCore import Qt
-    from ui.styles import FONT_FILES
+    from ui.styles import FONT_FILES, APP_ICON_ICO, APP_ICON_PNG
     from ui.main_window import MainWindow
+
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("CoCAttack.Desktop.App")
+        except Exception:
+            pass
 
     # Enable High DPI scaling
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
@@ -70,6 +77,9 @@ def run_gui(output):
 
     app = QApplication(sys.argv)
     app.setApplicationName("CoCAttack")
+    icon_file = APP_ICON_ICO if APP_ICON_ICO.is_file() else APP_ICON_PNG
+    if icon_file.is_file():
+        app.setWindowIcon(QIcon(str(icon_file)))
     for font_file in FONT_FILES:
         if font_file.is_file():
             QFontDatabase.addApplicationFont(str(font_file))
