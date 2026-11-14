@@ -242,6 +242,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "end_star_source": "all",
     "battle_timeout_sec": 120,
     "auto_surrender": True,
+    "prearm_surrender": False,
     "end_on_stars": True,
     "end_on_time": True,
     "end_on_loot": False,

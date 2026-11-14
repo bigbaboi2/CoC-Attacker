@@ -19,6 +19,7 @@ class PrearmedSurrenderTests(unittest.TestCase):
                                 (1000, 570) if name == 'okay' else (100, 650)))
         combat.adb = SimpleNamespace(tap=Mock(), screencap=Mock(return_value=object()))
         combat.scan_deck_cards = Mock()
+        combat.settings = {'prearm_surrender': True}
         return combat
 
     def test_waits_for_troops_and_usable_spells_but_ignores_invisibility(self):
@@ -39,6 +40,13 @@ class PrearmedSurrenderTests(unittest.TestCase):
     def test_disabled_auto_surrender_never_opens_dialog(self):
         combat = self.manager()
         combat._arm_surrender_if_ready(object(), BattleEndPolicy(enabled=False), Mock())
+        combat.scan_deck_cards.assert_not_called()
+        combat.adb.tap.assert_not_called()
+
+    def test_disabled_prearm_setting_never_opens_dialog(self):
+        combat = self.manager()
+        combat.settings = {'prearm_surrender': False}
+        combat._arm_surrender_if_ready(object(), BattleEndPolicy(enabled=True), Mock())
         combat.scan_deck_cards.assert_not_called()
         combat.adb.tap.assert_not_called()
 

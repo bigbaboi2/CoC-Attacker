@@ -297,7 +297,9 @@ class CombatExecutor:
         return bool(troops or spells)
 
     def _arm_surrender_if_ready(self, screen, policy, log):
-        if (self._surrender_armed or self._deployment_pending or not policy.enabled
+        settings = getattr(self, 'settings', None)
+        prearm_enabled = settings.get('prearm_surrender', False) if settings else True
+        if (not prearm_enabled or self._surrender_armed or self._deployment_pending or not policy.enabled
                 or not (policy.stars_enabled or policy.time_enabled
                         or policy.loot_enabled or policy.destruction_enabled)):
             return

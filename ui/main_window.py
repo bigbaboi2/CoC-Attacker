@@ -1837,7 +1837,16 @@ class MainWindow(QMainWindow):
         self.chk_auto_surr.setChecked(self.settings.get("auto_surrender", True))
         self.chk_auto_surr.stateChanged.connect(lambda s: self.settings.set("auto_surrender", s == Qt.Checked))
 
+        self.chk_prearm_surr = QCheckBox("Mở sẵn bảng xác nhận Đầu hàng (Surrender) sau khi thả hết quân & phép")
+        self.chk_prearm_surr.setToolTip(
+            "Khi bật, bot sẽ bấm mở sẵn popup Surrender ngay khi thả hết quân để bấm Okay nhanh hơn.\n"
+            "Lưu ý: Bảng popup mở sẵn có thể che khuất màn hình hoặc nút tua nhanh 4x."
+        )
+        self.chk_prearm_surr.setChecked(self.settings.get("prearm_surrender", False))
+        self.chk_prearm_surr.stateChanged.connect(lambda s: self.settings.set("prearm_surrender", s == Qt.Checked))
+
         form_surr.addRow(self.chk_auto_surr)
+        form_surr.addRow(self.chk_prearm_surr)
         self.chk_end_stars=QCheckBox('Đạt số sao (1, 2 hoặc 3):')
         self.chk_end_time=QCheckBox('Đạt thời gian tối đa (giây):')
         self.chk_end_loot=QCheckBox('Farm đủ tài nguyên địch (%):')
@@ -1885,6 +1894,7 @@ class MainWindow(QMainWindow):
                           self.chk_end_loot, self.chk_end_destruction)
         def update_end_conditions():
             enabled = self.chk_auto_surr.isChecked()
+            self.chk_prearm_surr.setEnabled(enabled)
             for check in end_conditions:
                 check.setEnabled(enabled)
             for check, control in ((self.chk_end_stars, self.spin_stars),
@@ -3050,6 +3060,7 @@ class MainWindow(QMainWindow):
 
     def _reset_surrender_defaults(self):
         self.chk_auto_surr.setChecked(DEFAULT_CONFIG["auto_surrender"])
+        self.chk_prearm_surr.setChecked(DEFAULT_CONFIG["prearm_surrender"])
         self.chk_end_stars.setChecked(DEFAULT_CONFIG["end_on_stars"])
         star_sources = ['all', 'town_hall', 'destruction']
         def_source = DEFAULT_CONFIG["end_star_source"]
@@ -3067,7 +3078,7 @@ class MainWindow(QMainWindow):
         self.chk_end_destruction.setChecked(DEFAULT_CONFIG["end_on_destruction"])
         self.spin_destruction.setValue(DEFAULT_CONFIG["destruction_target_percent"])
         self.combo_end_mode.setCurrentIndex(1 if DEFAULT_CONFIG["end_condition_mode"] == 'all' else 0)
-        for k in ("auto_surrender", "end_on_stars", "end_star_source", "star_target",
+        for k in ("auto_surrender", "prearm_surrender", "end_on_stars", "end_star_source", "star_target",
                   "end_on_time", "battle_timeout_sec", "end_on_loot", "loot_target_percent",
                   "loot_target_resource", "end_on_destruction", "destruction_target_percent", "end_condition_mode"):
             self.settings.set(k, DEFAULT_CONFIG[k])
@@ -3404,6 +3415,8 @@ class MainWindow(QMainWindow):
         # 8. Surrender & End conditions
         if hasattr(self, 'chk_auto_surr'):
             self.chk_auto_surr.setChecked(self.settings.get("auto_surrender", True))
+        if hasattr(self, 'chk_prearm_surr'):
+            self.chk_prearm_surr.setChecked(self.settings.get("prearm_surrender", False))
         if hasattr(self, 'chk_end_stars'):
             self.chk_end_stars.setChecked(self.settings.get("end_on_stars", True))
         if hasattr(self, 'combo_star_source'):
