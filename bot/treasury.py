@@ -4,7 +4,6 @@ import time
 import unicodedata
 import cv2
 import json
-import itertools
 from pathlib import Path
 from core.adb_client import BotStoppedError
 from core.resource_targets import ResourceTargetDetector
@@ -41,10 +40,10 @@ class TreasuryCollector:
         retry=self.memory.get('next_check_at',0)
         # An older Castle-image miss should get one fresh search with the
         # level-independent locator instead of inheriting its long cooldown.
-        if self.memory.get('last_result')=='castle_not_found' and self.memory.get('castle_search_version',0)<2:
+        if self.memory.get('last_result')=='castle_not_found' and self.memory.get('castle_search_version',0)<3:
             retry=0
             self.memory['next_check_at']=0
-        self.memory['castle_search_version']=2
+        self.memory['castle_search_version']=3
         if type(retry) in (int,float) and time.time()<retry<time.time()+31*86400:
             manager._treasury_next_check=retry
 
@@ -92,19 +91,36 @@ class TreasuryCollector:
         text=unicodedata.normalize('NFD',text.lower().replace('đ','d'))
         return ''.join(char for char in text if unicodedata.category(char)!='Mn')
 
-    def words(self, screen, roi):
+    def words(self, screen, roi, scale=1):
         if screen is None:
             return []
         x,y,w,h=roi
         ocr=self.vision._get_ocr()
         if ocr is None:
             return []
-        result=ocr(screen[y:y+h,x:x+w],use_det=True)
+        crop=screen[y:y+h,x:x+w]
+        if scale!=1:
+            crop=cv2.resize(crop,None,fx=scale,fy=scale)
+        result=ocr(crop,use_det=True)
         texts=getattr(result,'txts',None);boxes=getattr(result,'boxes',None)
         if texts is None or boxes is None:
             return []
-        return [(self.normalized(text),x+round(box[:,0].mean()),y+round(box[:,1].mean()))
+        return [(self.normalized(text),x+round(box[:,0].mean()/scale),y+round(box[:,1].mean()/scale))
                 for text,box in zip(texts,boxes)]
+
+    def tiled_clan_hints(self, screen, profile_names, max_seconds=6):
+        """Read the small world label in bounded, enlarged map crops."""
+        if not profile_names:
+            return []
+        tiles=[(x,y) for y in (400,280,520,160) for x in (700,520,880,340,1060)]
+        started=time.monotonic()
+        for x,y in tiles:
+            if time.monotonic()-started>max_seconds:
+                break
+            for text,tx,ty in self.words(screen,(x,y,220,170),scale=2):
+                if text.strip() in profile_names:
+                    return [(tx,min(690,ty+30),'tên bang trên bản đồ')]
+        return []
 
     def treasury_button(self, screen):
         words=self.words(screen,(150,500,1250,370))
@@ -115,41 +131,60 @@ class TreasuryCollector:
             return None
         return next(((x,y) for text,x,y in words if text.strip() in ('treasury','kho bac')),None)
 
-    @staticmethod
-    def castle_probe_points():
-        """Search the visible village without assuming a Clan Castle level."""
-        points = itertools.product(range(280, 1321, 80), range(160, 641, 80))
-        return sorted(points, key=lambda point: ((point[0]-800)**2 + (point[1]-400)**2,
-                                                 point[1], point[0]))
-
-    def open_castle(self, screen):
-        button=self.treasury_button(screen)
-        if button:
-            return screen,button
-        self.adb.zoom_out_map(times=2)
-        time.sleep(.3)
-        screen=self.adb.screencap()
-        if not self.vision.is_in_main_village(screen):
-            return None,None
+    def castle_hints(self, screen):
         # A single sprite template cannot cover every Clan Castle level.
         # Image hits are only hints; the selected title and Treasury button
         # remain the proof before opening anything.
         candidates=self.detector.detect(screen,kinds=('clan_castle',),threshold=.8)
-        hints=[(item['x'],item['y']) for item in candidates[:4]]
+        hints=[(item['x'],item['y'],'ảnh Clan Castle') for item in candidates[:2]]
+        map_words=self.words(screen,(200,140,1150,460))
+        # The same clan name appears under the player name and over the Clan
+        # Castle. This survives Castle level changes and a missing Request tag.
+        profile_names={text.strip() for text,x,y in self.words(screen,(100,30,360,160))
+                       if 95<=y<=155 and len(text.strip())>=4}
+        hints.extend((x,min(690,y+45),'tên bang trùng hồ sơ') for text,x,y in map_words
+                     if text.strip() in profile_names and 350<=x<=1250)
         # A troop-request label is independent of the Castle's visual level.
-        hints.extend((x,min(690,y+55)) for text,x,y in self.words(screen,(200,140,1150,460))
+        hints.extend((x,min(690,y+55),'nhãn Request') for text,x,y in map_words
                      if text.strip() in ('request','xin quan'))
-        positions=hints+self.castle_probe_points()
+        if not hints:
+            hints.extend(self.tiled_clan_hints(screen,profile_names))
+        positions=[]
+        for x,y,source in hints:
+            if not any((x-old_x)**2+(y-old_y)**2<35**2 for old_x,old_y,_ in positions):
+                positions.append((x,y,source))
+            if len(positions)>=3:break
+        return positions
+
+    def open_castle(self, screen, log=None):
+        log=log or (lambda message:None)
+        if not self.vision.is_in_main_village(screen):
+            return None,None
+        button=self.treasury_button(screen)
+        if button:
+            return screen,button
+        # Search this view before a pinch can move the castle under the toolbar.
+        positions=self.castle_hints(screen)
+        if not positions:
+            self.adb.zoom_out_map(times=2)
+            time.sleep(.3)
+            screen=self.adb.screencap()
+            if not self.vision.is_in_main_village(screen):
+                return None,None
+            positions=self.castle_hints(screen)
+        if not positions:
+            log('[Treasury] Không thấy Clan Castle, tên bang trùng hồ sơ hoặc nhãn Request; không tap dò trên làng.')
+            return None,None
         started=time.monotonic()
-        tried=[]
-        for point in positions:
-            if time.monotonic()-started>60:
+        attempted=0
+        for x,y,source in positions:
+            if time.monotonic()-started>8:
                 break
-            if any((point[0]-x)**2+(point[1]-y)**2<35**2 for x,y in tried):
-                continue
+            point=(x,y)
             self.adb._guard_input()
+            log(f'[Treasury] Thử Clan Castle tại {point} ({source}).')
             self.adb.tap(*point,jitter=0,delay_after=.18)
-            tried.append(point)
+            attempted+=1
             screen=self.adb.screencap()
             if screen is None or not self.vision.is_in_main_village(screen):
                 return None,None
@@ -160,6 +195,7 @@ class TreasuryCollector:
             # Clear that toolbar before probing another map coordinate.
             if not self.manager.deselect_all():
                 return None,None
+        log(f'[Treasury] {attempted} vị trí gợi ý không xác minh được; dừng tìm, không tap tọa độ đoán.')
         return None,None
 
     def collect_button(self, screen):
@@ -237,8 +273,9 @@ class TreasuryCollector:
         if not all(before.get('valid',{}).get(key,False) for key in ('gold','elixir','dark_elixir')):
             log('[Treasury] Chưa đọc đủ số dư trước thu; kiểm tra lại lượt sau.')
             return dict(verified=False,reason='unreadable_balance')
+        log('[Treasury] Bắt đầu tìm Clan Castle bằng ảnh, tên bang và nhãn Request.')
         try:
-            _,button=self.open_castle(screen)
+            _,button=self.open_castle(screen,log)
             if not button:
                 log('[Treasury] Chưa xác minh được Clan Castle/nút Treasury; bỏ lượt thu.')
                 return dict(verified=False,reason='castle_not_found')

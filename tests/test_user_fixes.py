@@ -307,15 +307,68 @@ class FixTests(unittest.TestCase):
 
     def test_deselect_all_skips_when_only_if_selected_and_no_building_selected(self):
         frame = np.zeros((900, 1600, 3), np.uint8)
-        adb = SimpleNamespace(tap=Mock(), screencap=lambda: frame)
+        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
         village = VillageManager.__new__(VillageManager)
         village.adb = adb
-        village.vision = SimpleNamespace(has_open_dialog=lambda _: False)
+        village.settings = {}
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
+                                         is_in_main_village=lambda _: True,
+                                         match_template=Mock(return_value=None),
+                                         load_template=Mock(return_value=None))
         village.has_selected_building = Mock(return_value=False)
         logs = []
         self.assertFalse(village.deselect_all(log_callback=logs.append, only_if_selected=True))
         adb.tap.assert_not_called()
+        adb.keyevent.assert_not_called()
         self.assertEqual(logs, [])
+
+    def test_deselect_all_uses_back_and_verifies_selection_cleared(self):
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
+        village = VillageManager.__new__(VillageManager)
+        village.adb = adb
+        village.settings = {}
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
+                                         is_in_main_village=lambda _: True,
+                                         match_template=Mock(return_value=None),
+                                         load_template=Mock(return_value=None))
+        village.has_selected_building = Mock(side_effect=[True, False])
+        self.assertTrue(village.deselect_all())
+        adb.keyevent.assert_called_once_with(4)
+        adb.tap.assert_not_called()
+
+    def test_deselect_all_reports_failed_back_without_tapping_map(self):
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
+        village = VillageManager.__new__(VillageManager)
+        village.adb = adb
+        village.settings = {}
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
+                                         is_in_main_village=lambda _: True,
+                                         match_template=Mock(return_value=None),
+                                         load_template=Mock(return_value=None))
+        village.has_selected_building = Mock(return_value=True)
+        self.assertFalse(village.deselect_all())
+        adb.keyevent.assert_called_once_with(4)
+        adb.tap.assert_not_called()
+
+    def test_deselect_all_keeps_selected_wall_without_back(self):
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
+        village = VillageManager.__new__(VillageManager)
+        village.adb = adb
+        village.settings = {}
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
+                                         is_in_main_village=lambda _: True,
+                                         match_template=Mock(return_value=None),
+                                         load_template=Mock(return_value=None))
+        village.has_selected_building = Mock(return_value=True)
+        logs = []
+        with patch('bot.walls.WallUpgrader.wall_controls_present', return_value=True):
+            self.assertFalse(village.deselect_all(log_callback=logs.append))
+        adb.keyevent.assert_not_called()
+        adb.tap.assert_not_called()
+        self.assertTrue(any('Tường đang được chọn' in line for line in logs))
 
     def test_apprentice_logs_when_no_ready_badge(self):
         from bot.apprentice import ApprenticeAssigner

@@ -1229,10 +1229,6 @@ class BotEngine:
         if home:
             if self.settings.get("main_village_enabled", True) and self._maybe_periodic_restart():
                 return True
-            if FarmFinishController.enabled(self.settings) and self.settings.get('auto_collect', True):
-                screen = self.adb.screencap()
-                if screen is not None and self.village.is_in_main_village(screen):
-                    self.village.collect_resources(screen, log_callback=self.log)
             self._run_village_maintenance(force=True)
             return True
         self.log('[Village] Chưa xác nhận về làng; hoãn bảo trì.')
@@ -2010,12 +2006,13 @@ class BotEngine:
             return
 
         # 2. Thu hoạch mỏ tài nguyên (Vàng & Dầu)
-        if (self.settings.get("auto_collect", True)
-                and self.village.collect_resources(fresh, log_callback=self.log)):
+        if self.settings.get("auto_collect", True):
+            self.village.collect_resources(fresh, log_callback=self.log)
             fresh = self.adb.screencap()
             if not self.village.is_in_main_village(fresh):
                 self.log('[Village] Màn hình đã đổi sau thu hoạch; dừng lượt bảo trì.')
                 return
+            self.log('[Village] Đã xử lý bước thu hoạch; tiếp tục các công việc bảo trì.')
 
         # 3. Tự động xin lính Clan (nếu bật)
         if self.settings.get('auto_collect_treasury',False):
@@ -2085,7 +2082,7 @@ class BotEngine:
                     self.village.wall_result = dict(status='paused_for_builders', reason=self.village.wall_status)
                     self.log('[Wall] ' + self.village.wall_status)
                 elif res['gold'] > 0 or res['elixir'] > 0:
-                    self.log('[Wall] Bắt đầu luồng kiểm tra/nâng tường; các tap tiếp theo thuộc luồng tường.')
+                    self.log('[Wall] Kiểm tra điều kiện nâng tường.')
                     self.village.upgrade_walls(fresh, res['gold'], res['elixir'], log_callback=self.log)
 
         fresh=self.adb.screencap()

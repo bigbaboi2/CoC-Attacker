@@ -87,6 +87,76 @@ class MainWallSelectionTests(unittest.TestCase):
         ]
         self.assertIs(WallUpgrader.choose_wall_candidate(rows, True, 8, 242), rows[1])
 
+    def test_verified_layout_level_recovers_noisy_selected_wall_title(self):
+        wall = WallUpgrader.__new__(WallUpgrader)
+        wall._selection_deadline = None
+        wall._selection_metrics = None
+        wall._selection_log = Mock()
+        wall.settings = {'wall_lowest_first': True}
+        frames = [object(), object()]
+        wall.adb = SimpleNamespace(tap=Mock(), screencap=Mock(side_effect=frames))
+        wall.stable_menu_row = Mock(side_effect=lambda row: row)
+        wall.record_wall_tap = Mock()
+        wall.save_wall_frame = Mock()
+        wall.is_menu_open = Mock(return_value=False)
+        wall.level = Mock(return_value=None)
+        wall.wall_title_present = Mock(return_value=True)
+        wall.wall_controls_present = Mock(return_value=True)
+        row = {'x': 1295, 'y': 312, 'cost': 500000, 'available': 220}
+
+        with patch('bot.walls.time.sleep'):
+            selected, level = wall.choose_row(row, verified_level=11)
+
+        self.assertIs(selected, frames[1])
+        self.assertEqual(level, 11)
+        self.assertEqual(wall._menu_selection_evidence['available'], 220)
+        wall.adb.tap.assert_called_once()
+
+    def test_verified_level_does_not_replace_missing_wall_title(self):
+        wall = WallUpgrader.__new__(WallUpgrader)
+        wall._selection_deadline = None
+        wall._selection_metrics = None
+        wall._selection_log = Mock()
+        wall.settings = {'wall_lowest_first': True}
+        wall.adb = SimpleNamespace(tap=Mock(), screencap=Mock(return_value=object()))
+        wall.stable_menu_row = Mock(side_effect=lambda row: row)
+        wall.record_wall_tap = Mock()
+        wall.save_wall_frame = Mock()
+        wall.is_menu_open = Mock(return_value=False)
+        wall.level = Mock(return_value=None)
+        wall.wall_title_present = Mock(return_value=False)
+        wall.wall_controls_present = Mock(return_value=True)
+        row = {'x': 1295, 'y': 312, 'cost': 500000, 'available': 220}
+
+        with patch('bot.walls.time.sleep'):
+            selected, level = wall.choose_row(row, verified_level=11)
+
+        self.assertIsNone(selected)
+        self.assertIsNone(level)
+
+    def test_prepare_upgrade_accepts_truncated_level_only_with_exact_live_price(self):
+        wall = WallUpgrader.__new__(WallUpgrader)
+        wall.settings = {'wall_quantity_button_mode': 'fixed'}
+        wall.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        wall._menu_selection_evidence = {'level': 11, 'cost': 500000, 'available': 206}
+        wall.is_menu_open = Mock(return_value=False)
+        wall.selection_level = Mock(return_value=1)
+        wall.wall_title_present = Mock(return_value=True)
+        wall.wall_controls_present = Mock(return_value=True)
+        wall.upgrade_price = Mock(return_value=(1000000, False))
+        wall.wall_template = Mock(return_value=(1147, 650, 30, 30, .9))
+        wall.price_is_red = Mock(return_value=False)
+        wall.fixed_upgrade_point = Mock(return_value=(1147, 747))
+
+        self.assertEqual(wall.prepare_upgrade('elixir', 11, 2, 1000000), (1147, 747))
+        self.assertTrue(wall._prepare_level_fallback)
+
+        wall.upgrade_price.return_value = (500000, False)
+        wall.save_wall_frame = Mock()
+        with patch('bot.walls.time.sleep'):
+            self.assertIsNone(wall.prepare_upgrade('elixir', 11, 2, 1000000))
+        wall.fixed_upgrade_point.assert_called_once()
+
     def test_failed_selection_with_full_resources_keeps_village_hold(self):
         guard = WallFarmGuard()
         settings = {'auto_upgrade_walls': True, 'wall_hold_enabled': True,

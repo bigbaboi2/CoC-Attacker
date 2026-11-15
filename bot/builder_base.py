@@ -426,7 +426,12 @@ class BuilderBaseManager:
                 x, y, w, h = hit[:4]
                 center = screen[y-h//4:y+h//4, x-w//4:x+w//4]
                 color = cv2.inRange(cv2.cvtColor(center, cv2.COLOR_BGR2HSV), low, high)
-                if np.mean(color > 0) >= .28:
+                patch = screen[max(0, y-h//2):min(900, y+h//2), max(0, x-w//2):min(1600, x+w//2)]
+                hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV) if patch.size else None
+                red_bg = (float((((hsv_patch[:, :, 0] <= 20) | (hsv_patch[:, :, 0] >= 165))
+                                 & (hsv_patch[:, :, 1] >= 110) & (hsv_patch[:, :, 2] >= 100)).mean())
+                          if hsv_patch is not None else 0.0)
+                if np.mean(color > 0) >= .28 and red_bg < .20:
                     candidates.append(hit)
             if not candidates:
                 break

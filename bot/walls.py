@@ -363,6 +363,12 @@ class WallUpgrader:
         return None
 
     @frame_analysis
+    def wall_title_present(self, screen):
+        header=self.header_roi(screen)
+        text=' '.join(self.texts(screen,(450,header[1],700,header[3]),scale=2))
+        return bool(re.search(r'\b(?:wa[li1][li1]|t\u01b0\u1eddng)\b',text,re.I))
+
+    @frame_analysis
     def wall_controls_present(self,screen):
         if screen is None:return False
         return bool(self.wall_template(screen,'upmore',.76,roi=(200,620,950,170)) or
@@ -973,7 +979,7 @@ class WallUpgrader:
         return None
 
     @selection_stage('choose_and_verify')
-    def choose_row(self, row, close=False):
+    def choose_row(self, row, close=False, verified_level=None):
         self._menu_selection_evidence=None
         self._selection_mismatch = False
         self._selection_row_tapped = False
@@ -1000,6 +1006,7 @@ class WallUpgrader:
         # Confirm a settled wall title. Exact contour lists fluctuate with map
         # animations/discount tags; Upgrade geometry is checked separately later.
         previous = None
+        previous_wall_title = False
         for attempt in range(6):
             self._selection_checkpoint()
             screen = self.adb.screencap()
@@ -1012,11 +1019,26 @@ class WallUpgrader:
                     self._selection_mismatch = True
                     return None, None
                 controls = self.wall_controls_present(screen)
+                title_seen = (self.wall_title_present(screen) if level is None and controls
+                              and type(verified_level) is int else False)
                 if level is not None and level == previous and controls:
                     self._menu_selection_evidence=dict(level=level,cost=row['cost'],available=row['available'])
                     self.last_selection = screen
                     return screen, level
+                # Layout Editor already established the lowest level and the
+                # exact group count. A selected Wall title plus live controls
+                # in two settled frames can bridge a noisy title-level OCR.
+                if (attempt >= 1 and level is None and controls
+                        and type(verified_level) is int and 1 <= verified_level <= 25
+                        and previous_wall_title and title_seen):
+                    self._menu_selection_evidence=dict(level=verified_level,
+                                                       cost=row['cost'],available=row['available'])
+                    self.last_selection=screen
+                    self._selection_log(f'[Wall] OCR cấp tường bị nhiễu; dùng Level {verified_level} '
+                                        'đã xác minh qua Layout Editor và đúng số đoạn trong menu.')
+                    return screen, verified_level
                 previous = level
+                previous_wall_title = title_seen
                 # Two settled observations with live wall controls can use
                 # the verified menu badge when title OCR alone is unreadable.
                 if (not self.settings.get('wall_lowest_first', True)
@@ -1174,7 +1196,9 @@ class WallUpgrader:
                 elif row.get('upgrade_level') is None:
                     row['upgrade_level'] = cached['level'] + 1
                 self._selection_row_tapped = False
-                selected, level = self.choose_row(row, close=True)
+                selected, level = self.choose_row(
+                    row, close=True, verified_level=known_lowest if lowest_first
+                    and row['available'] == known_count else None)
                 if level == cached['level']:
                     self.available_walls = row['available']
                     self.remember_group(row, level)
@@ -1270,7 +1294,9 @@ class WallUpgrader:
             target_row.pop('upgrade_level', None)
         elif target_row.get('upgrade_level') is None and target.get('upgrade_level') is not None:
             target_row['upgrade_level'] = target['upgrade_level']
-        selected, level = self.choose_row(target_row, close=True)
+        selected, level = self.choose_row(
+            target_row, close=True, verified_level=known_lowest if lowest_first
+            and target_row['available'] == known_count else None)
         if level is None:
             time.sleep(0.4)
             selected = self.adb.screencap()
@@ -1602,6 +1628,9 @@ class WallUpgrader:
         if first is None:
             log('[Wall] Chưa sẵn sàng bấm Upgrade: '+getattr(self,'last_prepare_reason','chưa xác minh ô tài nguyên')+'.')
             return None
+        if getattr(self, '_prepare_level_fallback', False):
+            log(f'[Wall] Tiêu đề cấp bị cắt còn 1 chữ số; giữ Level {level} đã xác minh '
+                f'qua menu và giá {total:,} trên ô Upgrade.')
         baseline = self.vision.read_village_resources(self.last_quantity_screen)
         if not baseline.get('valid', {}).get(resource, False) or baseline[resource] < total:
             log('[Wall] Chưa xác minh số dư ngay trước nâng; không bấm Upgrade.')
@@ -1894,6 +1923,21 @@ class WallUpgrader:
             actual_level=self.selection_level(screen)
             selection_valid = (self.single_selected(screen, level) if single else
                                actual_level == level and (fixed or self.quantity(screen) == quantity))
+            if (not selection_valid and not single and type(actual_level) is int
+                    and type(level) is int and level >= 10
+                    and actual_level == int(str(level)[0])
+                    and isinstance(getattr(self, '_menu_selection_evidence', None), dict)
+                    and self._menu_selection_evidence.get('level') == level
+                    and type(self._menu_selection_evidence.get('cost')) is int
+                    and self._menu_selection_evidence.get('cost') * quantity == total
+                    and self.wall_title_present(screen) and self.wall_controls_present(screen)):
+                # Animated village details sometimes make "Level 11" read as
+                # "Level 1". Only accept the already verified menu group when
+                # the live upgrade tile also shows the exact expected total.
+                observed_total, red = self.upgrade_price(screen, resource)
+                if observed_total == total and red is False:
+                    selection_valid = fixed or self.quantity(screen) == quantity
+                    self._prepare_level_fallback = selection_valid
             if not selection_valid:
                 self.last_prepare_reason=f'tiêu đề/nhóm đang chuyển trạng thái (cấp đọc {actual_level}, cần {level})'
                 self.save_wall_frame('wall-prepare-selection-failed.png',screen)
@@ -1923,6 +1967,7 @@ class WallUpgrader:
         self._wall_popup_pending = False
         self._resource_purchase_blocked = False
         self.last_upgrade = None
+        self._prepare_level_fallback = False
         external_log = log_callback or (lambda msg: None)
         def log(message):
             self.manager.wall_status = message.removeprefix('[Wall] ')
@@ -2115,7 +2160,10 @@ class WallUpgrader:
                 next_level = re.search(r'level\s*(\d+)', title, re.I)
                 confirm_price = self.amount(confirm, (1020, 765, 170, 35))
                 if not next_level or int(next_level.group(1)) != before_level + 1 or confirm_price != total:
-                    log('[Wall] Hộp xác nhận một đoạn chưa khớp cấp/giá; bỏ lượt, tiếp tục bot.')
+                    self.save_wall_frame('wall-single-confirm-unverified.png',confirm)
+                    log(f'[Wall] Hộp một đoạn chưa khớp: cấp tiếp OCR '
+                        f'{next_level.group(1) if next_level else "?"}/{before_level+1}, '
+                        f'giá OCR {confirm_price}/{total}; bỏ lượt.')
                     self.close_dialog()
                     return False
             self.manager._pending_wall_transaction = dict(level=before_level,
@@ -2141,7 +2189,7 @@ class WallUpgrader:
             self.wait_for_builder(0, log)
             return False
         success = self.verify_upgrade(after, resources, resource, total, before_level, target, unit_cost, log)
-        self.manager.deselect_all()
+        self.manager.deselect_all(log_callback=external_log)
         if success:
             self.manager._pending_wall_transaction = None
             self.last_upgrade = dict(resource=resource, quantity=target, total=total, prices=prices)
@@ -2309,7 +2357,9 @@ class WallUpgrader:
         if not eligible:
             self.manager.wall_status = 'Chưa đạt ngưỡng tài nguyên để mở lượt nâng tường.'
             self.manager.wall_result['status'] = 'below_threshold'
+            log('[Wall] Chưa đạt ngưỡng tài nguyên; không chọn tường.')
             return False
+        log('[Wall] Đủ ngưỡng tài nguyên; bắt đầu lựa chọn tường.')
         upgraded = False
         self._cycle_upgraded = False
         single_mode = False
