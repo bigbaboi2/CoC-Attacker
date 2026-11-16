@@ -211,6 +211,14 @@ class TreasuryCollector:
                 return (x,y)
         return None
 
+    def storage_space_error(self, screen):
+        """Recognize the short village toast after a rejected Treasury transfer."""
+        if screen is None:
+            return False
+        text=' '.join(word for word,_,_ in self.words(screen,(420,205,850,180),scale=2))
+        return bool(re.search(r'not\s+enough\s+storage\s+space|'
+                              r'(?:khong\s+du|thieu)\s+(?:cho|dung\s+luong)',text))
+
     def close(self):
         screen=self.adb.screencap()
         close=self.vision.find_close_button(screen)
@@ -296,6 +304,10 @@ class TreasuryCollector:
             for sample in range(10):
                 screen=self.adb.screencap()
                 if self.vision.is_in_main_village(screen):
+                    if confirmed and self.storage_space_error(screen):
+                        log('[Treasury] Game báo không đủ chỗ trong kho để chuyển toàn bộ tài nguyên; '
+                            'giữ nguyên Treasury, kiểm tra lại sau khi dùng bớt tài nguyên.')
+                        return dict(verified=False,reason='storage_full')
                     after=self.vision.read_village_resources(screen)
                     if all(after.get('valid',{}).get(key,False) for key in ('gold','elixir','dark_elixir')):
                         gains={key:after[key]-before[key] for key in ('gold','elixir','dark_elixir')}
@@ -314,7 +326,7 @@ class TreasuryCollector:
                     if re.search(r'collect|treasury|kho bac|thu thap',body):
                         okay=next(((x,y) for text,x,y in words if text.strip() in ('okay','ok','confirm','xac nhan')),None)
                         if okay:
-                            self.adb.tap(*okay,jitter=0,delay_after=.6)
+                            self.adb.tap(*okay,jitter=0,delay_after=.15)
                             confirmed=True
                     if sample>=2 and ('treasury' in body or 'kho bac' in body) and not okay:
                         self.close()

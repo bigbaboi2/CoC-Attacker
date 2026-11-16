@@ -56,11 +56,11 @@ class GuiOutput:
         self.pending.clear()
 
 
-def run_gui(output):
+def run_gui(output, instance):
     _preload_ocr()
     from PyQt5.QtWidgets import QApplication
     from PyQt5.QtGui import QFontDatabase, QIcon
-    from PyQt5.QtCore import Qt
+    from PyQt5.QtCore import Qt, QTimer
     from ui.styles import FONT_FILES, APP_ICON_ICO, APP_ICON_PNG
     from ui.main_window import MainWindow
 
@@ -87,6 +87,15 @@ def run_gui(output):
     window = MainWindow()
     output.attach(window.bridge.sig_log.emit)
     window.show()
+
+    restore_timer = QTimer(app)
+    restore_timer.setInterval(250)
+    restore_timer.timeout.connect(
+        lambda: window._restore_from_tray() if instance.restore_requested() else None
+    )
+    restore_timer.start()
+    if instance.restore_requested():
+        window._restore_from_tray()
 
     sys.exit(app.exec_())
 
@@ -122,25 +131,35 @@ def main():
     parser.add_argument("--wait-for-mumu", action="store_true", help="Open the GUI after MuMu starts")
     args = parser.parse_args()
 
-    if args.cli:
-        run_cli()
-    else:
-        if args.wait_for_mumu:
-            from core.startup import wait_for_mumu
-            wait_for_mumu()
-        output = GuiOutput()
-        console_available = sys.stderr is not None
-        try:
-            with redirect_stdout(output), redirect_stderr(output):
-                run_gui(output)
-        except Exception:
-            if console_available or os.name != 'nt':
-                raise
-            import ctypes
-            ctypes.windll.user32.MessageBoxW(
-                None, traceback.format_exc(), 'CoCAttack - Startup error', 0x10
-            )
-            sys.exit(1)
+    from core.single_instance import SingleInstance
+    instance = SingleInstance()
+    if not instance.acquired:
+        if args.cli:
+            print('[Main] CoCAttack đã chạy; không mở thêm phiên CLI.')
+        return
+
+    try:
+        if args.cli:
+            run_cli()
+        else:
+            if args.wait_for_mumu:
+                from core.startup import wait_for_mumu
+                wait_for_mumu()
+            output = GuiOutput()
+            console_available = sys.stderr is not None
+            try:
+                with redirect_stdout(output), redirect_stderr(output):
+                    run_gui(output, instance)
+            except Exception:
+                if console_available or os.name != 'nt':
+                    raise
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None, traceback.format_exc(), 'CoCAttack - Startup error', 0x10
+                )
+                sys.exit(1)
+    finally:
+        instance.close()
 
 if __name__ == "__main__":
     main()

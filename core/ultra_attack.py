@@ -107,7 +107,9 @@ class UltraAttackPlan:
     @classmethod
     def blocks(cls,cards,points,settings):
         blocks=[]
-        spells=[dict(card) for card in cards['spells'] if card['name'] in ('no','angry_spell','haste_spell')]
+        spells=[dict(card) for card in cards['spells'] if card['name'] in (
+            'no','angry_spell','haste_spell','healing_spell','bang',
+            'ice_block_spell','poison_spell')]
         zones=[]
         def deploy(card,count,targets,kind):
             if count:
@@ -115,21 +117,23 @@ class UltraAttackPlan:
         def support(entries,limit=1):
             from core.targeting import SpellTargeter
             sent=0
+            targets=cls.spell_points(entries,len(entries),settings)
             for card in spells:
-                if card['count']<=0 or sent>=limit:continue
-                for target in cls.spell_points(entries,len(entries),settings):
+                while card['count']>0 and sent<limit:
                     group=SpellTargeter.effect_group(card['name'])
-                    if any(group==old_group and math.dist(target,old)<90 for old_group,old in zones):continue
+                    target=min(targets,key=lambda point:(
+                        sum(group==old_group and math.dist(point,old)<90 for old_group,old in zones),
+                        sum(point==old for _,old in zones),targets.index(point)))
                     cast=dict(card);cast['count']=1
                     blocks.append(dict(card=cast,kind='spells',points=[target],planned=True))
                     zones.append((group,target));card['count']-=1;sent+=1
-                    break
         main=cards['troops'][0]
         opening=min(main['count'],4,len(points))
         deploy(main,opening,points,'troops')
         # Plan support during scouting, then cast as soon as the opening troops
         # are released; no health-bar/OCR wait in this initial timeline.
-        support(points[:opening],limit=2)
+        if settings.get('spell_early_with_troops',True):
+            support(points[:opening],limit=sum(card['count'] for card in spells))
         use_siege = settings.get('use_siege', True)
         siege_mode = settings.get('siege_deploy_mode', 'always')
         for card in cards['siege']:
@@ -148,7 +152,6 @@ class UltraAttackPlan:
                 count=min(4,remaining)
                 targets=points[cursor%len(points):]+points[:cursor%len(points)]
                 deploy(card,count,targets,'troops')
-                support(targets[:count])
                 cursor+=count;remaining-=count
         return blocks
 

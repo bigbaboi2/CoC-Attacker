@@ -28,7 +28,7 @@ class DeckRecognizer:
                 if not name.endswith('.png'):
                     continue
                 identity = name.removeprefix('use_main_use_').removesuffix('.png')
-                kind = 'siege' if identity in self.SIEGE else ('spells' if 'spell' in identity or identity == 'no' else 'troops')
+                kind = 'siege' if identity in self.SIEGE else ('spells' if 'spell' in identity or identity in ('no', 'bang') else 'troops')
                 template = self.vision.load_template('deploy-troop/' + name)
                 if template is not None:
                     tmpl_g = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if len(template.shape) == 3 else template
@@ -129,12 +129,22 @@ class DeckRecognizer:
         roi = screen[740:850, 60:1540]
         roi_g = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         candidates = []
+        first_slot_troops = []
         for kind, identity, template, tmpl_g in self._templates():
             h, w = tmpl_g.shape[:2]
             if h > roi_g.shape[0] or w > roi_g.shape[1]:
                 continue
             # Grayscale matchTemplate is 4-5x faster than 3-channel BGR
             result = cv2.matchTemplate(roi_g, tmpl_g, cv2.TM_CCOEFF_NORMED)
+            if kind == 'troops':
+                # The selected first troop card has a bright border, which
+                # lowers portrait confidence without changing its count badge.
+                width = max(0, 250 - 60 - w // 2)
+                if width:
+                    _, first_score, _, first_location = cv2.minMaxLoc(result[:, :width])
+                    first_slot_troops.append(dict(kind=kind, name=identity,
+                                                  x=first_location[0] + 60 + w // 2,
+                                                  y=810, confidence=float(first_score)))
             for _ in range(12):
                 _, score, _, location = cv2.minMaxLoc(result)
                 if score < .84:
@@ -143,6 +153,11 @@ class DeckRecognizer:
                 candidates.append(dict(kind=kind, name=identity, x=x, y=810, confidence=float(score)))
                 left, right = max(0, location[0] - 60), min(result.shape[1], location[0] + 61)
                 result[:, left:right] = -1
+        if not any(card['kind'] == 'troops' and card['x'] < 250 for card in candidates):
+            ranked = sorted(first_slot_troops, key=lambda card: card['confidence'], reverse=True)
+            if (ranked and ranked[0]['confidence'] >= .72 and
+                    (len(ranked) == 1 or ranked[0]['confidence'] - ranked[1]['confidence'] >= .08)):
+                candidates.append(ranked[0])
         selected = []
         for card in sorted(candidates, key=lambda c: c['confidence'], reverse=True):
             if not any(abs(card['x'] - old['x']) < 70 for old in selected):

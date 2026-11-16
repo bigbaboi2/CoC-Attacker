@@ -359,6 +359,8 @@ class CombatExecutor:
                         SpellTargeter.effect_group(zone['spell'])==group and
                         (point[0]-zone['point'][0])**2+(point[1]-zone['point'][1])**2<90**2
                         for zone in self.targeter.active if zone['until']>now)),None)
+                    if target is None and force and choices:
+                        target=choices[0]
                 if target is None:continue
                 self._abilities()
                 if self._ultra_active:
@@ -375,24 +377,29 @@ class CombatExecutor:
             if not cast:break
 
     def cast_opening_support(self,entries):
-        if self._opening_support_sent or not entries:return
-        now=time.monotonic()
+        if (self._opening_support_sent or not entries or
+                not self.settings.get('spell_early_with_troops', True)):return
+        targets=[self._prepared_spell_targets.get(entry) for entry in dict.fromkeys(entries)]
+        targets=[target for target in targets if target is not None]
+        if not targets:return
         sent=0
         for card in self.pending_spells:
-            if sent>=2:break
-            if card['count']<=0 or card['name'] not in ('no','angry_spell','haste_spell'):continue
-            for entry in entries:
-                target=self._prepared_spell_targets.get(entry)
-                if target is None:continue
+            if card['count']<=0 or card['name'] not in self.CASTABLE_SPELLS:continue
+            while card['count']>0:
+                now=time.monotonic()
                 group=SpellTargeter.effect_group(card['name'])
-                if any(SpellTargeter.effect_group(zone['spell'])==group and
-                       (target[0]-zone['point'][0])**2+(target[1]-zone['point'][1])**2<90**2
-                       for zone in self.targeter.active if zone['until']>now):continue
+                # Spread equal effects over confirmed entries before reusing
+                # a covered one; the opening wave does not wait for OCR.
+                target=min(targets,key=lambda point:(
+                    sum(SpellTargeter.effect_group(zone['spell'])==group and
+                        (point[0]-zone['point'][0])**2+(point[1]-zone['point'][1])**2<90**2
+                        for zone in self.targeter.active if zone['until']>now),
+                    sum(zone['point']==point for zone in self.targeter.active),
+                    targets.index(point)))
                 self.select_slot_pos(card['x'],card['y']);self._drops([target],spell=True)
                 card['count']-=1;sent+=1
                 self.targeter.mark(target,card['name'],now);self.last_spell_at=now
-                self._log(f'[Spell sớm] {card["name"]} tại {target}, điểm đã tính từ vùng thả {entry}.')
-                break
+                self._log(f'[Spell sớm] {card["name"]} tại {target}, cùng đợt quân mở đầu.')
         if sent:self._opening_support_sent=True
 
     def _start_live_battle(self, *, recovered=False):
@@ -841,14 +848,18 @@ class CombatExecutor:
                 after=self.recognizer.read_count(frame,card['x'],scale=3)
             if after is None or not remaining-1<=after<=remaining:
                 self._log('[Resource] Số rồng chưa rõ; dừng thả theo mục tiêu, để lượt quét quân còn lại kiểm tra.')
+                self.cast_opening_support(verified)
                 return None,verified
             if after==remaining-1:
                 remaining=after
                 verified.append(point)
                 building=item['building']
                 self._log(f"[Resource] Một rồng gần {building['kind']} ({building['x']}, {building['y']}), điểm hợp lệ {point}; còn {remaining}.")
-                self.cast_opening_support([point])
-                self._cast_pending_spells(screen=frame)
+                if len(verified)>=min(4,len(targets)) or remaining==0:
+                    self.cast_opening_support(verified)
+                if not self.settings.get('spell_early_with_troops', True) or self._opening_support_sent:
+                    self._cast_pending_spells(screen=frame)
+        self.cast_opening_support(verified)
         return remaining,verified
 
     def _fixed_serial(self):
@@ -914,7 +925,8 @@ class CombatExecutor:
             cards['siege'] = []
         elif siege_mode == 'require_cc':
             cards['siege'] = [c for c in cards.get('siege', []) if c.get('has_cc', True)]
-        blocks = FixedAttackPlan.blocks(profile, cards)
+        blocks = FixedAttackPlan.blocks(profile, cards,
+                                        early_spells=self.settings.get('spell_early_with_troops', True))
         self._log(f'[Rải cố định] Dùng {source}; thu nhỏ và gửi {sum(len(b["points"]) for b in blocks)} lệnh thả.')
         started = time.monotonic()
         self.zoom_out_map(profile['zoom'])

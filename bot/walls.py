@@ -13,6 +13,7 @@ from pathlib import Path
 from collections import deque, OrderedDict
 from functools import wraps
 from datetime import datetime, timezone, timedelta
+from bot.wall_guard import wall_thresholds
 
 class SelectionTimeout(RuntimeError):
     pass
@@ -300,6 +301,11 @@ class WallUpgrader:
         self._selection_deadline = None
         self._selection_metrics = None
         self._wall_template_cache = {}
+
+    def threshold_details(self):
+        resolver = getattr(self.manager, 'get_account_capacities', None)
+        capacities = resolver(('gold', 'elixir')) if callable(resolver) else None
+        return wall_thresholds(self.settings, capacities)
 
     def _selection_checkpoint(self):
         deadline = self._selection_deadline
@@ -1978,10 +1984,10 @@ class WallUpgrader:
             return False
 
         resources = dict(gold=current_gold, elixir=current_elixir)
-        allowed = self.settings.get('wall_resource', 'both')
-        choices = [name for name in ('gold', 'elixir') if allowed in ('both', name)
-                   and (resources[name] >= int(self.settings.get('min_' + name + '_to_upgrade_wall', 3000000))
-                        if eligible_resources is None else name in eligible_resources and resources[name] > 0)]
+        details = self.threshold_details()
+        choices = [name for name, item in details.items()
+                   if (resources[name] >= item['effective'] if eligible_resources is None
+                       else name in eligible_resources and resources[name] > 0)]
         if not choices:
             log('[Wall] Tài nguyên dưới ngưỡng; không mở nâng cấp.')
             return False
@@ -2189,7 +2195,6 @@ class WallUpgrader:
             self.wait_for_builder(0, log)
             return False
         success = self.verify_upgrade(after, resources, resource, total, before_level, target, unit_cost, log)
-        self.manager.deselect_all(log_callback=external_log)
         if success:
             self.manager._pending_wall_transaction = None
             self.last_upgrade = dict(resource=resource, quantity=target, total=total, prices=prices)
@@ -2351,9 +2356,18 @@ class WallUpgrader:
                 self.manager._wall_builder_notice_at = time.time()
             return False
         resources = dict(gold=current_gold, elixir=current_elixir)
-        allowed = self.settings.get('wall_resource', 'both')
-        eligible = [name for name in resources if allowed in ('both', name)
-                    and resources[name] >= int(self.settings.get('min_' + name + '_to_upgrade_wall', 3000000))]
+        details = self.threshold_details()
+        eligible = [name for name, item in details.items()
+                    if resources[name] >= item['effective']]
+        notices = getattr(self.manager, '_wall_capacity_notices', set())
+        for name, item in details.items():
+            if item['capped']:
+                signature = (name, item['configured'], item['capacity'])
+                if signature not in notices:
+                    log(f"[Wall] Ngưỡng {name} {item['configured']:,} đạt/vượt kho tối đa "
+                        f"{item['capacity']:,}; dùng ngưỡng gần đầy {item['effective']:,}.")
+                    notices.add(signature)
+        self.manager._wall_capacity_notices = notices
         if not eligible:
             self.manager.wall_status = 'Chưa đạt ngưỡng tài nguyên để mở lượt nâng tường.'
             self.manager.wall_result['status'] = 'below_threshold'

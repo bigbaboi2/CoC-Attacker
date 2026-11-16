@@ -83,7 +83,8 @@ class FixedAttackPlan:
         return cards, 'mẫu hiệu chuẩn'
 
     @staticmethod
-    def blocks(profile, cards, *, retry=False, hero_targets=None, sent=None):
+    def blocks(profile, cards, *, retry=False, hero_targets=None, sent=None,
+               early_spells=True):
         edges = [tuple(group[i]) for i in (1, 0, 2) for group in profile['edges']]
         if retry:
             edges = edges[4:] + edges[:4]
@@ -101,12 +102,15 @@ class FixedAttackPlan:
         for i, card in enumerate(cards['heroes']):
             point = (hero_targets or {}).get(card['x'], tuple(profile['edges'][i % 4][1]))
             blocks.append(block(card, [point]))
-        used = 0
-        for card in cards['spells']:
-            targets = spells[used:used+card['count']]
-            if targets:
-                blocks.append(block(card, targets))
-            used += len(targets)
+        def add_spells():
+            used = 0
+            for card in cards['spells']:
+                targets = spells[used:used+card['count']]
+                if targets:
+                    blocks.append(block(card, targets))
+                used += len(targets)
+        if early_spells:
+            add_spells()
         cursor = opening
         for i, card in enumerate(troops):
             count = card['count'] - (opening if i == 0 else 0)
@@ -119,4 +123,6 @@ class FixedAttackPlan:
                     targets = [directions[direction][i] for i in range(3) for direction in range(4)]
                 blocks.append(block(card, [targets[(cursor+j) % len(targets)] for j in range(count)]))
                 cursor += count
+        if not early_spells:
+            add_spells()
         return blocks

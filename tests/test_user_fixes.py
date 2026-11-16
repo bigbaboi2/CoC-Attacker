@@ -193,7 +193,7 @@ class FixTests(unittest.TestCase):
         self.assertEqual(BotEngine._service_optional_upgrades(fake, object())['status'], 'idle')
         self.assertEqual(buyer.step.call_count, 2)
 
-    def test_pending_builder_defers_battle(self):
+    def test_pending_builder_keeps_purchase_safe_without_repeating_maintenance(self):
         from bot.bot_engine import BotEngine
         from bot.farm_finish import FarmFinishController
         worker = SimpleNamespace(observe_home_builders=lambda _: 2, pending={'name': 'Cannon'})
@@ -203,8 +203,11 @@ class FixTests(unittest.TestCase):
                                current_account_key='#P0Y2'), settings={'auto_upgrade_buildings': True,
                                'reserve_builders': 0}, log=Mock())
         BotEngine._maintain_free_builders(fake, object())
-        self.assertTrue(fake._defer_battle_after_maintenance)
-        self.assertIn('chưa được xác minh', fake.log.call_args.args[0])
+        self.assertFalse(getattr(fake, '_defer_battle_after_maintenance', False))
+        self.assertIsNotNone(worker.pending)
+        self.assertIn('tiếp tục tìm trận', fake.log.call_args.args[0])
+        BotEngine._maintain_free_builders(fake, object())
+        fake.log.assert_called_once()
 
     def test_reconnect_uses_only_selected_port_and_retries(self):
         from bot.bot_engine import BotEngine
@@ -322,22 +325,7 @@ class FixTests(unittest.TestCase):
         adb.keyevent.assert_not_called()
         self.assertEqual(logs, [])
 
-    def test_deselect_all_uses_back_and_verifies_selection_cleared(self):
-        frame = np.zeros((900, 1600, 3), np.uint8)
-        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
-        village = VillageManager.__new__(VillageManager)
-        village.adb = adb
-        village.settings = {}
-        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
-                                         is_in_main_village=lambda _: True,
-                                         match_template=Mock(return_value=None),
-                                         load_template=Mock(return_value=None))
-        village.has_selected_building = Mock(side_effect=[True, False])
-        self.assertTrue(village.deselect_all())
-        adb.keyevent.assert_called_once_with(4)
-        adb.tap.assert_not_called()
-
-    def test_deselect_all_reports_failed_back_without_tapping_map(self):
+    def test_deselect_all_never_uses_android_back_on_selected_building(self):
         frame = np.zeros((900, 1600, 3), np.uint8)
         adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
         village = VillageManager.__new__(VillageManager)
@@ -349,8 +337,25 @@ class FixTests(unittest.TestCase):
                                          load_template=Mock(return_value=None))
         village.has_selected_building = Mock(return_value=True)
         self.assertFalse(village.deselect_all())
-        adb.keyevent.assert_called_once_with(4)
+        adb.keyevent.assert_not_called()
         adb.tap.assert_not_called()
+
+    def test_deselect_all_logs_safe_skip_without_tapping_map(self):
+        frame = np.zeros((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(tap=Mock(), keyevent=Mock(), screencap=lambda: frame)
+        village = VillageManager.__new__(VillageManager)
+        village.adb = adb
+        village.settings = {}
+        village.vision = SimpleNamespace(has_open_dialog=lambda _: False,
+                                         is_in_main_village=lambda _: True,
+                                         match_template=Mock(return_value=None),
+                                         load_template=Mock(return_value=None))
+        village.has_selected_building = Mock(return_value=True)
+        logs = []
+        self.assertFalse(village.deselect_all(log_callback=logs.append))
+        adb.keyevent.assert_not_called()
+        adb.tap.assert_not_called()
+        self.assertTrue(any('không bấm Back' in line for line in logs))
 
     def test_deselect_all_keeps_selected_wall_without_back(self):
         frame = np.zeros((900, 1600, 3), np.uint8)
@@ -364,11 +369,10 @@ class FixTests(unittest.TestCase):
                                          load_template=Mock(return_value=None))
         village.has_selected_building = Mock(return_value=True)
         logs = []
-        with patch('bot.walls.WallUpgrader.wall_controls_present', return_value=True):
-            self.assertFalse(village.deselect_all(log_callback=logs.append))
+        self.assertFalse(village.deselect_all(log_callback=logs.append))
         adb.keyevent.assert_not_called()
         adb.tap.assert_not_called()
-        self.assertTrue(any('Tường đang được chọn' in line for line in logs))
+        self.assertTrue(any('giữ nguyên' in line for line in logs))
 
     def test_apprentice_logs_when_no_ready_badge(self):
         from bot.apprentice import ApprenticeAssigner

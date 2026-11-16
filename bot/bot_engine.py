@@ -11,7 +11,7 @@ from core.vision import VisionEngine
 from core.mumu_optimizer import MuMuOptimizer
 from config.settings import BotSettings
 from bot.village import VillageManager
-from bot.wall_guard import WallFarmGuard
+from bot.wall_guard import WallFarmGuard, wall_thresholds
 from bot.farm_finish import FarmFinishController
 from bot.battle import BattleSearcher
 from bot.combat import CombatExecutor
@@ -804,6 +804,9 @@ class BotEngine:
         state = self.identify_screen_state(screen)
 
         if state == "STATE_UNKNOWN":
+            if self.village.open_treasure_chest_if_present(screen, self.log):
+                self._action_outcome('Nhận diện màn hình', True)
+                return
             if self._queue_screen_fault(screen):
                 return
             self._action_outcome('Nhận diện màn hình', False, inspect=False)
@@ -1605,6 +1608,18 @@ class BotEngine:
         if result.get('status') == 'maxed':
             guard.clear()
             return False
+        if getattr(self, '_wall_capacity_unverified', False):
+            if attack_menu:
+                self._ensure_main_village()
+                return True
+            if screen is None or not self.village.is_in_main_village(screen):
+                return True
+            if self._wall_storage_capacities() is None:
+                return True
+            self._wall_capacity_unverified = False
+            self.last_village_maintenance = 0
+            self.log('[Wall] Đã xác minh dung lượng kho; kiểm tra nâng tường trước trận tiếp theo.')
+            return True
         if attack_menu:
             if guard.active or result.get('status') in WallFarmGuard.FAILURES:
                 # Menu overlays cannot supply trustworthy home resource OCR.
@@ -1616,9 +1631,10 @@ class BotEngine:
             return guard.active
         readings = self.vision.read_village_resources(screen)
         was_active = guard.active
-        if not guard.observe(self.settings, readings, result):
+        capacities = self.village.get_account_capacities(('gold', 'elixir'))
+        if not guard.observe(self.settings, readings, result, capacities=capacities):
             if was_active:
-                self.log('[Wall] Tài nguyên dưới 110% qua hai lần đọc; tiếp tục đánh.')
+                self.log('[Wall] Tài nguyên đã giảm qua hai lần đọc; tiếp tục đánh.')
             return False
         self.set_state(self.STATE_WALL_HOLD)
         now = time.time()
@@ -1627,7 +1643,8 @@ class BotEngine:
             # The triggering maintenance has already used its recovery budget.
             # An uncertain purchase needs prompt verification; ordinary
             # selection failures keep the slower recovery interval.
-            guard.next_retry = now + retry_delay
+            capped = any(item['capped'] for item in wall_thresholds(self.settings, capacities).values())
+            guard.next_retry = now if capped and result.get('status') == 'below_threshold' else now + retry_delay
             self.log('[Wall] Giữ làng — chờ nâng tường: ' + str(result.get('reason', 'Chưa nâng được')))
         elif result.get('status') == 'transaction_pending':
             guard.next_retry = min(guard.next_retry, now + retry_delay)
@@ -1654,6 +1671,24 @@ class BotEngine:
             guard.next_retry = time.time() + next_delay
             self.log('[Wall] Giữ làng — chờ nâng tường: ' + self.village.wall_status)
         return True
+
+    def _wall_storage_capacities(self):
+        """Measure real storage once per account before using wall thresholds."""
+        resources = ('gold', 'elixir')
+        cached = self.village.get_account_capacities(resources)
+        if cached is not None:
+            return cached
+        now = time.monotonic()
+        if now < getattr(self, '_wall_capacity_retry_at', 0):
+            return None
+        self.farm_finish.capacity_reader.read(resources, self.log)
+        # Only use values saved against the verified account. An OCR value
+        # returned without a matching account must not unlock matchmaking.
+        capacities = self.village.get_account_capacities(resources)
+        self._wall_capacity_retry_at = 0 if capacities is not None else now + 30
+        if capacities is None:
+            self.log('[Wall] Chưa đọc chắc dung lượng kho; giữ làng và thử lại sau 30 giây.')
+        return capacities
 
     def _maintain_free_builders(self, screen):
         controller = getattr(self, 'farm_finish', None)
@@ -1720,14 +1755,22 @@ class BotEngine:
                         raise
                     except Exception as exc:
                         self.log(f'[Thợ] Chưa xác nhận được trạng thái max làng chính ({type(exc).__name__}).')
+        if worker.pending is not None:
+            reconcile = getattr(worker, 'reconcile_pending', None)
+            result = reconcile(screen, free) if callable(reconcile) else dict(status='uncertain')
+            if worker.pending is None:
+                self.log('[Thợ] ' + result['reason'])
+            else:
+                self._builders_need_assignment = False
+                now = time.monotonic()
+                if now >= getattr(self, '_pending_builder_log_at', 0):
+                    self.log('[Thợ] Giao dịch công trình chưa rõ; giữ lệnh nâng để tránh bấm lặp, tiếp tục tìm trận.')
+                    self._pending_builder_log_at = now + 300
+                return False
         if free <= reserve:
             self._builders_need_assignment = False
             if custom_buildings:
                 self.log(f'[Thợ] Có {free} thợ thường rảnh, mức dự phòng {reserve}; chưa nâng công trình.')
-            return
-        if worker.pending is not None:
-            self.log('[Thợ] Giao dịch công trình trước chưa được xác minh; hoãn tìm trận để tránh bỏ sót.')
-            self._defer_battle_after_maintenance = True
             return
         if custom_buildings:
             self.log(f'[Thợ] Có {free} thợ thường rảnh, dự phòng {reserve}; đang tìm công trình nâng cấp.')
@@ -1866,6 +1909,10 @@ class BotEngine:
             fresh = self.adb.screencap()
             if not self.village.is_in_main_village(fresh):
                 return dict(status='blocked', reason='Chưa trở về làng chính.')
+        if getattr(worker, 'pending', None) is not None:
+            # The regular-builder transaction is still unresolved. Let the
+            # maintenance pass reconcile it and keep unrelated farming alive.
+            return dict(status='idle', reason='Đang giữ giao dịch công trình chưa rõ.')
         no_new_cached = (account == getattr(self, '_new_scan_empty_account', None)
                          and time.monotonic() < getattr(self, '_new_scan_empty_until', 0))
         readings = None
@@ -1993,7 +2040,8 @@ class BotEngine:
         self.log("[Village] Kiểm tra thu hoạch, đội quân và tường.")
         if hasattr(self.village, 'check_and_sync_account'):
             self.village.check_and_sync_account(screen, self.log)
-        self.village.deselect_all(log_callback=self.log, only_if_selected=True)
+        # A selected building does not block the home actions below. Avoid
+        # Android Back, which can open the game's exit prompt instead.
 
         # 1. Tự động luyện quân nhanh (Quick Train)
         if self.settings.get("auto_train_army", True):
@@ -2082,8 +2130,13 @@ class BotEngine:
                     self.village.wall_result = dict(status='paused_for_builders', reason=self.village.wall_status)
                     self.log('[Wall] ' + self.village.wall_status)
                 elif res['gold'] > 0 or res['elixir'] > 0:
-                    self.log('[Wall] Kiểm tra điều kiện nâng tường.')
-                    self.village.upgrade_walls(fresh, res['gold'], res['elixir'], log_callback=self.log)
+                    if self._wall_storage_capacities() is None:
+                        self._wall_capacity_unverified = True
+                        self._defer_battle_after_maintenance = True
+                    else:
+                        self._wall_capacity_unverified = False
+                        self.log('[Wall] Kiểm tra điều kiện nâng tường.')
+                        self.village.upgrade_walls(fresh, res['gold'], res['elixir'], log_callback=self.log)
 
         fresh=self.adb.screencap()
         if fresh is None or not self.village.is_in_main_village(fresh):
@@ -2094,5 +2147,7 @@ class BotEngine:
             return
 
         self.last_village_maintenance = time.time()
-        self.village.deselect_all(log_callback=self.log, only_if_selected=True)
+        # The Battle button remains usable while a building is selected.
+        # Android Back here can leave Clash or open its exit dialog, causing
+        # the next home check to restart a healthy game.
         self.log("[Village] Hoàn tất bảo trì.")

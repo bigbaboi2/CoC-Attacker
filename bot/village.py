@@ -626,30 +626,15 @@ class VillageManager:
         return len(WallUpgrader.toolbar_tiles(self, screen)) > 0
 
     def deselect_all(self, log_callback=None, only_if_selected=False):
-        """Dismiss a selected building with Back, then verify the village is clear."""
+        """Leave a selected building in place; Android Back may exit the game."""
         screen = self.adb.screencap()
         if (screen is None or self.vision.has_open_dialog(screen)
                 or not self.is_in_main_village(screen)
                 or not self.has_selected_building(screen)):
             return False
-        # Back on the wall quantity toolbar can send Clash of Clans to the
-        # Android launcher. The builder menu and Battle button both work with
-        # a wall selected, so leave that selection in place.
-        from bot.walls import WallUpgrader
-        if WallUpgrader(self).wall_controls_present(screen):
-            if log_callback:
-                log_callback('[Village] Tường đang được chọn; giữ nguyên để tránh Back thoát game.')
-            return False
         if log_callback:
-            log_callback('[Village] Bấm Back để bỏ chọn công trình.')
-        self.adb.keyevent(4)
-        cleared = self.adb.screencap()
-        success = (cleared is not None and self.is_in_main_village(cleared)
-                   and not self.vision.has_open_dialog(cleared)
-                   and not self.has_selected_building(cleared))
-        if not success and log_callback:
-            log_callback('[Village] Back chưa xác minh bỏ chọn; dừng thao tác dò trên bản đồ.')
-        return success
+            log_callback('[Village] Công trình còn được chọn; giữ nguyên, không bấm Back để tránh thoát game.')
+        return False
 
     def dismiss_notification_prompt(self, screen):
         """Dismiss only the game's identified Notifications / Not now dialog."""
@@ -684,10 +669,49 @@ class VillageManager:
             return False
         return False
 
+    def open_treasure_chest_if_present(self, screen: np.ndarray, log_callback=None) -> bool:
+        """Open a recognized event chest, stopping as soon as its reward appears."""
+        if not self.vision.is_treasure_chest_tap_screen(screen):
+            return False
+        if log_callback:
+            log_callback('[Sự kiện] Phát hiện hòm; đang chạm để mở.')
+        frame = screen
+        for hit in range(5):
+            for _ in range(8):
+                if self.vision.is_treasure_chest_tap_screen(frame):
+                    self.adb.tap(800, 450, jitter=0, delay_after=0.3)
+                    frame = self.adb.screencap()
+                    break
+                if self.vision.is_treasure_chest_reward(frame):
+                    self.adb.tap(800, 815, jitter=0, delay_after=0.6)
+                    if log_callback:
+                        log_callback(f'[Sự kiện] Hòm đã mở sau {hit} lần chạm.')
+                    return True
+                time.sleep(0.25)
+                frame = self.adb.screencap()
+            else:
+                if log_callback:
+                    log_callback('[Sự kiện] Chưa thấy tiến độ hòm; sẽ kiểm tra lại ở lượt sau.')
+                return True
+        for _ in range(12):
+            if self.vision.is_treasure_chest_reward(frame):
+                self.adb.tap(800, 815, jitter=0, delay_after=0.6)
+                if log_callback:
+                    log_callback('[Sự kiện] Đã mở hòm và nhận phần thưởng.')
+                return True
+            time.sleep(0.25)
+            frame = self.adb.screencap()
+        if log_callback:
+            log_callback('[Sự kiện] Đã chạm hòm 5 lần; chờ màn hình phần thưởng ở lượt sau.')
+        return True
+
     def close_popups_and_dialogs(self, screen: np.ndarray) -> bool:
         """Finds and dismisses common popups like Okay, Confirm, Cancel, Close 'X'."""
         if screen is None:
             return False
+
+        if self.open_treasure_chest_if_present(screen):
+            return True
 
         if self.dismiss_notification_prompt(screen):
             return True

@@ -1700,6 +1700,11 @@ class MainWindow(QMainWindow):
         form_strat.addRow('Đánh bổ sung sau khi thả rồng theo tài nguyên:',self.combo_resource_fallback)
         self.combo_resource_fallback.setEnabled(cur_strat=='resource_dragons')
         self.combo_strat.currentIndexChanged.connect(lambda i:self.combo_resource_fallback.setEnabled(strat_keys[i]=='resource_dragons'))
+        self.chk_spell_early = QCheckBox('Thả phép cùng đợt quân mở đầu')
+        self.chk_spell_early.setChecked(self.settings.get('spell_early_with_troops', True))
+        self.chk_spell_early.setToolTip('Bật: ưu tiên thả hết phép nhanh tại các điểm quân mở đầu. Tắt: dùng nhịp phép tự dò như trước.')
+        self.chk_spell_early.toggled.connect(lambda checked: self.settings.set('spell_early_with_troops', checked))
+        form_strat.addRow(self.chk_spell_early)
         self.spin_attack_controls = {}
         for key, label, minimum, maximum, default in [
             ('attack_spread_points', 'Số điểm rải quân:', 4, 32, 16),
@@ -1733,7 +1738,7 @@ class MainWindow(QMainWindow):
             spin.valueChanged.connect(lambda value,name=key:self.settings.set(name,value))
             form_ultra.addRow(label,spin)
             self.spin_ultra_controls[key] = spin
-        ultra_note=QLabel('Chuẩn bị: zoom, đọc đội hình, quét ranh và tính sẵn điểm phép gần đường tiến quân. Xen phép ngay sau nhóm lính mở đầu và giữa các đợt lính, trước khi thả hết tướng/quân; không chờ thanh máu để thả phép mở đầu. Phép còn lại bám cụm lính quan sát được, được đặt trong ranh đỏ. Sau chuỗi chính kiểm tra quân/phép/tướng còn sót, thử lại tối đa hai lượt. Kỹ năng chỉ dùng khi xác minh tướng xuất trận; kết thúc theo các điều kiện đã tích bên dưới.')
+        ultra_note=QLabel('Chuẩn bị: zoom, đọc đội hình, quét ranh và tính sẵn điểm phép gần đường tiến quân. Khi bật thả phép sớm, ưu tiên thả hết phép ngay sau nhóm lính mở đầu, trước phần quân còn lại. Sau chuỗi chính kiểm tra quân/phép/tướng còn sót, thử lại tối đa hai lượt. Kỹ năng chỉ dùng khi xác minh tướng xuất trận; kết thúc theo các điều kiện đã tích bên dưới.')
         ultra_note.setWordWrap(True);form_ultra.addRow(ultra_note)
         reset_ultra_row = QHBoxLayout()
         reset_ultra_row.addStretch()
@@ -3013,6 +3018,7 @@ class MainWindow(QMainWindow):
         if def_strat in strat_keys:
             self.combo_strat.setCurrentIndex(strat_keys.index(def_strat))
         self.spin_drop_delay.setValue(DEFAULT_CONFIG["troop_drop_delay_ms"])
+        self.chk_spell_early.setChecked(DEFAULT_CONFIG['spell_early_with_troops'])
         fallback_keys = ['perimeter', 'four_corners', 'smart_wave', 'hybrid']
         def_fb = DEFAULT_CONFIG["resource_attack_fallback"]
         if def_fb in fallback_keys:
@@ -3021,7 +3027,8 @@ class MainWindow(QMainWindow):
             if hasattr(self, 'spin_attack_controls') and key in self.spin_attack_controls:
                 self.spin_attack_controls[key].setValue(round(DEFAULT_CONFIG[key]))
         for k in ("attack_strategy", "troop_drop_delay_ms", "resource_attack_fallback",
-                  "attack_spread_points", "spell_first_delay_sec", "spell_wave_gap_sec"):
+                  "attack_spread_points", "spell_first_delay_sec", "spell_wave_gap_sec",
+                  "spell_early_with_troops"):
             self.settings.set(k, DEFAULT_CONFIG[k])
         self.statusBar().showMessage("Đã đặt lại mặc định: Cách thả quân", 3000)
 
@@ -3389,6 +3396,8 @@ class MainWindow(QMainWindow):
                 self.combo_strategy.setCurrentIndex(idx)
         if hasattr(self, 'spin_spread'):
             self.spin_spread.setValue(self.settings.get("attack_spread_points", 12))
+        if hasattr(self, 'chk_spell_early'):
+            self.chk_spell_early.setChecked(self.settings.get('spell_early_with_troops', True))
         if hasattr(self, 'chk_ultra_fixed'):
             self.chk_ultra_fixed.setChecked(self.settings.get("ultra_fixed_positions", False))
         if hasattr(self, 'spin_ultra_controls'):

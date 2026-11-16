@@ -4,7 +4,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 from bot.walls import WallUpgrader
-from bot.wall_guard import WallFarmGuard
+from bot.wall_guard import WallFarmGuard, wall_thresholds
+from bot.bot_engine import BotEngine
 from config.settings import DEFAULT_CONFIG
 from core.vision import VisionEngine
 
@@ -166,6 +167,124 @@ class MainWallSelectionTests(unittest.TestCase):
                     'valid': {'gold': True, 'elixir': True}}
         self.assertTrue(guard.observe(settings, readings, {'status': 'selection_failed'}))
         self.assertTrue(guard.active)
+
+    def test_unreachable_wall_threshold_uses_measured_near_full_capacity(self):
+        settings = {'wall_resource': 'both', 'min_gold_to_upgrade_wall': 10000000,
+                    'min_elixir_to_upgrade_wall': 10000000,
+                    'auto_upgrade_walls': True, 'wall_hold_enabled': True}
+        capacities = {'gold': 5518000, 'elixir': 5537000}
+        details = wall_thresholds(settings, capacities)
+        self.assertEqual(details['gold']['effective'], 5490410)
+        self.assertEqual(details['elixir']['effective'], 5509315)
+        self.assertTrue(details['gold']['capped'])
+
+        guard = WallFarmGuard()
+        full = {'gold': 5515800, 'elixir': 5537000,
+                'valid': {'gold': True, 'elixir': True}}
+        self.assertTrue(guard.observe(settings, full, {'status': 'below_threshold'}, capacities))
+        self.assertEqual(guard.resources, {'gold', 'elixir'})
+        after_upgrade = {'gold': 4515800, 'elixir': 4537000,
+                         'valid': {'gold': True, 'elixir': True}}
+        self.assertTrue(guard.observe(settings, after_upgrade, {'status': 'upgraded'}, capacities))
+        self.assertFalse(guard.observe(settings, after_upgrade, {'status': 'upgraded'}, capacities))
+
+    def test_wall_run_checks_builder_when_balance_reaches_effective_threshold(self):
+        wall = WallUpgrader.__new__(WallUpgrader)
+        wall.settings = {'auto_upgrade_walls': True, 'wall_resource': 'both',
+                         'min_gold_to_upgrade_wall': 10000000,
+                         'min_elixir_to_upgrade_wall': 10000000}
+        wall.manager = SimpleNamespace(wall_status='', wall_result={},
+            get_account_capacities=lambda names: {'gold': 5518000, 'elixir': 5537000},
+            set_wall_wait=Mock())
+        wall.builders = Mock(return_value=0)
+        wall.wait_for_builder = Mock()
+        wall.paid_builder_visible = False
+        screen = np.zeros((900, 1600, 3), dtype=np.uint8)
+        self.assertFalse(wall.run(screen, 5515800, 5537000))
+        wall.builders.assert_called_once_with(screen)
+        self.assertEqual(wall.manager.wall_result['status'], 'waiting_builder')
+
+    def test_full_storage_holds_village_and_retries_wall_before_battle(self):
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'auto_upgrade_walls': True, 'wall_hold_enabled': True,
+                           'wall_resource': 'both', 'min_gold_to_upgrade_wall': 10000000,
+                           'min_elixir_to_upgrade_wall': 10000000}
+        engine._wall_farm_guard = WallFarmGuard()
+        engine.log = Mock()
+        engine.set_state = Mock()
+        screen = object()
+        engine.village = SimpleNamespace(
+            walls_confirmed_maxed=False,
+            wall_result={'status': 'below_threshold', 'reason': 'raw threshold unreachable'},
+            wall_status='raw threshold unreachable', _wall_builder_retry_at=0,
+            is_in_main_village=lambda frame: True,
+            get_account_capacities=lambda names: {'gold': 5518000, 'elixir': 5537000},
+            upgrade_walls=Mock())
+        engine.vision = SimpleNamespace(read_village_resources=lambda frame: {
+            'gold': 5515800, 'elixir': 5537000,
+            'valid': {'gold': True, 'elixir': True}})
+
+        self.assertTrue(engine._wall_hold_gate(screen))
+        engine.village.upgrade_walls.assert_called_once()
+        self.assertEqual(engine.village.upgrade_walls.call_args.args[:3],
+                         (screen, 5515800, 5537000))
+
+    def test_unreadable_capacity_retries_at_bounded_interval(self):
+        engine = BotEngine.__new__(BotEngine)
+        engine.village = SimpleNamespace(get_account_capacities=Mock(return_value=None))
+        reader = Mock(return_value=None)
+        engine.farm_finish = SimpleNamespace(capacity_reader=SimpleNamespace(read=reader))
+        engine.log = Mock()
+        with patch('bot.bot_engine.time.monotonic', return_value=100):
+            self.assertIsNone(engine._wall_storage_capacities())
+            self.assertIsNone(engine._wall_storage_capacities())
+        reader.assert_called_once()
+        self.assertEqual(engine._wall_capacity_retry_at, 130)
+
+    def test_unbound_capacity_read_does_not_unlock_battle(self):
+        engine = BotEngine.__new__(BotEngine)
+        engine.village = SimpleNamespace(get_account_capacities=Mock(return_value=None))
+        reader = Mock(return_value={'gold': 5518000, 'elixir': 5537000})
+        engine.farm_finish = SimpleNamespace(capacity_reader=SimpleNamespace(read=reader))
+        engine.log = Mock()
+        with patch('bot.bot_engine.time.monotonic', return_value=100):
+            self.assertIsNone(engine._wall_storage_capacities())
+        self.assertEqual(engine._wall_capacity_retry_at, 130)
+
+    def test_live_replay_without_home_resource_bars_is_not_village(self):
+        vision = VisionEngine.__new__(VisionEngine)
+        vision.has_open_dialog = Mock(return_value=False)
+        vision.match_template = Mock(return_value=(100, 850, 80, 50))
+        vision.read_village_resources = Mock(return_value={
+            'valid': {'gold': False, 'elixir': False}})
+        screen = np.zeros((900, 1600, 3), dtype=np.uint8)
+        self.assertFalse(vision.is_in_main_village(screen))
+        vision.match_template.assert_not_called()
+        vision.read_village_resources.return_value = {
+            'valid': {'gold': True, 'elixir': True}}
+        self.assertTrue(vision.is_in_main_village(screen))
+
+    def test_maintenance_does_not_press_back_to_deselect_buildings(self):
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'main_village_enabled': True, 'auto_train_army': False,
+                           'auto_collect': False, 'auto_collect_treasury': False,
+                           'auto_request_troops': False, 'auto_upgrade_walls': False}
+        engine.last_village_maintenance = 0
+        engine._wall_farm_guard = WallFarmGuard()
+        engine.log = Mock()
+        screen = object()
+        engine.adb = SimpleNamespace(screencap=Mock(return_value=screen))
+        engine.village = SimpleNamespace(
+            wall_result={'status': 'not_checked'},
+            is_in_main_village=Mock(return_value=True),
+            check_and_sync_account=Mock(), deselect_all=Mock())
+        engine._service_optional_upgrades = Mock(return_value={'status': 'idle'})
+        engine._maintain_free_builders = Mock(return_value=False)
+        engine._wall_hold_gate = Mock(return_value=False)
+        engine._run_village_maintenance()
+        engine.village.deselect_all.assert_not_called()
+        self.assertTrue(any('Hoàn tất bảo trì' in call.args[0]
+                            for call in engine.log.call_args_list))
 
     def test_layout_reverification_is_not_cut_off_by_row_deadline(self):
         wall = WallUpgrader.__new__(WallUpgrader)

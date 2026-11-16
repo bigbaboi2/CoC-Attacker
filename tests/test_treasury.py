@@ -130,6 +130,45 @@ class TreasuryCastleSearchTests(unittest.TestCase):
         self.assertEqual(log.call_count, 1)
         self.assertIn('lượt trước: castle_not_found', log.call_args.args[0])
 
+    def test_storage_space_error_recognizes_game_toast(self):
+        collector, frame = self.make_collector()
+        collector.words.return_value = [('not enough storage space!', 800, 260)]
+        self.assertTrue(collector.storage_space_error(frame))
+        collector.words.assert_called_with(frame, (420, 205, 850, 180), scale=2)
+        collector.words.return_value = [('storage available', 800, 260)]
+        self.assertFalse(collector.storage_space_error(frame))
+
+    def test_confirmed_transfer_reports_storage_full_without_retrying_collect(self):
+        collector, home = self.make_collector()
+        treasury, confirmation, toast = object(), object(), object()
+        collector.manager.settings = {'auto_collect_treasury': True,
+                                      'treasury_star_bonus_enabled': True,
+                                      'treasury_war_rewards_enabled': True,
+                                      'treasury_check_interval_min': 30}
+        collector.manager._treasury_next_check = 0
+        collector.memory = {}
+        collector.save_memory = Mock()
+        collector.adb.screencap.side_effect = [home, treasury, confirmation, toast]
+        collector.vision.is_in_main_village.side_effect = [True, False, True]
+        collector.vision.read_village_resources = Mock(return_value={
+            'gold': 358950, 'elixir': 442697, 'dark_elixir': 37500,
+            'valid': {'gold': True, 'elixir': True, 'dark_elixir': True}})
+        collector.open_castle = Mock(return_value=(home, (1100, 740)))
+        collector.collect_button = Mock(return_value=(800, 680))
+        collector.words.return_value = [('collect resources', 700, 300),
+                                        ('treasury', 800, 450), ('okay', 900, 600)]
+        collector.storage_space_error = Mock(return_value=True)
+        collector.close = Mock()
+        log = Mock()
+
+        result = collector.run(log)
+
+        self.assertEqual(result['reason'], 'storage_full')
+        self.assertFalse(result['verified'])
+        self.assertEqual(collector.adb.tap.call_count, 3)
+        self.assertEqual(collector.memory['last_result'], 'storage_full')
+        self.assertTrue(any('không đủ chỗ' in call.args[0] for call in log.call_args_list))
+
 
 if __name__ == '__main__':
     unittest.main()

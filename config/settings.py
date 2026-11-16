@@ -238,6 +238,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "troop_drop_delay_ms": 80,
     "spell_first_delay_sec": 1,
     "spell_wave_gap_sec": 2,
+    "spell_early_with_troops": True,
     "star_target": 1,
     "end_star_source": "all",
     "battle_timeout_sec": 120,

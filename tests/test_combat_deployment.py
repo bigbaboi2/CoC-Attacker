@@ -4,6 +4,8 @@ from unittest.mock import Mock
 
 from bot.combat import CombatExecutor
 from core.targeting import SpellTargeter
+from core.ultra_attack import UltraAttackPlan
+from core.fixed_attack import FixedAttackPlan
 
 
 class CombatDeploymentTests(unittest.TestCase):
@@ -23,6 +25,7 @@ class CombatDeploymentTests(unittest.TestCase):
         combat.battle_start_time = 0
         combat.last_spell_at = 0
         combat.pending_spells = []
+        combat._opening_support_sent = False
         combat._log = Mock()
         combat._home_button = Mock(return_value=None)
         combat._abilities = Mock()
@@ -59,6 +62,64 @@ class CombatDeploymentTests(unittest.TestCase):
         ])
         combat.run_backup_sweep()
         combat._drops.assert_called_once_with([(340, 310)], spell=True)
+
+    def test_opening_spell_is_sent_after_first_verified_troop(self):
+        combat = self.make_executor()
+        combat.settings['spell_early_with_troops'] = True
+        combat.pending_spells = [{'name': 'healing_spell', 'x': 400, 'y': 810, 'count': 1}]
+        combat.cast_opening_support([(300, 300)])
+        combat._drops.assert_called_once_with([(340, 310)], spell=True)
+        self.assertEqual(combat.pending_spells[0]['count'], 0)
+
+    def test_opening_spell_toggle_off_preserves_later_cast(self):
+        combat = self.make_executor()
+        combat.settings['spell_early_with_troops'] = False
+        combat.pending_spells = [{'name': 'no', 'x': 400, 'y': 810, 'count': 1}]
+        combat.cast_opening_support([(300, 300)])
+        combat._drops.assert_not_called()
+        self.assertEqual(combat.pending_spells[0]['count'], 1)
+
+    def test_opening_wave_sends_all_spells_before_remaining_troops(self):
+        combat = self.make_executor()
+        combat.pending_spells = [{'name': 'no', 'x': 400, 'y': 810, 'count': 3},
+                                 {'name': 'healing_spell', 'x': 500, 'y': 810, 'count': 1}]
+        combat.cast_opening_support([(300, 300), (1200, 300)])
+        self.assertEqual([card['count'] for card in combat.pending_spells], [0, 0])
+        self.assertEqual(combat._drops.call_count, 4)
+        self.assertEqual([call.args[0][0] for call in combat._drops.call_args_list[:2]],
+                         [(340, 310), (1160, 310)])
+
+    def test_ultra_plan_places_every_spell_after_opening_troops(self):
+        cards = {'troops': [{'name': 'dragon', 'x': 200, 'y': 810, 'count': 12}],
+                 'spells': [{'name': 'no', 'x': 400, 'y': 810, 'count': 4},
+                            {'name': 'healing_spell', 'x': 500, 'y': 810, 'count': 2}],
+                 'siege': [], 'heroes': []}
+        points = [(300, 300), (1200, 300), (300, 600), (1200, 600)]
+        blocks = UltraAttackPlan.blocks(cards, points, {'spell_early_with_troops': True})
+        self.assertEqual(blocks[0]['kind'], 'troops')
+        self.assertEqual(sum(block['kind'] == 'spells' for block in blocks[1:7]), 6)
+        self.assertTrue(all(block['kind'] == 'troops' for block in blocks[7:]))
+
+    def test_fixed_plan_toggle_controls_spell_order(self):
+        profile = {'edges': [[(300+i*30, 300+j*30) for i in range(3)]
+                             for j in range(4)],
+                   'spells': [[(400+i*30, 400+j*30) for i in range(2)]
+                              for j in range(4)]}
+        cards = {'troops': [{'name': 'dragon', 'x': 200, 'count': 8}],
+                 'spells': [{'name': 'no', 'x': 400, 'count': 2}],
+                 'siege': [], 'heroes': []}
+        early = FixedAttackPlan.blocks(profile, cards, early_spells=True)
+        later = FixedAttackPlan.blocks(profile, cards, early_spells=False)
+        self.assertEqual(early[1]['card']['name'], 'no')
+        self.assertEqual(later[-1]['card']['name'], 'no')
+
+    def test_final_sweep_casts_even_when_verified_entry_has_recent_effect(self):
+        combat = self.make_executor()
+        combat._verified_drop_points = [(300, 300)]
+        combat.pending_spells = [{'name': 'no', 'x': 400, 'y': 810, 'count': 2}]
+        combat._cast_pending_spells(force=True)
+        self.assertEqual(combat.pending_spells[0]['count'], 0)
+        self.assertEqual(combat._drops.call_count, 2)
 
     def test_probe_checks_later_points_after_first_four_fail(self):
         combat = self.make_executor()

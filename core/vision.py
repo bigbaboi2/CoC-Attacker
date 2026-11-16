@@ -401,6 +401,11 @@ class VisionEngine:
     def is_in_main_village(self, screen: np.ndarray) -> bool:
         if screen is None or screen.shape[:2] != (900, 1600) or self.has_open_dialog(screen):
             return False
+        # A defense Live Replay can accidentally match the Battle button.
+        # Require at least one actual home resource bar before any village tap.
+        resources = self.read_village_resources(screen)
+        if not (resources['valid'].get('gold') or resources['valid'].get('elixir')):
+            return False
         if self.match_template(screen, 'battle', threshold=0.78, roi=(30, 800, 160, 95)):
             return True
         ocr = self._get_ocr()
@@ -412,6 +417,34 @@ class VisionEngine:
             except Exception:
                 pass
         return False
+
+    def is_treasure_chest_tap_screen(self, screen: np.ndarray) -> bool:
+        """Recognize the full-screen chest event before tapping its center."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        ocr = self._get_ocr()
+        if ocr is None:
+            return False
+        try:
+            result = ocr(screen[175:285, 680:940])
+            text = ' '.join(getattr(result, 'txts', None) or ())
+        except Exception:
+            return False
+        if not re.search(r'\btap\b', text, re.I):
+            return False
+        chest = screen[375:600, 670:930]
+        hsv = cv2.cvtColor(chest, cv2.COLOR_BGR2HSV)
+        wood = cv2.inRange(hsv, (5, 65, 65), (30, 255, 255))
+        return float((wood > 0).mean()) >= 0.025
+
+    def is_treasure_chest_reward(self, screen: np.ndarray) -> bool:
+        """Recognize the Continue button after a chest has opened."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        button = screen[755:880, 660:940]
+        hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, (35, 80, 90), (95, 255, 255))
+        return float((green > 0).mean()) >= 0.12
 
     def battle_phase(self, screen):
         # ADB returns a new immutable BGR frame per capture. Reuse recognition
