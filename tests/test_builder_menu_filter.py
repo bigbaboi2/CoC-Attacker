@@ -58,6 +58,30 @@ class BuilderMenuResourceFilterTests(unittest.TestCase):
         worker.reset_menu_filter()
         self.assertIsNone(state['active'])
 
+    def test_supercharge_toggle_filters_blue_lightning_rows_and_dialog(self):
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        # Cyan-blue lightning pixels below Supercharge row (y=210 -> y+6..y+40 = 216..250)
+        frame[225:238, 1245:1255] = (255, 190, 30)  # BGR cyan-blue
+        self.assertTrue(SuggestedUpgrader.is_supercharge_row(frame, 210))
+        self.assertFalse(SuggestedUpgrader.is_supercharge_row(frame, 350))
+
+        worker = SuggestedUpgrader.__new__(SuggestedUpgrader)
+        worker.base_regular_names = {'firespitter', 'buildershut'}
+        worker.custom_regular_names = {'firespitter', 'buildershut'}
+        worker.village = SimpleNamespace(settings={
+            'lock_townhall_upgrade': True,
+            'building_upgrade_allow_supercharge': False,
+        })
+        self.assertFalse(worker.is_candidate_allowed({'name': 'Firespitter', 'supercharge': True}, custom_mode=True))
+        self.assertTrue(worker.is_candidate_allowed({'name': "Builder's Hut", 'supercharge': False}, custom_mode=True))
+        worker.village.settings['building_upgrade_allow_supercharge'] = True
+        self.assertTrue(worker.is_candidate_allowed({'name': 'Firespitter', 'supercharge': True}, custom_mode=True))
+
+        worker.village.settings['building_upgrade_allow_supercharge'] = False
+        worker.village.settings['auto_upgrade_buildings'] = True
+        worker.words = lambda _scr, _roi: [('Supercharge Firespitter to Charge 1?', 800, 50), ('Confirm', 950, 750)]
+        self.assertIsNone(worker.confirmation(frame, {'name': 'Firespitter', 'cost': 8500000, 'resource': 'gold'}))
+
 
 if __name__ == '__main__':
     unittest.main()

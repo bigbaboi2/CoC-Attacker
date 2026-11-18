@@ -271,7 +271,17 @@ class AppearanceTests(unittest.TestCase):
                 window.chk_walls.setChecked(False)
                 window.chk_farm_finish.setChecked(False)
                 self.assertNotIn(1, window.village_subtabs.tabBar().active_dots)
+                window.chk_farm_finish.setChecked(True)
+                self.assertNotIn(1, window.village_subtabs.tabBar().active_dots)
+                window.chk_farm_finish.setChecked(False)
                 window.chk_walls.setChecked(True)
+                self.assertIn(1, window.village_subtabs.tabBar().active_dots)
+                window.bot.village.walls_confirmed_maxed = True
+                window._update_farm_finish_badge()
+                self.assertNotIn(1, window.village_subtabs.tabBar().active_dots)
+                window.bot.village.walls_confirmed_maxed = False
+                window.chk_farm_finish.setChecked(False)
+                window._update_farm_finish_badge()
                 self.assertIn(1, window.village_subtabs.tabBar().active_dots)
                 window.chk_auto_buildings.setChecked(False)
                 window.chk_buy_new.setChecked(True)

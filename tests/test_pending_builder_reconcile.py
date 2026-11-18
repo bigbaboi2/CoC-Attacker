@@ -35,6 +35,17 @@ class PendingBuilderReconcileTests(unittest.TestCase):
         self.assertIsNotNone(worker.pending)
         worker.adb.screencap.assert_called_once()
 
+    def test_timed_step_preserves_verified_count_when_later_builder_times_out(self):
+        worker = SuggestedUpgrader.__new__(SuggestedUpgrader)
+        worker.pending = None
+        worker.opened_menu = False
+        worker._step_verified = 1
+        worker.last_status = ''
+        worker._step = Mock(side_effect=TimeoutError('Hết thời gian kiểm tra nâng công trình'))
+        result = worker._timed_step(None, maintain_reserve=True, custom_mode=True, preopened=None)
+        self.assertEqual(result['status'], 'progress')
+        self.assertEqual(result['count'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

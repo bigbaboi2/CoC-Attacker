@@ -662,16 +662,17 @@ class BuilderBattle:
             return False
         okay = self.base.match(screen, ("okaystar", "okhome", "okay"), (375, 410, 850, 465),
                                .75, (.8, 1., 1.15))
+        if not okay and hasattr(self.vision, 'find_okay_button'):
+            okay = self.vision.find_okay_button(screen)
         if not okay:
             ocr_fn = getattr(self.base.walls, 'ocr_positions', None)
             if ocr_fn:
-                for item in ocr_fn(screen, (600, 600, 400, 200), scale=1):
-                    text = item[0]
-                    box = item[1]
-                    if 'ok' in text.lower():
-                        bx = box[0] if isinstance(box, (list, tuple)) else box
-                        by = box[1] if isinstance(box, (list, tuple)) and len(box) > 1 else 700
-                        cand = (bx, by, 160, 70)
+                for item in ocr_fn(screen, (600, 600, 400, 220), scale=1):
+                    text = str(item[0]).lower()
+                    if any(k in text for k in ('ok', 'claim', 'ciaim', 'nhan', 'nhận')):
+                        bx = item[1] if isinstance(item[1], (int, float)) else (item[1][0] if isinstance(item[1], (list, tuple)) else 800)
+                        by = item[2] if len(item) > 2 and isinstance(item[2], (int, float)) else 710
+                        cand = (int(bx), int(by), 160, 70)
                         if self.base.green_button(screen, cand):
                             okay = cand
                             break

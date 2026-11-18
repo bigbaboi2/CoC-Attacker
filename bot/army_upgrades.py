@@ -267,8 +267,16 @@ class ArmyUpgrader:
                     if candidate not in self.rows(fresh, w.words(fresh, (1170, 50, 430, 755))):
                         return dict(status='blocked', reason='Hàng nâng quân chưa ổn định.')
                     self.adb.tap(1380, candidate['y'] + 8, jitter=0, delay_after=.6)
-                    point = self.confirm(self.adb.screencap(), candidate)
-                    if not point or point != self.confirm(self.adb.screencap(), candidate):
+                    point = None
+                    prev_pt = None
+                    for _ in range(4):
+                        curr_pt = self.confirm(self.adb.screencap(), candidate)
+                        if curr_pt and prev_pt and abs(curr_pt[0] - prev_pt[0]) <= 20 and abs(curr_pt[1] - prev_pt[1]) <= 20:
+                            point = curr_pt
+                            break
+                        prev_pt = curr_pt
+                        time.sleep(.2)
+                    if not point:
                         return dict(status='blocked', reason='Chưa xác minh giá và nút nâng quân.')
                     self.pending = dict(candidate, before=before[resource],
                                         account=getattr(self.village, 'current_account_key', None))
@@ -283,4 +291,9 @@ class ArmyUpgrader:
             return dict(status='idle', reason='Không tìm thấy mục nâng quân phù hợp.')
         finally:
             if not self.pending:
+                up_close_fn = getattr(w, 'upgrade_close_button', None)
+                if callable(up_close_fn):
+                    up_close = up_close_fn(self.adb.screencap())
+                    if up_close:
+                        self.adb.tap(*up_close[:2], jitter=0, delay_after=.3)
                 w.close_menu(self.adb.screencap())

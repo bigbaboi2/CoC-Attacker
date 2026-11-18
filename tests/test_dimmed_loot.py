@@ -32,6 +32,25 @@ class DimmedLootTests(unittest.TestCase):
         self.assertEqual(loot['elixir'], 506634)
         self.assertTrue(loot['known']['gold'] and loot['known']['elixir'])
 
+    def test_multiplier_yellow_loot_is_read_in_scouting_and_when_dimmed(self):
+        crop = cv2.imread(str(Path(__file__).resolve().parent / 'fixtures' / 'multiplier_loot_2x.png'))
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        frame[105:242, 80:305] = crop
+        vision = VisionEngine()
+        vision.battle_phase = Mock(return_value='scouting')
+        loot = vision.read_loot(frame)
+        self.assertEqual(loot['gold'], 1730930)
+        self.assertEqual(loot['elixir'], 1379998)
+        self.assertEqual(loot['dark_elixir'], 3058)
+        self.assertTrue(loot['valid'] and loot['valid_dark'])
+        self.assertTrue(all(loot['known'].values()))
+
+        dimmed_frame = np.clip(frame.astype(np.float32) * 0.44, 0, 255).astype(np.uint8)
+        dimmed_loot = vision.read_loot(dimmed_frame, dimmed=True)
+        self.assertEqual(dimmed_loot['gold'], 1730930)
+        self.assertEqual(dimmed_loot['elixir'], 1379998)
+        self.assertEqual(dimmed_loot['dark_elixir'], 3058)
+
 
 if __name__ == '__main__':
     unittest.main()

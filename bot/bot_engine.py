@@ -66,7 +66,6 @@ class BotEngine:
         self.farm_finish = FarmFinishController(self.village)
         self.completion_callback = None
         self.battle = BattleSearcher(self.adb, self.vision, self.settings)
-        self.battle.bonus_handler=self.village.handle_star_bonus
         self.battle.fault_check = self._queue_screen_fault
         self.combat = CombatExecutor(self.adb, self.vision, self.settings, screen_callback=self.screen_cb, village_state=self.village_state)
         self.builder = BuilderBaseManager(self.adb, self.vision, self.settings, self.village,
@@ -686,7 +685,7 @@ class BotEngine:
             # Update uptime
             self._publish_stats()
 
-            time.sleep(0.6)
+            time.sleep(0.25 if getattr(self, 'current_state', None) in (self.STATE_VILLAGE, self.STATE_SEARCHING, self.STATE_COMBAT) else 0.6)
 
     def _ensure_game_resolution(self, screen):
         if screen.shape[:2] == (900, 1600):
@@ -809,15 +808,16 @@ class BotEngine:
                 return
             if self._queue_screen_fault(screen):
                 return
-            self._action_outcome('Nhận diện màn hình', False, inspect=False)
-            if getattr(self, '_pending_recovery', None):
-                return
             if self._open_game_if_needed():
                 return
-            # Thử đóng các popup ngẫu nhiên nếu có
+            # Thử đóng các popup ngẫu nhiên nếu có trước khi tính là lỗi nhận diện
             if self.village.close_popups_and_dialogs(screen):
+                self._action_outcome('Nhận diện màn hình', True)
                 self.log("[Bot] Đã đóng một thông báo popup nổi.")
                 time.sleep(1.0)
+                return
+            self._action_outcome('Nhận diện màn hình', False, inspect=False)
+            if getattr(self, '_pending_recovery', None):
                 return
 
             time.sleep(1.5)
@@ -865,12 +865,15 @@ class BotEngine:
                 return
             self.log("[Bot] Menu Tấn công đang mở -> Bấm Tìm trận (Find a Match)...")
             self.set_state(self.STATE_SEARCHING)
+            self._configure_treasure_hunt(screen)
             searching = self.battle.start_find_match(log_callback=self.log)
             self._action_outcome('Bấm Tìm trận', searching)
             if searching:
                 self._run_scouting_loop()
-            elif not getattr(self, '_pending_recovery', None):
-                self.log('[Bot] Chưa xác nhận được Tìm trận.')
+            else:
+                self.combat.treasure_hunt_active = False
+                if not getattr(self, '_pending_recovery', None):
+                    self.log('[Bot] Chưa xác nhận được Tìm trận.')
             return
 
         # TRƯỜNG HỢP E: ĐANG Ở LÀNG CHÍNH (MAIN VILLAGE)
@@ -879,10 +882,18 @@ class BotEngine:
                 self.set_state(self.STATE_IDLE)
                 time.sleep(1)
                 return
-            if not getattr(getattr(self, '_wall_farm_guard', None), 'active', False):
+            if not getattr(getattr(self, '_wall_farm_guard', None), 'active', False) and not (FarmFinishController.enabled(self.settings) and getattr(getattr(self, 'farm_finish', None), 'completed', False)):
                 self.set_state(self.STATE_VILLAGE)
             if self._maybe_periodic_restart(screen):
                 return
+
+            if self.settings.get('auto_collect_treasury', False):
+                treasury_res = self.village.collect_treasury(log_callback=self.log)
+                if not isinstance(treasury_res, dict) or treasury_res.get('reason') not in ('disabled', 'cooldown', 'not_home'):
+                    screen = self.adb.screencap()
+                    if screen is None or not self.village.is_in_main_village(screen):
+                        self.log('[Treasury] Chưa xác nhận về làng; hoãn các thao tác khác.')
+                        return
 
             if getattr(self, '_manual_village_scan_requested', False):
                 self._manual_village_scan_requested = False
@@ -898,15 +909,15 @@ class BotEngine:
                 return
 
             # Thực hiện chu trình chăm sóc làng (Luyện quân, Thu hoạch, Nâng tường)
-            self._run_village_maintenance()
+            did_maintenance = self._run_village_maintenance()
             self._startup_main_work_pending = False
             if getattr(self, '_defer_battle_after_maintenance', False):
                 self._force_builder_maintenance = True
                 return
-            fresh=self.adb.screencap()
+            fresh = self.adb.screencap() if did_maintenance else screen
             if not self.settings.get("main_village_enabled", True):
                 return
-            home = fresh is not None and self.village.is_in_main_village(fresh)
+            home = fresh is not None and (not did_maintenance or self.village.is_in_main_village(fresh))
             self._action_outcome('Xác minh làng sau bảo trì', home)
             if not home:
                 self.log('[Village] Chưa ở làng sau bảo trì; chưa tìm trận mới.')
@@ -931,14 +942,37 @@ class BotEngine:
             if not self.settings.get("main_village_enabled", True):
                 return
             # Bấm Tìm trận có xác minh
+            self._configure_treasure_hunt(self.adb.screencap())
             searching = self.battle.start_find_match(log_callback=self.log)
             self._action_outcome('Bấm Tìm trận', searching)
             if not searching:
+                self.combat.treasure_hunt_active = False
                 self.log("[Bot] Không thể bấm Tìm trận. Thử lại...")
                 return
 
             # Vào chu trình soi nhà
             self._run_scouting_loop()
+
+    def _configure_treasure_hunt(self, screen):
+        """Arm the chest gate only for a confirmed, incomplete event quota."""
+        self.combat.treasure_hunt_active = False
+        self.village._treasure_chest_claimed = False
+        if not (self.settings.get('auto_surrender', True)
+                and self.settings.get('end_on_treasure_hunt', False)
+                and any(self.settings.get(key, False) for key in
+                        ('end_on_stars', 'end_on_time', 'end_on_loot', 'end_on_destruction'))):
+            return
+        first = self.vision.read_treasure_hunt_collected(screen)
+        second = self.vision.read_treasure_hunt_collected(self.adb.screencap()) if first else None
+        if first is None or first != second:
+            self.log('[Treasure Hunt] Chưa xác minh được Collected; dùng điều kiện dừng thường cho trận này.')
+            return
+        found, total = first
+        if found >= total:
+            self.log(f'[Treasure Hunt] Collected {found}/{total}; tạm ngưng chờ hòm, dùng điều kiện dừng thường.')
+            return
+        self.combat.treasure_hunt_active = True
+        self.log(f'[Treasure Hunt] Collected {found}/{total}; chờ tìm thấy hòm trong trận trước khi kết thúc.')
 
     def _verify_builder_walls_once(self, builder):
         """Verify both Builder Base stages before the first action in this village."""
@@ -1227,7 +1261,8 @@ class BotEngine:
         self._publish_stats()
         self.save_stats(force=True)
         self.log(f"[Combat] Kết thúc: {result.get('stars',0)} sao, {result.get('duration',0):.0f}s.")
-        home = self._ensure_main_village(timeout_sec=25)
+        home = self._ensure_main_village(timeout_sec=25,
+                                         expect_treasure=bool(result.get('treasure_found')))
         self._action_outcome('Quay về làng', home)
         if home:
             if self.settings.get("main_village_enabled", True) and self._maybe_periodic_restart():
@@ -1237,13 +1272,13 @@ class BotEngine:
         self.log('[Village] Chưa xác nhận về làng; hoãn bảo trì.')
         return False
 
-    def _ensure_main_village(self, timeout_sec: float = 25.0) -> bool:
+    def _ensure_main_village(self, timeout_sec: float = 25.0, expect_treasure=False) -> bool:
         """Chờ và xác minh chắc chắn game đã quay về Làng chính sau trận đánh hoặc chuyển cảnh."""
         self.log("[Bot] Đang chờ và xác nhận quay về Làng chính an toàn...")
         start_wait = time.time()
         home_taps = 0
         while time.time() - start_wait < timeout_sec:
-            time.sleep(1.0)
+            time.sleep(0.45)
             screen = self.adb.screencap()
             if screen is None:
                 continue
@@ -1251,14 +1286,22 @@ class BotEngine:
             if self.screen_cb:
                 self.screen_cb(screen)
 
+            if expect_treasure:
+                if self.village.open_treasure_chest_if_present(screen, self.log):
+                    continue
+                if getattr(self.village, '_treasure_chest_claimed', False):
+                    expect_treasure = False
+
             home = self.village.is_in_main_village(screen)
             if (not home or self.vision.has_system_dialog(screen)) and self._queue_screen_fault(screen):
                 return False
-            if home:
+            if home and not expect_treasure:
                 self.set_state(self.STATE_VILLAGE)
                 self.village.deselect_all()
                 self.log('[Village] Đã xác nhận màn hình làng.')
                 return True
+            if home and expect_treasure:
+                continue
 
             # Nếu còn ở bảng kết quả (thấy Return Home), bấm tiếp để về
             home_match = self.vision.match_template(screen, "return_home", threshold=0.70, roi=(500, 650, 600, 200))
@@ -1290,6 +1333,10 @@ class BotEngine:
                 time.sleep(0.5)
                 return True
 
+        if expect_treasure:
+            self.log('[Treasure Hunt] Đã thấy hòm trong trận nhưng chưa xác nhận mở hòm; tạm dừng bot để kiểm tra.')
+            self.pause_bot()
+            return False
         self.log("[Bot] Hết thời gian chờ về làng, thử chạm nhẹ góc màn hình để bỏ qua...")
         self.village.deselect_all()
         final_screen = self.adb.screencap()
@@ -1488,26 +1535,47 @@ class BotEngine:
             self.pause_bot()
             return True
         self.village.wall_status = controller.status
-        self.set_state('HOÀN TẤT FARM')
+        if action == 'wait' and self.settings.get('auto_upgrade_buildings', False) and self.settings.get('building_upgrade_wait_mode', 'target_cost') == 'target_cost' and time.time() - self.last_village_maintenance >= self.settings.get('maintenance_interval_sec', 45):
+            fresh = self.adb.screencap()
+            if fresh is not None and self.village.is_in_main_village(fresh):
+                self._maintain_free_builders(fresh)
+            self.last_village_maintenance = time.time()
         if action == 'farm':
             self.battle.farm_needed_resources = set(controller.missing)
-            # Research and new construction can be started while filling the
-            # farm-finish target; waiting for completely full stores can leave
-            # the laboratory idle indefinitely.
-            if ((self.settings.get('auto_upgrade_army', False) or self.settings.get('auto_buy_new_buildings', False))
+            wait_mode = self.settings.get('building_upgrade_wait_mode', 'target_cost')
+            custom_bldg_immediate = (self.settings.get('auto_upgrade_buildings', False)
+                                     and wait_mode == 'target_cost')
+            # Research, new construction, and target-cost building upgrades can be
+            # started while filling the farm-finish target; waiting for completely
+            # full stores can leave builders or the laboratory idle indefinitely.
+            if ((self.settings.get('auto_upgrade_army', False)
+                 or self.settings.get('auto_buy_new_buildings', False)
+                 or custom_bldg_immediate)
                     and (getattr(self, '_optional_upgrade_retry', False) or
                          time.time() - self.last_village_maintenance >= self.settings.get('maintenance_interval_sec', 45))):
-                optional = self._service_optional_upgrades(self.adb.screencap())
+                if (self.settings.get('auto_upgrade_army', False)
+                        or self.settings.get('auto_buy_new_buildings', False)):
+                    optional = self._service_optional_upgrades(self.adb.screencap())
+                    self._optional_upgrade_retry = optional['status'] in ('blocked', 'uncertain')
+                    if optional['status'] == 'needs_resources':
+                        self.last_village_maintenance = time.time()
+                        controller.extra_resources.update(optional.get('resources', ()))
+                        return True
+                    if optional['status'] in ('progress', 'uncertain', 'blocked'):
+                        self.last_village_maintenance = time.time()
+                        return True
+                if custom_bldg_immediate:
+                    fresh = self.adb.screencap()
+                    if fresh is not None and self.village.is_in_main_village(fresh):
+                        ran = self._maintain_free_builders(fresh)
+                        if ran and not getattr(self, '_builders_need_assignment', False):
+                            self.last_village_maintenance = time.time()
+                            return True
                 self.last_village_maintenance = time.time()
-                self._optional_upgrade_retry = optional['status'] in ('blocked', 'uncertain')
-                if optional['status'] == 'needs_resources':
-                    controller.extra_resources.update(optional.get('resources', ()))
-                    return True
-                if optional['status'] in ('progress', 'uncertain', 'blocked'):
-                    return True
                 self.battle.farm_needed_resources = set(controller.missing)
             return False
         if action == 'complete':
+            self.set_state('HOÀN TẤT FARM')
             if time.monotonic() - getattr(self, '_completed_status_scan_at', 0) >= 30:
                 frame = self.adb.screencap()
                 if frame is not None and self.village.is_in_main_village(frame):
@@ -1989,7 +2057,7 @@ class BotEngine:
         if self.settings.get('auto_upgrade_army', False) or self.settings.get('auto_buy_new_buildings', False):
             self.battle.farm_needed_resources = set()
 
-        return dict(status='idle', reason='Không có mục tùy chọn cần xử lý.')
+        return dict(status='idle', reason='Không có mục tùy chọn cần xử lý.', acted=False)
 
     def _service_apprentice(self, screen):
         if self.settings.get('auto_assign_apprentice', False) and self.village.assign_apprentice(screen, self.log):
@@ -2021,91 +2089,93 @@ class BotEngine:
             if self._wall_hold_gate(self._service_apprentice(self.adb.screencap())):
                 return
         if not force and now - self.last_village_maintenance < self.settings.get("maintenance_interval_sec",45):
-            return
+            return False
 
         screen = self.adb.screencap()
         if screen is None:
-            return
+            return False
 
         if not self.village.is_in_main_village(screen):
             # Thử đóng popup nếu có
             if self.village.close_popups_and_dialogs(screen):
-                time.sleep(0.8)
+                time.sleep(0.5)
                 screen = self.adb.screencap()
 
         if screen is None or not self.village.is_in_main_village(screen):
             self.log("[Village] Chưa xác nhận được Làng chính -> Bỏ qua chu trình chăm sóc.")
-            return
+            return False
 
         self.log("[Village] Kiểm tra thu hoạch, đội quân và tường.")
         if hasattr(self.village, 'check_and_sync_account'):
             self.village.check_and_sync_account(screen, self.log)
-        # A selected building does not block the home actions below. Avoid
-        # Android Back, which can open the game's exit prompt instead.
+        acted = False
+        fresh = screen
 
         # 1. Tự động luyện quân nhanh (Quick Train)
         if self.settings.get("auto_train_army", True):
             self.log("[Village] Mở đội quân nhanh theo thiết lập.")
-            self.village.train_army(force=force)
-
-        fresh=self.adb.screencap()
-        if fresh is None or not self.village.is_in_main_village(fresh):
-            self.log('[Village] Chưa xác nhận màn hình làng sau thao tác; dừng lượt bảo trì.')
-            return
+            if self.village.train_army(force=force) is not False:
+                acted = True
+                fresh = self.adb.screencap()
+                if fresh is None or not self.village.is_in_main_village(fresh):
+                    self.log('[Village] Chưa xác nhận màn hình làng sau thao tác; dừng lượt bảo trì.')
+                    return True
 
         # 2. Thu hoạch mỏ tài nguyên (Vàng & Dầu)
         if self.settings.get("auto_collect", True):
+            prev_collect = getattr(self.village, 'last_collect_time', None)
             self.village.collect_resources(fresh, log_callback=self.log)
-            fresh = self.adb.screencap()
-            if not self.village.is_in_main_village(fresh):
-                self.log('[Village] Màn hình đã đổi sau thu hoạch; dừng lượt bảo trì.')
-                return
-            self.log('[Village] Đã xử lý bước thu hoạch; tiếp tục các công việc bảo trì.')
+            if getattr(self.village, 'last_collect_time', None) != prev_collect:
+                acted = True
+                fresh = self.adb.screencap()
+                if not self.village.is_in_main_village(fresh):
+                    self.log('[Village] Màn hình đã đổi sau thu hoạch; dừng lượt bảo trì.')
+                    return True
+                self.log('[Village] Đã xử lý bước thu hoạch; tiếp tục các công việc bảo trì.')
 
         # 3. Tự động xin lính Clan (nếu bật)
-        if self.settings.get('auto_collect_treasury',False):
-            self.village.observe_reward_timers(fresh,log_callback=self.log)
-            self.village.collect_treasury(log_callback=self.log)
-            fresh = self.adb.screencap()
-            if not self.village.is_in_main_village(fresh):
-                self.log('[Treasury] Chưa xác nhận về làng; hoãn các thao tác bảo trì còn lại.')
-                return
-
         if self.settings.get("auto_request_troops", False):
             self.log("[Village] Tự động xin lính Clan Castle...")
-            self.village.request_clan_troops()
-            fresh = self.adb.screencap()
-            if not self.village.is_in_main_village(fresh):
-                self.log('[Village] Chưa xác nhận màn hình làng sau khi xin lính; dừng lượt bảo trì.')
-                return
+            if self.village.request_clan_troops() is not False:
+                acted = True
+                fresh = self.adb.screencap()
+                if not self.village.is_in_main_village(fresh):
+                    self.log('[Village] Chưa xác nhận màn hình làng sau khi xin lính; dừng lượt bảo trì.')
+                    return True
 
         optional_result = self._service_optional_upgrades(fresh)
         if optional_result['status'] != 'idle':
             if optional_result['status'] in ('blocked', 'uncertain', 'progress'):
                 self._defer_battle_after_maintenance = True
-            return
-        fresh = self.adb.screencap()
-        if not self.village.is_in_main_village(fresh):
-            self.log('[Thợ] Chưa xác nhận về làng sau kiểm tra công trình mới; hoãn tìm trận để kiểm tra thợ.')
-            self._defer_battle_after_maintenance = True
-            return
+            return True
+        if optional_result.get('acted', True):
+            acted = True
+            fresh = self.adb.screencap()
+            if not self.village.is_in_main_village(fresh):
+                self.log('[Thợ] Chưa xác nhận về làng sau kiểm tra công trình mới; hoãn tìm trận để kiểm tra thợ.')
+                self._defer_battle_after_maintenance = True
+                return True
 
         ran_builder_actions = self._maintain_free_builders(fresh)
         if ran_builder_actions:
+            acted = True
             fresh = self.adb.screencap()
             if not self.village.is_in_main_village(fresh):
-                return
+                return True
         builder = getattr(self, 'builder', None)
         if (builder is not None and self.settings.get('builder_base_enabled', False)
                 and time.monotonic() < getattr(builder, 'main_builders_wait_until', 0)
                 and time.monotonic() >= getattr(builder, 'night_builders_wait_until', 0)
                 and not getattr(builder, 'all_upgrades_complete', False)):
             self._defer_battle_after_maintenance = True
-            return
+            return acted
         if self.settings.get('auto_assign_apprentice', False):
+            before_app = fresh
             fresh = self._service_apprentice(fresh)
-            if not self.village.is_in_main_village(fresh):
-                return
+            if fresh is not before_app:
+                acted = True
+                if not self.village.is_in_main_village(fresh):
+                    return True
 
         # 4. Tự động nâng cấp tường (Auto Wall Upgrade)
         upgrade_walls = self.settings.get("auto_upgrade_walls", True)
@@ -2137,17 +2207,20 @@ class BotEngine:
                         self._wall_capacity_unverified = False
                         self.log('[Wall] Kiểm tra điều kiện nâng tường.')
                         self.village.upgrade_walls(fresh, res['gold'], res['elixir'], log_callback=self.log)
+                        acted = True
 
-        fresh=self.adb.screencap()
-        if fresh is None or not self.village.is_in_main_village(fresh):
-            self.log('[Village] Chưa xác nhận màn hình làng sau thao tác; dừng lượt bảo trì.')
-            return
+        if acted:
+            fresh = self.adb.screencap()
+            if fresh is None or not self.village.is_in_main_village(fresh):
+                self.log('[Village] Chưa xác nhận màn hình làng sau thao tác; dừng lượt bảo trì.')
+                return True
 
         if self._wall_hold_gate(fresh):
-            return
+            return acted
 
         self.last_village_maintenance = time.time()
         # The Battle button remains usable while a building is selected.
         # Android Back here can leave Clash or open its exit dialog, causing
         # the next home check to restart a healthy game.
         self.log("[Village] Hoàn tất bảo trì.")
+        return acted

@@ -648,7 +648,7 @@ class MainWindow(QMainWindow):
         self.village_subtabs.tabBar().set_active_dots({
             index: main_color for index, active in enumerate((
                 main,
-                main and (self.chk_walls.isChecked() or self.chk_farm_finish.isChecked()),
+                main and self.chk_walls.isChecked() and not self.chk_farm_finish.isChecked() and not self._is_walls_maxed(),
                 main and (self.chk_auto_buildings.isChecked() or self.chk_buy_new.isChecked()),
                 main and self.chk_upgrade_army.isChecked(),
             )) if active
@@ -1223,14 +1223,6 @@ class MainWindow(QMainWindow):
         self.chk_treasury.setChecked(self.settings.get('auto_collect_treasury',False))
         self.chk_treasury.stateChanged.connect(lambda state:self.settings.set('auto_collect_treasury',state==Qt.Checked))
         vbox_treasury.addWidget(self.chk_treasury)
-        self.chk_treasury_star=QCheckBox('  Theo dõi và nhận Star Bonus khi đủ sao, đến giờ')
-        self.chk_treasury_war=QCheckBox('  Theo dõi giờ thưởng hội chiến')
-        for key,check in (('treasury_star_bonus_enabled',self.chk_treasury_star),('treasury_war_rewards_enabled',self.chk_treasury_war)):
-            check.setChecked(self.settings.get(key,True))
-            check.setEnabled(self.chk_treasury.isChecked())
-            check.stateChanged.connect(lambda state,name=key:self.settings.set(name,state==Qt.Checked))
-            self.chk_treasury.toggled.connect(check.setEnabled)
-            vbox_treasury.addWidget(check)
         vbox_auto.addWidget(self.chk_train)
         vbox_auto.addWidget(self.chk_request)
         form_auto = QFormLayout()
@@ -1249,14 +1241,15 @@ class MainWindow(QMainWindow):
         form_auto.addRow('Chu kỳ thu hoạch:', self.spin_collect_interval)
         self.spin_treasury_interval=QSpinBox()
         self.spin_treasury_interval.setRange(1,1440)
-        self.spin_treasury_interval.setValue(self.settings.get('treasury_check_interval_min',30))
+        self.spin_treasury_interval.setSuffix(' phút')
+        self.spin_treasury_interval.setValue(self.settings.get('treasury_check_interval_min',180))
         self.spin_treasury_interval.valueChanged.connect(lambda value:self.settings.set('treasury_check_interval_min',value))
         form_treasury=QFormLayout()
-        form_treasury.addRow('Kiểm tra dự phòng khi chưa rõ giờ (phút):',self.spin_treasury_interval)
+        form_treasury.addRow('Kiểm tra lại Treasury sau:',self.spin_treasury_interval)
         vbox_treasury.addLayout(form_treasury)
         self.spin_treasury_interval.setEnabled(self.chk_treasury.isChecked())
         self.chk_treasury.toggled.connect(self.spin_treasury_interval.setEnabled)
-        treasury_note=QLabel('Lưu riêng giờ Star Bonus và hội chiến, cùng trạng thái đã thu/kho trống. Hai ô chọn thời điểm kiểm tra; Treasury thu chung tài nguyên đang có trong kho.')
+        treasury_note=QLabel('Đọc số dư kho bạc từ popup tài nguyên khi bắt đầu. Kho bạc trống thì tiếp tục công việc khác; sẽ kiểm tra lại theo chu kỳ trên.')
         treasury_note.setWordWrap(True)
         vbox_treasury.addWidget(treasury_note)
         reset_treasury_row = QHBoxLayout()
@@ -1512,6 +1505,16 @@ class MainWindow(QMainWindow):
         )
         form_bldg.addRow(self.chk_bldg_menu_filter)
 
+        self.chk_bldg_supercharge = QCheckBox("Cho phép nâng cấp Supercharge (tia sét xanh)")
+        self.chk_bldg_supercharge.setChecked(self.settings.get("building_upgrade_allow_supercharge", True))
+        self.chk_bldg_supercharge.setToolTip(
+            "Khi tắt, bot sẽ bỏ qua các nâng cấp tạm thời Supercharge có biểu tượng tia sét xanh trong menu thợ."
+        )
+        self.chk_bldg_supercharge.toggled.connect(
+            lambda checked: self.settings.set("building_upgrade_allow_supercharge", checked)
+        )
+        form_bldg.addRow(self.chk_bldg_supercharge)
+
         res_row = QHBoxLayout()
         self.chk_bldg_resources = {}
         saved_res = dict(DEFAULT_CONFIG["building_upgrade_resources"])
@@ -1572,7 +1575,7 @@ class MainWindow(QMainWindow):
         form_bldg.addRow(reset_bldg_row)
         layout.addWidget(grp_bldg, 3, 1)
         building_options = (self.combo_bldg_priority, self.combo_specific_target,
-                            self.combo_bldg_wait_mode, self.chk_bldg_menu_filter,
+                            self.combo_bldg_wait_mode, self.chk_bldg_menu_filter, self.chk_bldg_supercharge,
                             self.combo_bldg_preset, self.btn_bldg_details,
                             *self.chk_bldg_resources.values(), *self.chk_bldg_categories.values())
         def update_building_options():
@@ -1856,6 +1859,13 @@ class MainWindow(QMainWindow):
         self.chk_end_time=QCheckBox('Đạt thời gian tối đa (giây):')
         self.chk_end_loot=QCheckBox('Farm đủ tài nguyên địch (%):')
         self.chk_end_destruction=QCheckBox('Đạt tỷ lệ phá hủy (%):')
+        self.chk_end_treasure_hunt=QCheckBox('Treasure Hunt: chỉ kết thúc trận sau khi tìm thấy hòm')
+        self.chk_end_treasure_hunt.setChecked(self.settings.get('end_on_treasure_hunt', False))
+        self.chk_end_treasure_hunt.toggled.connect(
+            lambda enabled: self.settings.set('end_on_treasure_hunt', enabled))
+        self.chk_end_treasure_hunt.setToolTip(
+            'Chỉ dùng khi có ít nhất một điều kiện dừng khác. Nếu Collected đã đầy, '
+            'bot dùng điều kiện dừng thường; nếu còn hòm, bot chờ biểu tượng hòm cạnh Overall Damage.')
         self.spin_loot_percent=QSpinBox();self.spin_loot_percent.setRange(1,100)
         self.spin_loot_percent.setValue(self.settings.get('loot_target_percent',70))
         self.spin_loot_percent.valueChanged.connect(lambda v:self.settings.set('loot_target_percent',v))
@@ -1870,6 +1880,7 @@ class MainWindow(QMainWindow):
             check.setChecked(self.settings.get(key,default))
             check.stateChanged.connect(lambda state,name=key:self.settings.set(name,state==Qt.Checked))
             form_surr.addRow(check,control)
+        form_surr.addRow(self.chk_end_treasure_hunt)
         self.combo_star_source=QComboBox()
         star_sources=['all','town_hall','destruction']
         self.combo_star_source.addItems(['Tính mọi sao','Phải có sao nhà chính','Không tính sao nhà chính'])
@@ -1899,9 +1910,13 @@ class MainWindow(QMainWindow):
                           self.chk_end_loot, self.chk_end_destruction)
         def update_end_conditions():
             enabled = self.chk_auto_surr.isChecked()
+            has_goal = any(check.isChecked() for check in end_conditions)
+            if not (enabled and has_goal) and self.chk_end_treasure_hunt.isChecked():
+                self.chk_end_treasure_hunt.setChecked(False)
             self.chk_prearm_surr.setEnabled(enabled)
             for check in end_conditions:
                 check.setEnabled(enabled)
+            self.chk_end_treasure_hunt.setEnabled(enabled and has_goal)
             for check, control in ((self.chk_end_stars, self.spin_stars),
                                    (self.chk_end_time, self.spin_timeout),
                                    (self.chk_end_loot, self.spin_loot_percent),
@@ -2441,6 +2456,8 @@ class MainWindow(QMainWindow):
             chosen = self.device_combo.currentData()
             if chosen and chosen != selected and ':' in chosen:
                 self.settings.set('device_serial', chosen)
+            if chosen and not getattr(self.bot.adb, 'device_serial', None):
+                self._connect_device()
 
         self._run_job(self.bot.adb.list_devices, done)
 
@@ -2541,10 +2558,10 @@ class MainWindow(QMainWindow):
                 self.settings.set('farm_finish_enabled', True)
                 if hasattr(self, '_update_farm_finish_options'):
                     self._update_farm_finish_options()
-                if hasattr(self, 'village_subtabs'):
-                    self._update_active_subtabs()
         else:
             self.lbl_farm_finish_max_badge.setText('')
+        if hasattr(self, 'village_subtabs'):
+            self._update_active_subtabs()
 
     def _on_farm_finish_toggled(self, enabled: bool):
         if not enabled and self._is_walls_maxed():
@@ -2816,11 +2833,8 @@ class MainWindow(QMainWindow):
 
     def _reset_treasury_defaults(self):
         self.chk_treasury.setChecked(DEFAULT_CONFIG["auto_collect_treasury"])
-        self.chk_treasury_star.setChecked(DEFAULT_CONFIG["treasury_star_bonus_enabled"])
-        self.chk_treasury_war.setChecked(DEFAULT_CONFIG["treasury_war_rewards_enabled"])
         self.spin_treasury_interval.setValue(DEFAULT_CONFIG["treasury_check_interval_min"])
-        for k in ("auto_collect_treasury", "treasury_star_bonus_enabled",
-                  "treasury_war_rewards_enabled", "treasury_check_interval_min"):
+        for k in ("auto_collect_treasury", "treasury_check_interval_min"):
             self.settings.set(k, DEFAULT_CONFIG[k])
         self.statusBar().showMessage("Đã đặt lại mặc định: Kho bạc Clan Castle", 3000)
 
@@ -2994,6 +3008,7 @@ class MainWindow(QMainWindow):
             max(0, self.combo_bldg_wait_mode.findData(DEFAULT_CONFIG["building_upgrade_wait_mode"]))
         )
         self.chk_bldg_menu_filter.setChecked(DEFAULT_CONFIG["building_upgrade_use_menu_filter"])
+        self.chk_bldg_supercharge.setChecked(DEFAULT_CONFIG["building_upgrade_allow_supercharge"])
         for k, chk in self.chk_bldg_resources.items():
             chk.blockSignals(True)
             chk.setChecked(DEFAULT_CONFIG["building_upgrade_resources"][k])
@@ -3006,6 +3021,7 @@ class MainWindow(QMainWindow):
         self.settings.set("building_upgrade_priority", DEFAULT_CONFIG["building_upgrade_priority"])
         self.settings.set("building_upgrade_wait_mode", DEFAULT_CONFIG["building_upgrade_wait_mode"])
         self.settings.set("building_upgrade_use_menu_filter", DEFAULT_CONFIG["building_upgrade_use_menu_filter"])
+        self.settings.set("building_upgrade_allow_supercharge", DEFAULT_CONFIG["building_upgrade_allow_supercharge"])
         self.settings.set("building_upgrade_resources", dict(DEFAULT_CONFIG["building_upgrade_resources"]))
         self.settings.set("building_upgrade_categories", dict(DEFAULT_CONFIG["building_upgrade_categories"]))
         self.settings.set("building_upgrade_whitelist", dict(DEFAULT_BUILDING_WHITELIST))
@@ -3083,11 +3099,13 @@ class MainWindow(QMainWindow):
         if def_loot_res in loot_keys:
             self.combo_loot_resource.setCurrentIndex(loot_keys.index(def_loot_res))
         self.chk_end_destruction.setChecked(DEFAULT_CONFIG["end_on_destruction"])
+        self.chk_end_treasure_hunt.setChecked(DEFAULT_CONFIG["end_on_treasure_hunt"])
         self.spin_destruction.setValue(DEFAULT_CONFIG["destruction_target_percent"])
         self.combo_end_mode.setCurrentIndex(1 if DEFAULT_CONFIG["end_condition_mode"] == 'all' else 0)
         for k in ("auto_surrender", "prearm_surrender", "end_on_stars", "end_star_source", "star_target",
                   "end_on_time", "battle_timeout_sec", "end_on_loot", "loot_target_percent",
-                  "loot_target_resource", "end_on_destruction", "destruction_target_percent", "end_condition_mode"):
+                  "loot_target_resource", "end_on_destruction", "destruction_target_percent",
+                  "end_on_treasure_hunt", "end_condition_mode"):
             self.settings.set(k, DEFAULT_CONFIG[k])
         self.statusBar().showMessage("Đã đặt lại mặc định: Kết thúc trận", 3000)
 
@@ -3294,12 +3312,8 @@ class MainWindow(QMainWindow):
         # 4. Treasury
         if hasattr(self, 'chk_treasury'):
             self.chk_treasury.setChecked(self.settings.get("auto_collect_treasury", False))
-        if hasattr(self, 'chk_treasury_star'):
-            self.chk_treasury_star.setChecked(self.settings.get("treasury_star_bonus_enabled", True))
-        if hasattr(self, 'chk_treasury_war'):
-            self.chk_treasury_war.setChecked(self.settings.get("treasury_war_rewards_enabled", True))
         if hasattr(self, 'spin_treasury_interval'):
-            self.spin_treasury_interval.setValue(self.settings.get("treasury_check_interval_min", 600))
+            self.spin_treasury_interval.setValue(self.settings.get("treasury_check_interval_min", 180))
 
         # 5. Walls & Farm Finish
         if hasattr(self, 'chk_walls'):
@@ -3370,6 +3384,10 @@ class MainWindow(QMainWindow):
             idx = self.combo_building_wait_mode.findData(self.settings.get("building_upgrade_wait_mode", "target_cost"))
             if idx >= 0:
                 self.combo_building_wait_mode.setCurrentIndex(idx)
+        if hasattr(self, 'chk_bldg_supercharge'):
+            self.chk_bldg_supercharge.blockSignals(True)
+            self.chk_bldg_supercharge.setChecked(self.settings.get("building_upgrade_allow_supercharge", True))
+            self.chk_bldg_supercharge.blockSignals(False)
         if hasattr(self, 'chk_building_menu_filter'):
             self.chk_building_menu_filter.setChecked(self.settings.get("building_upgrade_use_menu_filter", True))
         if hasattr(self, 'chk_bldg_resources'):
@@ -3437,6 +3455,8 @@ class MainWindow(QMainWindow):
             self.spin_stars.setValue(self.settings.get("star_target", 1))
         if hasattr(self, 'chk_end_time'):
             self.chk_end_time.setChecked(self.settings.get("end_on_time", False))
+        if hasattr(self, 'chk_end_treasure_hunt'):
+            self.chk_end_treasure_hunt.setChecked(self.settings.get("end_on_treasure_hunt", False))
         if hasattr(self, 'spin_timeout'):
             self.spin_timeout.setValue(self.settings.get("battle_timeout_sec", 180))
         if hasattr(self, 'chk_end_loot'):

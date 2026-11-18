@@ -12,8 +12,32 @@ class ResourceCapacityReader:
         self.vision = village.vision
         self.cache = {}
         self._logged_accounts = set()
+        self.last_tapped_hud = False
+
+    def _read_popup_fields(self, frame):
+        reader = getattr(self.vision, 'read_resource_popup', None)
+        if callable(reader):
+            popup = reader(frame)
+            if isinstance(popup, dict):
+                return popup.get('capacity'), popup.get('treasury')
+            if popup is None:
+                return None, None
+        cap_fn = getattr(self.vision, 'read_resource_capacity_popup', None)
+        treas_fn = getattr(self.vision, 'read_resource_treasury_popup', None)
+        cap = cap_fn(frame) if callable(cap_fn) else None
+        treas = treas_fn(frame) if callable(treas_fn) else None
+        return cap, treas
+
+    def _plausible_capacity(self, resource, value, context=None):
+        checker = getattr(self.village, '_is_plausible_capacity', None)
+        if callable(checker):
+            res = checker(resource, value, context)
+            if isinstance(res, bool):
+                return res
+        return type(value) is int and value > 0
 
     def read(self, resources, log):
+        self.last_tapped_hud = False
         serial = self.village.settings.get('device_serial', '')
         has_account_store = isinstance(getattr(self.village, 'account_capacities', None), dict)
         screen = self.adb.screencap()
@@ -27,7 +51,7 @@ class ResourceCapacityReader:
 
         if has_account_store and callable(getattr(self.village, 'get_account_capacities', None)):
             entry = self.village.account_capacities.get(acc_key, {})
-            recently_measured = time.time() - float(entry.get('updated_at', 0)) < 300
+            recently_measured = time.time() - float(entry.get('updated_at', 0)) < 1800
             saved = self.village.get_account_capacities(resources, acc_key=acc_key) if recently_measured else None
             if isinstance(saved, dict) and all(isinstance(saved.get(r), int) and saved[r] > 0 for r in resources):
                 now_mono = time.monotonic()
@@ -41,14 +65,22 @@ class ResourceCapacityReader:
                 return {r: saved[r] for r in resources}
 
         values = {}
+        treasury_read = {}
         scanned_new = False
         for resource in resources:
             key = (serial, acc_key, resource)
             cached = self.cache.get(key)
-            if cached and time.monotonic()-cached[1] < 300:
+            if cached and time.monotonic()-cached[1] < 1800 and self._plausible_capacity(resource, cached[0], values):
                 values[resource] = cached[0]
                 continue
-            screen = self.adb.screencap()
+            if has_account_store and recently_measured and callable(getattr(self.village, 'get_account_capacities', None)):
+                saved_one = self.village.get_account_capacities((resource,), acc_key=acc_key)
+                if isinstance(saved_one, dict) and isinstance(saved_one.get(resource), int) and saved_one[resource] > 0:
+                    self.cache[key] = (saved_one[resource], time.monotonic())
+                    values[resource] = saved_one[resource]
+                    continue
+            if scanned_new or screen is None:
+                screen = self.adb.screencap()
             if screen is None or screen.shape[:2] != (900, 1600) or not self.village.is_in_main_village(screen):
                 return None
             if has_account_store and not acc_key and callable(getattr(self.village, 'check_and_sync_account', None)):
@@ -62,37 +94,53 @@ class ResourceCapacityReader:
                             self.cache[(serial, acc_key, r)] = (saved[r], now_mono)
                         return {r: saved[r] for r in resources}
             log(f'[Kho] Đang kiểm tra dung lượng tối đa {resource} của tài khoản {acc_key}.')
-            # Close an existing tooltip before opening the requested resource.
-            if self.vision.read_resource_capacity_popup(screen) is not None:
-                self.adb.tap(1000, 250, jitter=0, delay_after=.15)
+            if not scanned_new and not getattr(self.village, '_hud_tooltip_clean', False):
+                prev_cap, _ = self._read_popup_fields(screen)
+                if prev_cap is not None:
+                    self.adb.tap(1000, 250, jitter=0, delay_after=.12)
             try:
-                self.adb.tap(*self.BAR_POINTS[resource], jitter=0, delay_after=.2)
-                previous = None
+                self.adb.tap(*self.BAR_POINTS[resource], jitter=0, delay_after=.18)
+                prev_cap = None
+                prev_treas = None
                 capacity = None
-                for _ in range(4):
+                treasury = None
+                for attempt in range(4):
                     fresh = self.adb.screencap()
                     if fresh is None or not self.village.is_in_main_village(fresh):
                         break
-                    current = self.vision.read_resource_capacity_popup(fresh)
-                    if current is not None and current == previous:
-                        capacity = current
+                    cur_cap, cur_treas = self._read_popup_fields(fresh)
+                    if cur_cap is not None and cur_cap == prev_cap:
+                        capacity = cur_cap
+                    if cur_treas is not None and cur_treas == prev_treas:
+                        treasury = cur_treas
+                    if capacity is not None and (treasury is not None or attempt >= 1):
                         break
-                    previous = current
-                    time.sleep(.12)
-                if capacity is None:
+                    prev_cap = cur_cap
+                    prev_treas = cur_treas
+                    time.sleep(.10)
+                if capacity is None or not self._plausible_capacity(resource, capacity, values):
                     log(f'[Kho] Chưa đọc chắc Max của {resource}; sẽ kiểm tra lại, chưa kết thúc farm.')
                     return None
                 self.cache[key] = (capacity, time.monotonic())
                 values[resource] = capacity
+                if treasury is not None:
+                    treasury_read[resource] = treasury
+                    t_cache = getattr(self.village, '_hud_treasury_cache', None)
+                    if isinstance(t_cache, dict):
+                        t_cache[resource] = (treasury, time.monotonic())
                 scanned_new = True
-                log(f'[Kho] Dung lượng {resource}: {capacity:,}.')
+                self.last_tapped_hud = True
+                treas_note = f' | kho bạc: {treasury:,}' if treasury is not None else ''
+                log(f'[Kho] Dung lượng {resource}: {capacity:,}{treas_note}.')
             finally:
-                # A neutral point outside the HUD dismisses only the tooltip.
-                self.adb.tap(1000, 250, jitter=0, delay_after=.15)
+                self.adb.tap(1000, 250, jitter=0, delay_after=.12)
+                try:
+                    self.village._hud_tooltip_clean = True
+                except Exception:
+                    pass
         if scanned_new and has_account_store and callable(getattr(self.village, 'save_account_capacities', None)):
             self.village.save_account_capacities(values, acc_key=acc_key, source='popup_ocr')
         return values
-
 
 class FarmFinishController:
     def __init__(self, village):
@@ -144,12 +192,13 @@ class FarmFinishController:
         capacities = self.capacity_reader.read(resources, log)
         if capacities is None:
             self.ready_reads = 0
-            self.next_capacity_retry = 0
+            self.next_capacity_retry = time.monotonic() + 30
             self.status = 'Chưa đọc được Max kho; thử lại ở lượt kế tiếp.'
             return 'wait'
         self.capacities = capacities
-        # Read a fresh home frame after the tooltip has been dismissed.
-        fresh = self.village.adb.screencap()
+        # Read a fresh home frame only if a HUD tooltip was opened and dismissed.
+        tapped = getattr(self.capacity_reader, 'last_tapped_hud', True)
+        fresh = self.village.adb.screencap() if (tapped or screen is None) else screen
         if fresh is None or not self.village.is_in_main_village(fresh):
             self.ready_reads = 0
             return 'wait'

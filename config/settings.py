@@ -250,13 +250,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "loot_target_percent": 70,
     "loot_target_resource": "gold_elixir",
     "end_on_destruction": False,
+    "end_on_treasure_hunt": False,
     "destruction_target_percent": 50,
     "end_condition_mode": "any",
     "resource_attack_fallback": "perimeter",
     "auto_collect_treasury": False,
-    "treasury_star_bonus_enabled": True,
-    "treasury_war_rewards_enabled": True,
-    "treasury_check_interval_min": 30,
+    "treasury_check_interval_min": 180,
     "surrender_at_stars": 1,
 
     # Village automation
@@ -288,6 +287,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "building_upgrade_specific_target": "",
     "building_upgrade_wait_mode": "target_cost",  # 'target_cost', 'full_storage'
     "building_upgrade_use_menu_filter": True,
+    "building_upgrade_allow_supercharge": True,
     "building_upgrade_priority": "time_min",  # 'time_min', 'cost_min', 'cost_max', 'time_max', 'suggested', 'specific'
     "building_upgrade_resources": {
         "gold": True,
@@ -363,6 +363,10 @@ class BotSettings:
                     saved.pop("wall_verify_layout_editor", None)
                     saved.pop("wall_max_upgrades_per_cycle", None)
                     saved.pop("wall_upgrade_max_by_money", None)
+                    if ('treasury_star_bonus_enabled' in saved or 'treasury_war_rewards_enabled' in saved) and saved.get('treasury_check_interval_min') == 30:
+                        saved['treasury_check_interval_min'] = 180
+                    saved.pop('treasury_star_bonus_enabled', None)
+                    saved.pop('treasury_war_rewards_enabled', None)
                     self.data.update(saved)
             except Exception as e:
                 print(f"[Settings] Warning loading settings: {e}")

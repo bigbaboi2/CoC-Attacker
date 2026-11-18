@@ -80,12 +80,31 @@ class SuggestedUpgrader:
         settings = getattr(self.village, 'settings', None)
         return bool(settings and settings.get('auto_upgrade_buildings', False))
 
-    def is_candidate_allowed(self, candidate, custom_mode=False):
+    @staticmethod
+    def is_supercharge_row(screen, y) -> bool:
+        """Detect the cyan-blue lightning bolt badge shown under Supercharge rows."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        y1 = max(0, int(y) + 6)
+        y2 = min(900, int(y) + 40)
+        if y2 <= y1:
+            return False
+        patch = screen[y1:y2, 1243:1365]
+        if not patch.size:
+            return False
+        hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        blue = (hsv[:, :, 0] >= 85) & (hsv[:, :, 0] <= 118) & (hsv[:, :, 1] >= 120) & (hsv[:, :, 2] >= 130)
+        return int(blue.sum()) >= 18
+
+    _HEADER_KEYWORDS = ('suggest', 'filter', 'gợi ý', 'đã lọc', 'lọc')
+
+    def diagnose_row_rejection(self, candidate, custom_mode=False):
+        """Return rejection reason string if candidate is disallowed, else None."""
         name = candidate.get('name', '')
         key = self.normalized(name)
         allowed_names = self.custom_regular_names if custom_mode else self.base_regular_names
         if key not in allowed_names or key.startswith('wall'):
-            return False
+            return 'Ngoài danh mục hoặc là tường'
 
         settings = getattr(self.village, 'settings', None)
         ckey = self.canonical_key(name)
@@ -93,16 +112,21 @@ class SuggestedUpgrader:
         # 1. Town Hall Safety Lock: Strictly forbid Town Hall if lock is on
         lock_th = True if settings is None else bool(settings.get('lock_townhall_upgrade', True))
         if lock_th and (ckey in ('townhall', 'town_hall') or 'town hall' in name.lower() or 'nhà chính' in name.lower()):
-            return False
+            return 'Khóa an toàn Town Hall đang bật'
+
+        category = BUILDING_KEY_TO_CATEGORY.get(ckey)
+        if (settings is not None and not settings.get('building_upgrade_allow_supercharge', True)
+                and candidate.get('supercharge') and category != 'heroes'):
+            return 'Tắt nâng Supercharge (tia sét xanh)'
 
         if not custom_mode:
-            return True
+            return None
         if settings is None:
-            return True
+            return None
 
         whitelist = settings.get('building_upgrade_whitelist')
         if isinstance(whitelist, dict) and ckey in whitelist and not whitelist[ckey]:
-            return False
+            return f'Bị bỏ chọn trong danh sách chi tiết ({ckey})'
 
         # 2. Specific Target Upgrade Priority: Scan ONLY for that specific building!
         priority = settings.get('building_upgrade_priority', 'time_min')
@@ -113,22 +137,25 @@ class SuggestedUpgrader:
                 canon_target = BUILDING_KEY_ALIASES.get(canon_target, canon_target)
                 canon_cand = BUILDING_KEY_ALIASES.get(ckey, ckey)
                 if canon_cand != canon_target:
-                    return False
-                return True
+                    return f'Không khớp công trình cụ thể ({canon_target})'
+                return None
 
         allowed_res = settings.get('building_upgrade_resources') or {
             'gold': True, 'elixir': True, 'dark_elixir': True
         }
         resource = candidate.get('resource')
         if resource and not allowed_res.get(resource, True):
-            return False
+            return f'Tài nguyên {resource} đang tắt'
         category = BUILDING_KEY_TO_CATEGORY.get(ckey)
         categories_cfg = settings.get('building_upgrade_categories') or {
             'traps': True, 'resource': True, 'defense': True, 'army': True, 'heroes': True
         }
         if category and not categories_cfg.get(category, True):
-            return False
-        return True
+            return f"Nhóm công trình '{category}' đang tắt"
+        return None
+
+    def is_candidate_allowed(self, candidate, custom_mode=False):
+        return self.diagnose_row_rejection(candidate, custom_mode=custom_mode) is None
 
     @staticmethod
     def sort_candidates(candidates, priority='suggested'):
@@ -227,6 +254,13 @@ class SuggestedUpgrader:
         )
         return screen, verified
 
+    def _menu_header_shows_unfiltered(self, screen) -> bool:
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        words = self.words(screen, (1170, 50, 430, 755))
+        joined = ' '.join(t.lower() for t, _, _ in words)
+        return ('suggest' in joined or 'gợi ý' in joined) and 'filter' not in joined and 'đã lọc' not in joined
+
     def apply_menu_filter_if_needed(self):
         """Use fixed coordinates on the Builder Menu Filter popup when enabled."""
         settings = getattr(self.village, 'settings', None)
@@ -234,14 +268,6 @@ class SuggestedUpgrader:
             return True
         if not settings.get('building_upgrade_use_menu_filter', True):
             return True
-        pts = self.FIXED_FILTER_POINTS
-        self.check()
-        screen = self.adb.screencap()
-        if not self.is_filter_popup_open(screen):
-            self.adb.tap(*pts['button'], jitter=0, delay_after=0.6)
-            screen = self.adb.screencap()
-        if not self.is_filter_popup_open(screen):
-            return False
         res_cfg = settings.get('building_upgrade_resources') or {'gold': True, 'elixir': True, 'dark_elixir': True}
         allowed_resources = [key for key in ('gold', 'elixir', 'dark_elixir')
                              if res_cfg.get(key, True)]
@@ -257,24 +283,48 @@ class SuggestedUpgrader:
         # several resources are allowed, clear the game's filter and apply the
         # user's resource choices to each OCR candidate instead.
         selected_resource = allowed_resources[0] if len(allowed_resources) == 1 else None
+        log = getattr(self, '_active_log', None)
+        pts = self.FIXED_FILTER_POINTS
+        self.check()
+        screen = self.adb.screencap()
+        if (selected_resource is None and priority not in ('cost_max', 'cost_min')
+                and not self.is_filter_popup_open(screen)
+                and self._menu_header_shows_unfiltered(screen)):
+            if callable(log):
+                log('[Thợ] [Lọc] Menu đang ở chế độ gợi ý gốc (không lọc) -> giữ nguyên.')
+            return True
+        if callable(log):
+            log(f"[Thợ] [Lọc] Mở bộ lọc game: tài nguyên={selected_resource or 'tất cả'}, ưu tiên={priority}.")
+        if not self.is_filter_popup_open(screen):
+            self.adb.tap(*pts['button'], jitter=0, delay_after=0.35)
+            screen = self.adb.screencap()
+        if not self.is_filter_popup_open(screen):
+            if callable(log):
+                log('[Thợ] [Lọc] ❌ Không mở được popup bộ lọc menu thợ.')
+            return False
         screen, resource_verified = self.set_menu_resource_filter(screen, selected_resource)
         if not resource_verified:
+            if callable(log):
+                log('[Thợ] [Lọc] ❌ Không xác minh được nút tài nguyên trong popup bộ lọc.')
             return False
         if priority in ('cost_max', 'cost_min'):
             target_pt_key = 'sort_cost_max' if priority == 'cost_max' else 'sort_cost_min'
             active = self.is_filter_button_active(screen, pts[target_pt_key], sorting=True)
             if active is False:
-                self.adb.tap(*pts[target_pt_key], jitter=0, delay_after=0.3)
+                self.adb.tap(*pts[target_pt_key], jitter=0, delay_after=0.2)
                 screen = self.adb.screencap()
         else:
             for pt_key in ('sort_cost_max', 'sort_cost_min'):
                 active = self.is_filter_button_active(screen, pts[pt_key], sorting=True)
                 if active is True:
-                    self.adb.tap(*pts[pt_key], jitter=0, delay_after=0.3)
+                    self.adb.tap(*pts[pt_key], jitter=0, delay_after=0.2)
                     screen = self.adb.screencap()
         if self.is_filter_popup_open(screen):
-            self.adb.tap(*pts['button'], jitter=0, delay_after=0.35)
-        return not self.is_filter_popup_open(self.adb.screencap())
+            self.adb.tap(*pts['button'], jitter=0, delay_after=0.25)
+        closed = not self.is_filter_popup_open(self.adb.screencap())
+        if callable(log):
+            log(f"[Thợ] [Lọc] {'✅ Đã áp dụng & đóng popup bộ lọc' if closed else '❌ Chưa đóng được popup bộ lọc'}.")
+        return closed
 
     def reset_menu_filter(self):
         """Clear exclusive resource and cost filters to show all builder jobs."""
@@ -387,21 +437,27 @@ class SuggestedUpgrader:
             elixir=int(((hue >= 125) & (hue <= 175) & (sat > 110) & (val > 150)).sum()),
             gold=int(((hue >= 12) & (hue <= 38) & (sat > 120) & (val > 170)).sum()),
             dark_elixir=int(((hue >= 110) & (hue <= 175) & (sat > 25) & (val > 25) & (val < 135)).sum()))
-        # Bright elixir and gold are unambiguous; dark elixir requires purple.
-        for name in ('elixir', 'gold', 'dark_elixir'):
-            if counts[name] >= 12:
-                return name
-        return None
+        # Pick the dominant currency color so minor border/badge pixels (e.g. 12 gold vs 190 dark_elixir) never win.
+        best_name, best_count = max(counts.items(), key=lambda kv: kv[1])
+        return best_name if best_count >= 12 else None
 
-    def menu_candidates(self, screen, words, start=50, end=795, custom_mode=False):
+    def _parse_menu_rows(self, screen, words, start=50, end=795, custom_mode=False):
+        """Parse candidate rows and collect diagnostic details for rejected or incomplete rows."""
         candidates = []
+        diagnostics = []
         for text, x, y in words:
-            if not (1230 <= x <= 1460 and start+10 < y < end-20):
+            if not (1230 <= x <= 1460 and start + 10 < y < end - 20):
                 continue
             name = re.sub(r'\s*[xX×]\s*\d+\s*$', '', text).strip()
             key = self.normalized(name)
             allowed_names = self.custom_regular_names if custom_mode else self.base_regular_names
-            if key not in allowed_names or key.startswith('wall'):
+            if key not in allowed_names:
+                if key not in self.custom_regular_names:
+                    continue
+                diagnostics.append(dict(name=name, x=x, y=y, cost=0, resource=None, duration_sec=0,
+                                        supercharge=False, allowed=False, reject_reason='Ngoài danh mục Suggested mặc định'))
+                continue
+            if key.startswith('wall'):
                 continue
 
             # New construction has its own placement flow and must never be
@@ -413,12 +469,12 @@ class SuggestedUpgrader:
             # Duration parse (optional; never discard candidate if duration OCR fails)
             duration_sec = 0
             dur_candidates = [
-                token for token, tx, ty in words if tx > 1410 and abs(ty-y) <= 18
+                token for token, tx, ty in words if tx > 1410 and abs(ty - y) <= 18
             ]
             if dur_candidates:
                 combined_dur = ''.join(
                     token for token, tx, ty in sorted(
-                        [(t, tx, ty) for t, tx, ty in words if tx > 1410 and abs(ty-y) <= 18],
+                        [(t, tx, ty) for t, tx, ty in words if tx > 1410 and abs(ty - y) <= 18],
                         key=lambda item: item[1]
                     )
                 )
@@ -441,7 +497,7 @@ class SuggestedUpgrader:
             # Prices parse with OCR digit normalization (price row is ~23px below title, never 48px on next row)
             price_tokens = []
             for token, px, py in words:
-                if px > 1350 and y+10 <= py <= y+36:
+                if px > 1350 and y + 10 <= py <= y + 36:
                     if self.parse_duration(token, allow_unitless_seconds=False) is not None:
                         continue
                     norm_p = token.replace('O', '0').replace('o', '0').replace('l', '1').replace('I', '1').replace('i', '1')
@@ -451,28 +507,44 @@ class SuggestedUpgrader:
                     if digits:
                         price_tokens.append((px, py, digits))
             if not price_tokens:
+                diagnostics.append(dict(name=name, x=x, y=y, cost=0, resource=None, duration_sec=duration_sec,
+                                        supercharge=False, allowed=False, reject_reason='Không đọc được giá nâng cấp từ OCR'))
                 continue
 
             price_y = price_tokens[0][1]
             cost_str = ''.join(d for _, _, d in sorted(price_tokens, key=lambda p: p[0]))
             cost = int(cost_str) if cost_str.isdigit() else 0
             if cost <= 0:
+                diagnostics.append(dict(name=name, x=x, y=y, cost=0, resource=None, duration_sec=duration_sec,
+                                        supercharge=False, allowed=False, reject_reason='Giá đọc được không hợp lệ (<= 0)'))
                 continue
 
-            resource = self.currency(screen, (1560, max(0, price_y-16), 38, 34))
-            if resource:
-                row = dict(
-                    name=name,
-                    x=x,
-                    y=y,
-                    cost=cost,
-                    resource=resource,
-                    duration_sec=duration_sec,
-                    category=self.category_of(name),
-                )
-                if self.is_candidate_allowed(row, custom_mode=custom_mode):
-                    candidates.append(row)
-        return sorted(candidates, key=lambda row: row['y'])
+            resource = self.currency(screen, (1560, max(0, price_y - 16), 38, 34))
+            if not resource:
+                diagnostics.append(dict(name=name, x=x, y=y, cost=cost, resource=None, duration_sec=duration_sec,
+                                        supercharge=False, allowed=False,
+                                        reject_reason=f'Không nhận diện được icon tiền tệ ở (1560, {max(0, price_y - 16)})'))
+                continue
+
+            row = dict(
+                name=name,
+                x=x,
+                y=y,
+                cost=cost,
+                resource=resource,
+                duration_sec=duration_sec,
+                category=self.category_of(name),
+                supercharge=self.is_supercharge_row(screen, y),
+            )
+            reject_reason = self.diagnose_row_rejection(row, custom_mode=custom_mode)
+            diagnostics.append(dict(row, allowed=(reject_reason is None), reject_reason=reject_reason))
+            if reject_reason is None:
+                candidates.append(row)
+        return sorted(candidates, key=lambda row: row['y']), sorted(diagnostics, key=lambda row: row['y'])
+
+    def menu_candidates(self, screen, words, start=50, end=795, custom_mode=False):
+        candidates, _ = self._parse_menu_rows(screen, words, start=start, end=end, custom_mode=custom_mode)
+        return candidates
 
     def find_candidate(self, wallet, custom_mode=None):
         if custom_mode is None:
@@ -527,10 +599,10 @@ class SuggestedUpgrader:
             if not self.apply_menu_filter_if_needed():
                 return None, set(), 'Chưa xác minh được bộ lọc tài nguyên trong menu thợ.'
 
-        # Check if already at top (headers 'suggest' or 'filter' visible near top)
+        # Check if already at top (allow y < 430 when 1-6 ongoing builders occupy the top area)
         screen = self.adb.screencap()
         words = self.words(screen, (1170, 50, 430, 755))
-        top_headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter', 'gợi ý', 'đã lọc', 'lọc')) and y < 160]
+        top_headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS) and y < 430]
         if not top_headers:
             previous = None
             for _ in range(6):
@@ -538,7 +610,7 @@ class SuggestedUpgrader:
                 self.ui.scroll_menu('up', fast=True)
                 screen = self.adb.screencap()
                 words = self.words(screen, (1170, 50, 430, 755))
-                headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter', 'gợi ý', 'đã lọc', 'lọc')) and y < 160]
+                headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS) and y < 430]
                 signature = self.ui.menu_signature(words)
                 if headers or signature == previous:
                     break
@@ -546,7 +618,7 @@ class SuggestedUpgrader:
 
         # In cost_min, cost_max or suggested: the game menu filter already ordered items!
         # Check page 0 candidates first for instantaneous selection
-        headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter'))]
+        headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS)]
         start = min(headers) if headers else 45
         p0_rows = self.menu_candidates(screen, words, start=start, end=795, custom_mode=True)
 
@@ -642,7 +714,14 @@ class SuggestedUpgrader:
             f"(hiện có {wallet.get(best_res, 0):,}).",
         )
 
-    def _seek_candidate_row(self, target):
+    def _seek_candidate_row(self, target, start_page=None):
+        target_page = target.get('page')
+        if isinstance(start_page, int) and isinstance(target_page, int) and start_page != target_page:
+            steps = abs(start_page - target_page)
+            fast_dir = 'up' if start_page > target_page else 'down'
+            for _ in range(min(steps, 6)):
+                self.check()
+                self.ui.scroll_menu(fast_dir, fast=True)
         for direction in ('up', 'down'):
             previous = None
             for _ in range(14):
@@ -719,6 +798,10 @@ class SuggestedUpgrader:
             return None
         words = self.words(screen, (220, 20, 1230, 850))
         all_text = ' '.join(text for text, _, _ in words).lower()
+        settings = getattr(self.village, 'settings', None)
+        if settings is not None and not settings.get('building_upgrade_allow_supercharge', True):
+            if 'supercharge' in all_text or 'this supercharge will last' in all_text:
+                return None
         if re.search(r'\bgoblin builder\b|\bgems?\b|need more|buy resources|finish now', all_text):
             return None
         title = self.normalized(' '.join(text for text, _, y in words if y < 250))
@@ -873,32 +956,49 @@ class SuggestedUpgrader:
             return [], set(), msg
 
         if custom_mode and use_filter:
-            if not self.apply_menu_filter_if_needed():
+            self._active_log = log
+            try:
+                filter_ok = self.apply_menu_filter_if_needed()
+            finally:
+                self._active_log = None
+            if not filter_ok:
                 return [], set(), 'Chưa xác minh được bộ lọc tài nguyên trong menu thợ.'
 
         screen = self.adb.screencap()
         words = self.words(screen, (1170, 50, 430, 755))
-        top_headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter', 'gợi ý', 'đã lọc', 'lọc')) and y < 160]
-        if not top_headers:
+        top_headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS) and y < 430]
+        if top_headers:
+            if log:
+                log(f'[Thợ] Đã ở đầu danh sách (tiêu đề tại y={min(top_headers)}).')
+        else:
             previous = None
-            for _ in range(6):
+            for step_up in range(1, 7):
                 self.check()
+                if log:
+                    log(f'[Thợ] ⬆️ Chưa thấy tiêu đề đầu danh sách -> cuộn lên (lần {step_up}/6)...')
                 self.ui.scroll_menu('up', fast=True)
                 screen = self.adb.screencap()
                 words = self.words(screen, (1170, 50, 430, 755))
-                headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter', 'gợi ý', 'đã lọc', 'lọc')) and y < 160]
+                headers_up = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS) and y < 430]
                 signature = self.ui.menu_signature(words)
-                if headers or signature == previous:
+                if headers_up or signature == previous:
+                    if log:
+                        if headers_up:
+                            log(f'[Thợ] Đã thấy tiêu đề đầu danh sách tại y={min(headers_up)}.')
+                        else:
+                            log('[Thợ] ⏹ Đã chạm đỉnh menu (nội dung không đổi khi cuộn lên).')
                     break
                 previous = signature
 
         collected = []
         seen_keys = set()
-        headers = [y for text, _, y in words if any(k in text.lower() for k in ('suggest', 'filter'))]
+        headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS)]
         start = min(headers) if headers else 45
 
         # Scan active ongoing jobs appearing above headers (group by right-side timer so green progress bars hiding names never skip jobs)
         ongoing_jobs = self._extract_ongoing_jobs_from_words(screen, words, start) if start > 55 else []
+        if ongoing_jobs and log:
+            log('[Thợ] 🔨 Đang xây ở đầu menu: ' + ', '.join(f"{j['name']} ({j['duration_str']})" for j in ongoing_jobs))
         state = getattr(self.village, 'village_state', None)
         if state is not None and ongoing_jobs:
             state.set_ongoing_upgrades(ongoing_jobs)
@@ -907,48 +1007,89 @@ class SuggestedUpgrader:
             if callable(getattr(self.village, 'save_account_builder_timers', None)):
                 self.village.save_account_builder_timers(ongoing_jobs)
 
-        p0_rows = self.menu_candidates(screen, words, start=start, end=795, custom_mode=custom_mode)
+        def _log_page_scan(page_idx, page_screen, page_words, scan_start):
+            accepted, diag = self._parse_menu_rows(page_screen, page_words, start=scan_start, end=795, custom_mode=custom_mode)
+            if not accepted:
+                patched = self.menu_candidates(page_screen, page_words, start=scan_start, end=795, custom_mode=custom_mode)
+                if patched:
+                    accepted = patched
+            if log:
+                log(f'[Thợ] 📄 Trang {page_idx} (start_y={scan_start}): OCR nhận {len(diag)} dòng công trình ({len(accepted)} đạt điều kiện).')
+                for item in diag:
+                    sc = ' ⚡Supercharge' if item.get('supercharge') else ''
+                    if item.get('allowed'):
+                        log(f"   ✅ {item['name']} | {item['cost']:,} {item['resource']}{sc}")
+                    else:
+                        cost_txt = f"{item['cost']:,}" if item.get('cost') else '?'
+                        res_txt = item.get('resource') or '?'
+                        log(f"   🚫 {item['name']} | {cost_txt} {res_txt}{sc} -> Loại: {item.get('reject_reason')}")
+                if not diag:
+                    raw_tokens = [f'{t}@{py}' for t, _px, py in page_words if py >= scan_start]
+                    log(f"   [OCR thô trang {page_idx}]: {', '.join(raw_tokens[:16]) or '(trống)'}")
+            return accepted
+
+        def _body_sig(page_words, scan_start):
+            body = [w for w in page_words if w[2] >= scan_start]
+            return self.ui.menu_signature(body if body else page_words)
+
+        p0_rows = _log_page_scan(0, screen, words, start)
         for r in p0_rows:
             dedup = (self.canonical_key(r['name']), r['cost'], r['resource'])
             if dedup not in seen_keys:
                 seen_keys.add(dedup)
                 collected.append(dict(r, page=0))
 
+        current_page = 0
         need_more = len(collected) < needed_builders or priority not in ('suggested', 'cost_min', 'cost_max')
         if need_more and priority != 'specific':
-            prev_sig = self.ui.menu_signature(words)
+            prev_sig = _body_sig(words, start)
             for page in range(1, 4):
                 self.check()
+                if log:
+                    log(f'[Thợ] ⬇️ Cuộn xuống trang {page}/3 để quét thêm công trình...')
                 self.ui.scroll_menu('down', fast=True)
+                current_page = page
                 screen = self.adb.screencap()
                 words = self.words(screen, (1170, 50, 430, 755))
-                rows = self.menu_candidates(screen, words, start=45, end=795, custom_mode=custom_mode)
+                page_headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS)]
+                page_start = min(page_headers) if page_headers else 45
+                rows = _log_page_scan(page, screen, words, page_start)
                 for r in rows:
                     dedup = (self.canonical_key(r['name']), r['cost'], r['resource'])
                     if dedup not in seen_keys:
                         seen_keys.add(dedup)
                         collected.append(dict(r, page=page))
-                sig = self.ui.menu_signature(words)
+                sig = _body_sig(words, page_start)
                 if sig == prev_sig or len(collected) >= needed_builders * 2:
+                    if log and sig == prev_sig:
+                        log('[Thợ] ⏹ Danh sách không thay đổi sau khi cuộn xuống -> dừng quét.')
                     break
                 prev_sig = sig
         elif priority == 'specific' and not collected:
-            prev_sig = self.ui.menu_signature(words)
+            prev_sig = _body_sig(words, start)
             for page in range(1, 5):
                 self.check()
+                if log:
+                    log(f"[Thợ] ⬇️ Cuộn xuống trang {page}/4 tìm công trình cụ thể...")
                 self.ui.scroll_menu('down', fast=True)
+                current_page = page
                 screen = self.adb.screencap()
                 words = self.words(screen, (1170, 50, 430, 755))
-                rows = self.menu_candidates(screen, words, start=45, end=795, custom_mode=custom_mode)
+                page_headers = [y for text, _, y in words if any(k in text.lower() for k in self._HEADER_KEYWORDS)]
+                page_start = min(page_headers) if page_headers else 45
+                rows = _log_page_scan(page, screen, words, page_start)
                 for r in rows:
                     dedup = (self.canonical_key(r['name']), r['cost'], r['resource'])
                     if dedup not in seen_keys:
                         seen_keys.add(dedup)
                         collected.append(dict(r, page=page))
-                sig = self.ui.menu_signature(words)
+                sig = _body_sig(words, page_start)
                 if sig == prev_sig or collected:
+                    if log and sig == prev_sig:
+                        log('[Thợ] ⏹ Danh sách không thay đổi sau khi cuộn xuống -> dừng quét.')
                     break
                 prev_sig = sig
+        self._last_menu_page = current_page
 
         if not collected:
             if custom_mode and priority == 'specific':
@@ -1065,29 +1206,44 @@ class SuggestedUpgrader:
             return dict(status='done', reason='Không có công trình nào trong kế hoạch.')
 
         verified = 0
+        self._step_verified = 0
+        start_page = getattr(self, '_last_menu_page', None)
+        hard_cap = getattr(self, '_step_started_at', time.monotonic()) + 180
         for index, item in enumerate(ready_items):
-            result = self._execute_builder_candidate(item['candidate'], before,
-                                                     builders_before, log)
+            if getattr(self, 'deadline', 0) > 0:
+                self.deadline = min(hard_cap, max(self.deadline, time.monotonic() + 45))
+            result = self._execute_builder_candidate(
+                item['candidate'], before, builders_before, log,
+                start_page=start_page if index == 0 else 0,
+            )
             if result['status'] != 'progress':
                 if result['status'] == 'uncertain' or verified == 0:
                     return result
                 return dict(status='progress', count=verified,
                             reason=f'Đã xác minh {verified} công trình; dừng để lập lại kế hoạch: {result["reason"]}')
             verified += 1
+            self._step_verified = verified
+            if log:
+                log(f'[Thợ] ✅ {result["reason"]}')
             if index == len(ready_items) - 1:
                 break
-            # A second purchase uses live balances and builders, never the
-            # virtual wallet from the original multi-builder plan.
-            home = self.adb.screencap()
-            if not self.village.is_in_main_village(home):
-                self.close_menu(home)
+            # Reuse the already-verified home snapshot when available.
+            snap = getattr(self, '_last_verified_home', None)
+            if isinstance(snap, tuple) and len(snap) == 3 and snap[2] == builders_before - 1:
+                home, partial_reading, builders_before = snap
+                before = self.vision.read_village_resources(home) if callable(getattr(self.vision, 'read_village_resources', None)) else partial_reading
+            else:
                 home = self.adb.screencap()
-            if not self.village.is_in_main_village(home):
-                if log:
-                    log('[Thợ] Đã xác minh một nâng cấp; chưa trở lại làng để kiểm tra thợ tiếp theo.')
-                break
-            before = self.vision.read_village_resources(home)
-            builders_before = self.observe_home_builders(home)
+                if not self.village.is_in_main_village(home):
+                    self.close_menu(home)
+                    home = self.adb.screencap()
+                if not self.village.is_in_main_village(home):
+                    if log:
+                        log('[Thợ] Đã xác minh một nâng cấp; chưa trở lại làng để kiểm tra thợ tiếp theo.')
+                    break
+                before = self.vision.read_village_resources(home)
+                builders_before = self.observe_home_builders(home)
+            self._last_verified_home = None
             if builders_before is None or not self.ui.ensure_menu_open():
                 if log:
                     log('[Thợ] Đã xác minh một nâng cấp; chưa mở lại được menu thợ cho công trình tiếp theo.')
@@ -1095,21 +1251,42 @@ class SuggestedUpgrader:
         return dict(status='progress', count=verified,
                     reason=f'Đã xác minh khởi công {verified} công trình; còn lại sẽ lập kế hoạch từ số dư mới.')
 
-    def _execute_builder_candidate(self, cand, before, builders_before, log):
+    def _confirm_stable_on_second_frame(self, frame1, confirm, cand) -> bool:
+        time.sleep(0.08)
+        frame2 = self.adb.screencap()
+        if (isinstance(frame1, np.ndarray) and isinstance(frame2, np.ndarray)
+                and frame1.shape == frame2.shape == (900, 1600, 3)):
+            cx, cy = confirm
+            p1 = frame1[max(0, cy-45):min(900, cy+45), max(0, cx-120):min(1600, cx+120)]
+            p2 = frame2[max(0, cy-45):min(900, cy+45), max(0, cx-120):min(1600, cx+120)]
+            if p1.size and float(np.mean(np.abs(p1.astype(np.int16) - p2.astype(np.int16)))) < 4.0:
+                return True
+        return self.confirmation(frame2, cand) == confirm
+
+    def _execute_builder_candidate(self, cand, before, builders_before, log, start_page=None):
         resource = cand['resource']
         if (type(builders_before) is not int or not isinstance(before, dict)
                 or before.get('valid', {}).get(resource) is not True
                 or before.get(resource, 0) < cand['cost']):
             return dict(status='blocked', reason='Chưa xác minh số thợ và tài nguyên trước khi nâng.')
 
-        sought = self._seek_candidate_row(cand)
+        sought = self._seek_candidate_row(cand, start_page=start_page)
         if sought is None:
             return dict(status='blocked', reason=f'Không còn thấy hàng {cand["name"]} đúng giá; chưa bấm nâng.')
-        # The list can move while scrolling. Require the same row on a fresh
-        # frame immediately before touching it; never reuse the planned y.
+        # Verify the row on a fresh frame using only the narrow strip around sought['y'].
         live = self.adb.screencap()
-        rows = self.menu_candidates(live, self.words(live, (1170, 50, 430, 755)),
-                                    start=45, end=795, custom_mode=True)
+        strip_top = max(50, int(sought['y']) - 28)
+        strip_h = min(805 - strip_top, 90)
+        rows = self.menu_candidates(
+            live,
+            self.words(live, (1170, strip_top, 430, strip_h)),
+            start=strip_top - 15,
+            end=strip_top + strip_h,
+            custom_mode=True,
+        )
+        if not rows:
+            rows = self.menu_candidates(live, self.words(live, (1170, 50, 430, 755)),
+                                        start=45, end=795, custom_mode=True)
         row = next((r for r in rows
                     if self.canonical_key(r['name']) == self.canonical_key(cand['name'])
                     and r['cost'] == cand['cost'] and r['resource'] == resource
@@ -1118,8 +1295,9 @@ class SuggestedUpgrader:
             return dict(status='blocked', reason=f'Hàng {cand["name"]} đã dịch chuyển; chưa bấm nâng.')
 
         self.adb.tap(1380, row['y'] + 15, jitter=0, delay_after=0.4)
-        confirm = self.confirmation(self.adb.screencap(), cand)
-        if confirm is None or self.confirmation(self.adb.screencap(), cand) != confirm:
+        frame1 = self.adb.screencap()
+        confirm = self.confirmation(frame1, cand)
+        if confirm is None or not self._confirm_stable_on_second_frame(frame1, confirm, cand):
             return dict(status='blocked', reason=f'Chưa thấy Confirm đúng giá của {cand["name"]}; chưa bấm nâng.')
 
         self.pending = dict(cand, before=before[resource], builders_before=builders_before,
@@ -1127,8 +1305,8 @@ class SuggestedUpgrader:
                             started_at=time.monotonic())
         if log:
             log(f'[Thợ] Đã bấm Confirm {cand["name"]} ({cand["cost"]:,} {resource}); đang xác minh giao dịch.')
-        self.adb.tap(*confirm, jitter=0, delay_after=0.6)
-        for _ in range(8):
+        self.adb.tap(*confirm, jitter=0, delay_after=0.7)
+        for _ in range(10):
             self.check()
             frame = self.adb.screencap()
             if self.village.is_in_main_village(frame):
@@ -1142,7 +1320,7 @@ class SuggestedUpgrader:
             else:
                 close_btn = self.upgrade_close_button(frame)
                 if close_btn:
-                    self.adb.tap(*close_btn[:2], jitter=0, delay_after=0.3)
+                    self.adb.tap(*close_btn[:2], jitter=0, delay_after=0.25)
                 else:
                     self.close_menu(frame)
             time.sleep(0.25)
@@ -1180,6 +1358,9 @@ class SuggestedUpgrader:
                 isinstance(builders_before, int) and resource):
             return dict(status='uncertain', reason='Thiếu mốc xác minh giao dịch; không bấm nâng lặp.')
         matches = 0
+        last_frame = None
+        last_reading = None
+        read_single = getattr(self.vision, 'read_single_resource', None)
         for _ in range(2):
             frame = screen if screen is not None else self.adb.screencap()
             screen = None
@@ -1187,14 +1368,19 @@ class SuggestedUpgrader:
                 break
             builders = free if free is not None else self.observe_home_builders(frame)
             free = None
-            reading = self.vision.read_village_resources(frame)
-            if (builders == builders_before - 1 and
-                    reading.get('valid', {}).get(resource) is True and
+            if builders != builders_before - 1:
+                break
+            reading = read_single(frame, resource) if callable(read_single) else self.vision.read_village_resources(frame)
+            if (reading.get('valid', {}).get(resource) is True and
                     before - reading[resource] == cost):
                 matches += 1
+                last_frame = frame
+                last_reading = reading
             else:
                 break
         if matches == 2:
+            if last_frame is not None:
+                self._last_verified_home = (last_frame, last_reading, builders_before - 1)
             self.assignments.append(dict(pending, builders_after=builders_before - 1))
             self.pending = None
             self.target_candidate = None
@@ -1205,7 +1391,11 @@ class SuggestedUpgrader:
             'không bấm nâng lần nữa.'))
 
     def step(self, log, *, maintain_reserve=False, custom_mode=None, preopened=None):
-        self.deadline = time.monotonic()+60
+        now = time.monotonic()
+        self._step_started_at = now
+        self._step_verified = 0
+        self._last_verified_home = None
+        self.deadline = now + 90
         try:
             return self._timed_step(log, maintain_reserve=maintain_reserve,
                                     custom_mode=custom_mode, preopened=preopened)
@@ -1223,8 +1413,16 @@ class SuggestedUpgrader:
         except BotStoppedError:
             raise
         except Exception as exc:
-            result = dict(status='uncertain' if self.pending else 'blocked',
-                          reason=f'Chưa hoàn tất phân công thợ ({exc}).')
+            verified = getattr(self, '_step_verified', 0)
+            if verified > 0 and self.pending is None:
+                result = dict(
+                    status='progress',
+                    count=verified,
+                    reason=f'Đã xác minh khởi công {verified} công trình trước khi hết thời gian kiểm tra tiếp ({exc}).',
+                )
+            else:
+                result = dict(status='uncertain' if self.pending else 'blocked',
+                              reason=f'Chưa hoàn tất phân công thợ ({exc}).')
         self.last_status = result.get('reason', self.last_status)
         if self.opened_menu and result['status'] != 'progress':
             # A direct upgrade can leave both its dialog and the builder menu.
@@ -1286,6 +1484,9 @@ class SuggestedUpgrader:
             return dict(status='done', reason=f'Đã xác nhận {first} thợ thường rảnh; mức duy trì {target()}.')
 
         needed_builders = first - target()
+        if self.deadline > 0 and needed_builders > 1:
+            hard_cap = getattr(self, '_step_started_at', time.monotonic()) + 180
+            self.deadline = min(hard_cap, max(self.deadline, time.monotonic() + 45 * needed_builders))
         if custom_mode:
             plan, needed, reason = self.plan_multi_builders(wallet, needed_builders=needed_builders, log=log, custom_mode=True)
             if not plan:

@@ -48,6 +48,8 @@ class VillageManager:
         self._treasury_next_check = 0.0
         self._treasury_collector = None
         self._apprentice = None
+        self._hud_treasury_cache = {}
+        self._hud_tooltip_clean = False
         self.wall_status = 'Chưa kiểm tra nâng tường.'
         self.wall_result = dict(status='not_checked', reason=self.wall_status)
         self._wall_builder_retry_at = 0.0
@@ -74,6 +76,14 @@ class VillageManager:
                     self.verified_maxed_accounts = saved.get('verified_maxed_accounts', {})
                     if isinstance(saved.get('account_capacities'), dict):
                         self.account_capacities = saved['account_capacities']
+                        for acc_entry in self.account_capacities.values():
+                            if isinstance(acc_entry, dict):
+                                g, e = acc_entry.get('gold'), acc_entry.get('elixir')
+                                if type(g) is int and type(e) is int:
+                                    if g >= 1_000_000 and e < 100_000:
+                                        acc_entry.pop('elixir', None)
+                                    elif e >= 1_000_000 and g < 100_000:
+                                        acc_entry.pop('gold', None)
                     if isinstance(saved.get('account_builder_timers'), dict):
                         self.account_builder_timers = saved['account_builder_timers']
                     curr_acc = saved.get('current_account')
@@ -140,6 +150,20 @@ class VillageManager:
                 return th_lvl
         return None
 
+    def _is_plausible_capacity(self, resource: str, value: int, context: Optional[Dict] = None) -> bool:
+        if type(value) is not int or value <= 0:
+            return False
+        if resource in ('gold', 'elixir') and value < 100_000:
+            sibling = 'elixir' if resource == 'gold' else 'gold'
+            sib_val = (context or {}).get(sibling)
+            if type(sib_val) is int and sib_val >= 1_000_000:
+                return False
+            v_state = getattr(self, 'village_state', None)
+            cur = getattr(v_state, 'resources', {}).get(resource, 0) if v_state is not None else 0
+            if isinstance(cur, int) and cur >= 500_000:
+                return False
+        return True
+
     def get_account_capacities(self, resources, acc_key: Optional[str] = None) -> Optional[Dict[str, int]]:
         """Use measured storage values bound to the current session identity."""
         key = acc_key or self.current_account_key
@@ -147,7 +171,7 @@ class VillageManager:
             return None
         saved = self.account_capacities.get(key)
         if (isinstance(saved, dict) and saved.get('source') == 'popup_ocr'
-                and all(type(saved.get(r)) is int and saved[r] > 0 for r in resources)):
+                and all(self._is_plausible_capacity(r, saved.get(r), saved) for r in resources)):
             return {r: saved[r] for r in resources}
         return None
 
@@ -159,9 +183,14 @@ class VillageManager:
         if not isinstance(values, dict) or source != 'popup_ocr':
             return
         entry = dict(self.account_capacities.get(key) or {})
+        merged = {**entry, **values}
+        added = False
         for resource, value in values.items():
-            if resource in ('gold', 'elixir', 'dark_elixir') and type(value) is int and value > 0:
+            if resource in ('gold', 'elixir', 'dark_elixir') and self._is_plausible_capacity(resource, value, merged):
                 entry[resource] = value
+                added = True
+        if not added:
+            return
         entry.update(source=source, updated_at=time.time())
         self.account_capacities[key] = entry
         self.set_wall_wait(self._wall_builder_retry_at, self.wall_status)
@@ -434,6 +463,7 @@ class VillageManager:
                 v_state.set_account(key)
             return
         self.current_account_key = key
+        self._hud_treasury_cache = {}
         self.walls_confirmed_maxed = bool(self.verified_maxed_accounts.get(key))
         self._lowest_wall_target = None
         self._wall_builder_retry_at = 0
@@ -669,38 +699,40 @@ class VillageManager:
             return False
         return False
 
+    def _claim_treasure_chest_reward(self, screen: np.ndarray) -> bool:
+        finder = getattr(self.vision, 'find_treasure_chest_reward_button', None)
+        btn = finder(screen) if callable(finder) else None
+        if btn is None:
+            if not self.vision.is_treasure_chest_reward(screen):
+                return False
+            btn = (790, 775)
+        self.adb.tap(btn[0], btn[1], jitter=0, delay_after=0.6)
+        self._treasure_chest_pending = False
+        self._treasure_chest_claimed = True
+        return True
+
     def open_treasure_chest_if_present(self, screen: np.ndarray, log_callback=None) -> bool:
-        """Open a recognized event chest, stopping as soon as its reward appears."""
+        """Open a recognized event chest with 5 continuous taps before OCR/reward verification."""
+        if getattr(self, '_treasure_chest_pending', False) and self._claim_treasure_chest_reward(screen):
+            if log_callback:
+                log_callback('[Sự kiện] Đã mở hòm và nhận phần thưởng.')
+            return True
         if not self.vision.is_treasure_chest_tap_screen(screen):
             return False
+        self._treasure_chest_pending = True
         if log_callback:
-            log_callback('[Sự kiện] Phát hiện hòm; đang chạm để mở.')
-        frame = screen
-        for hit in range(5):
-            for _ in range(8):
-                if self.vision.is_treasure_chest_tap_screen(frame):
-                    self.adb.tap(800, 450, jitter=0, delay_after=0.3)
-                    frame = self.adb.screencap()
-                    break
-                if self.vision.is_treasure_chest_reward(frame):
-                    self.adb.tap(800, 815, jitter=0, delay_after=0.6)
-                    if log_callback:
-                        log_callback(f'[Sự kiện] Hòm đã mở sau {hit} lần chạm.')
-                    return True
-                time.sleep(0.25)
-                frame = self.adb.screencap()
-            else:
-                if log_callback:
-                    log_callback('[Sự kiện] Chưa thấy tiến độ hòm; sẽ kiểm tra lại ở lượt sau.')
-                return True
+            log_callback('[Sự kiện] Phát hiện hòm; đang chạm liên tục 5 lần để mở.')
+        for _ in range(5):
+            self.adb.tap(800, 450, jitter=0, delay_after=0.08)
         for _ in range(12):
-            if self.vision.is_treasure_chest_reward(frame):
-                self.adb.tap(800, 815, jitter=0, delay_after=0.6)
+            frame = self.adb.screencap()
+            if self._claim_treasure_chest_reward(frame):
                 if log_callback:
                     log_callback('[Sự kiện] Đã mở hòm và nhận phần thưởng.')
                 return True
-            time.sleep(0.25)
-            frame = self.adb.screencap()
+            if self.vision.is_treasure_chest_tap_screen(frame):
+                self.adb.tap(800, 450, jitter=0, delay_after=0.08)
+            time.sleep(0.1)
         if log_callback:
             log_callback('[Sự kiện] Đã chạm hòm 5 lần; chờ màn hình phần thưởng ở lượt sau.')
         return True
@@ -986,43 +1018,45 @@ class VillageManager:
         """
         now = time.time()
         if not force and now - self.last_train_time < 45:
-            return
+            return False
 
         # 1. Open Train Army
-        self.adb.tap(85, 740, delay_after=0.7)
+        self.adb.tap(85, 740, delay_after=0.45)
 
         # 2. Tap 'Quick Train' tab
-        self.adb.tap(1050, 110, delay_after=0.6)
+        self.adb.tap(1050, 110, delay_after=0.4)
 
         # 3. Tap 'Train' for Slot 1 or chosen slot
         slot = self.settings.get("quick_train_slot", 1)
         slot_y = 310 if slot == 1 else (480 if slot == 2 else 650)
-        self.adb.tap(1320, slot_y, delay_after=0.5)
+        self.adb.tap(1320, slot_y, delay_after=0.35)
 
         # 4. Close Training Menu (1542, 80 in 1600x900)
-        self.adb.tap(1542, 80, delay_after=0.6)
+        self.adb.tap(1542, 80, delay_after=0.45)
         fresh = self.adb.screencap()
         if fresh is not None and self.vision.has_open_dialog(fresh):
             close = self.vision.find_close_button(fresh)
             if close:
-                self.adb.tap(close[0], close[1], delay_after=0.5)
+                self.adb.tap(close[0], close[1], delay_after=0.4)
 
         self.last_train_time = now
         self.deselect_all()
+        return True
 
     def request_clan_troops(self):
         """Request clan castle reinforcements if enabled."""
         if not self.settings.get("auto_request_troops", False):
-            return
+            return False
         # Open Clan Chat tab on the left: (20, 450)
-        self.adb.tap(20, 450, delay_after=0.7)
+        self.adb.tap(20, 450, delay_after=0.45)
         # Tap Request button in clan chat: (250, 820)
-        self.adb.tap(250, 820, delay_after=0.5)
+        self.adb.tap(250, 820, delay_after=0.35)
         # Tap Send Request: (1080, 720)
-        self.adb.tap(1080, 720, delay_after=0.5)
+        self.adb.tap(1080, 720, delay_after=0.35)
         # Close chat drawer: tap arrow at (490, 450)
-        self.adb.tap(490, 450, delay_after=0.4)
+        self.adb.tap(490, 450, delay_after=0.3)
         self.deselect_all()
+        return True
 
     def upgrade_walls(self, screen, current_gold, current_elixir, log_callback=None):
         from bot.walls import WallUpgrader

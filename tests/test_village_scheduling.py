@@ -349,4 +349,65 @@ class VillageSchedulingTests(unittest.TestCase):
         engine._sleep_wait_for_builders.assert_called_once_with(3600)
         self.assertFalse(controller.completed)
 
+    def test_farm_finish_gate_runs_target_cost_builders_before_storage_is_full(self):
+        controller = SimpleNamespace(
+            completed=False, ready_reads=0, status='gold: 18M/31M | elixir: 30.7M/31M',
+            missing={'gold'}, extra_resources=set(),
+            observe_home=Mock(return_value='farm'))
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'farm_finish_enabled': True, 'auto_upgrade_buildings': True,
+                           'building_upgrade_wait_mode': 'target_cost', 'maintenance_interval_sec': 45}
+        engine.farm_finish = controller
+        engine.village = SimpleNamespace(player_tag_failures=0, wall_status='',
+                                         is_in_main_village=Mock(return_value=True))
+        engine.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        engine.battle = SimpleNamespace(farm_needed_resources=set())
+        engine.last_village_maintenance = 0
+        engine._builders_need_assignment = False
+        engine.log = Mock()
+        engine.set_state = Mock()
+        engine._maintain_free_builders = Mock(return_value=True)
+
+        self.assertTrue(engine._farm_finish_gate(object()))
+        engine._maintain_free_builders.assert_called_once()
+        engine.set_state.assert_not_called()
+
+    def test_farm_finish_gate_does_not_set_complete_state_while_waiting(self):
+        controller = SimpleNamespace(
+            completed=False, ready_reads=0, status='Chưa đọc được Max kho',
+            missing=set(), extra_resources=set(),
+            observe_home=Mock(return_value='wait'))
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'farm_finish_enabled': True, 'auto_upgrade_buildings': True,
+                           'building_upgrade_wait_mode': 'target_cost', 'maintenance_interval_sec': 45}
+        engine.farm_finish = controller
+        engine.village = SimpleNamespace(player_tag_failures=0, wall_status='',
+                                         is_in_main_village=Mock(return_value=True))
+        engine.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        engine.battle = SimpleNamespace(farm_needed_resources=set())
+        engine.last_village_maintenance = 0
+        engine._builders_need_assignment = False
+        engine.log = Mock()
+        engine.set_state = Mock()
+        engine._maintain_free_builders = Mock(return_value=False)
+
+        self.assertTrue(engine._farm_finish_gate(object()))
+        engine.set_state.assert_not_called()
+        engine._maintain_free_builders.assert_called_once()
+
+    def test_run_loop_uses_current_state_for_loop_sleep(self):
+        engine = BotEngine.__new__(BotEngine)
+        engine.log = Mock()
+        engine._open_game_if_needed = Mock()
+        engine._is_current_worker = Mock(side_effect=[True, True, False])
+        engine.is_paused = False
+        engine.adb = SimpleNamespace(device_unavailable=False)
+        engine.current_state = BotEngine.STATE_VILLAGE
+        engine._iteration = Mock()
+        engine._action_outcome = Mock()
+        engine._publish_stats = Mock()
+        with patch('bot.bot_engine.time.sleep') as sleep_mock:
+            engine._run_loop()
+        sleep_mock.assert_any_call(0.25)
+
 if __name__ == '__main__': unittest.main()

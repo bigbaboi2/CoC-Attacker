@@ -59,6 +59,9 @@ class CombatExecutor:
         self._next_surrender_arm_check_at = 0
         self._speedup_used = False
         self._next_speed_check_at = 0
+        self.treasure_hunt_active = False
+        self._treasure_found = False
+        self._treasure_icon_streak = 0
 
     def save_ultra_trace(self):
         if self._ultra_trace is not None:
@@ -226,11 +229,13 @@ class CombatExecutor:
                 self._log(f'[Loot] Chưa xác minh mốc {key} trước thả; không cộng loot/RPH từ số OCR chưa rõ.')
 
     def _result(self,stars,completed,surrendered=False,reason=''):
+        treasure_found = self._treasure_found
         if self._ultra_active and self._ultra_trace is not None:
             self._ultra_trace.update(completed=completed,reason=reason,time_to_50_ms=self._time_to_50_ms)
             self.save_ultra_trace()
         if completed or reason in ('not_scouting','unrecognized_deck_or_boundary'):
             self._active_fight=False
+            self.treasure_hunt_active=False
             self._speedup_used=False
             self._next_speed_check_at=0
             self._surrender_armed=False
@@ -240,6 +245,7 @@ class CombatExecutor:
                 self.village_state.clear_battle('main')
         return dict(stars=stars,duration=max(0,time.monotonic()-self.battle_start_time),completed=completed,
                     surrendered=surrendered,reason=reason,loot_gained=dict(self._loot_gained),
+                    treasure_found=treasure_found,
                     destruction_percent=self._last_destruction,loot_percent=self._last_loot_percent,
                     time_to_50_ms=self._time_to_50_ms if self._timing_valid else 0)
 
@@ -300,6 +306,8 @@ class CombatExecutor:
         settings = getattr(self, 'settings', None)
         prearm_enabled = settings.get('prearm_surrender', False) if settings else True
         if (not prearm_enabled or self._surrender_armed or self._deployment_pending or not policy.enabled
+                or (getattr(self, 'treasure_hunt_active', False)
+                    and not getattr(self, '_treasure_found', False))
                 or not (policy.stars_enabled or policy.time_enabled
                         or policy.loot_enabled or policy.destruction_enabled)):
             return
@@ -330,6 +338,16 @@ class CombatExecutor:
                 return
             time.sleep(.15)
         self._surrender_empty_checks=0
+
+    def _treasure_end_ready(self, screen, log):
+        if not self.treasure_hunt_active or self._treasure_found:
+            return True
+        self._treasure_icon_streak = (self._treasure_icon_streak + 1
+            if self.vision.has_treasure_hunt_chest_icon(screen) else 0)
+        if self._treasure_icon_streak >= 2:
+            self._treasure_found = True
+            log('[Treasure Hunt] Đã xác nhận biểu tượng hòm cạnh Overall Damage.')
+        return self._treasure_found
 
     def _cast_pending_spells(self, screen=None, force=False):
         now=time.monotonic()
@@ -450,7 +468,7 @@ class CombatExecutor:
         policy=self._end_policy or BattleEndPolicy.from_settings(self.settings)
         self._end_policy=policy
         deadline=self.battle_start_time+policy.time_limit
-        if not (policy.enabled and policy.time_enabled):
+        if self.treasure_hunt_active or not (policy.enabled and policy.time_enabled):
             deadline=max(self.battle_start_time+240,time.monotonic()+30)
         stars=0;last_report=-1;last_loot=-5;last_destruction=-5
         if self.village_state is not None:
@@ -477,6 +495,7 @@ class CombatExecutor:
                     log('[Combat] Hộp thoại Surrender đã đóng; tiếp tục theo dõi trận.')
             if not self._surrender_armed:
                 self._enable_final_minute_speedup(screen, log)
+            treasure_ready = self._treasure_end_ready(screen, log)
             stars=max(stars,self._stars(screen))
             if self.village_state is not None:
                 self.village_state.update_battle('main', stars)
@@ -504,6 +523,8 @@ class CombatExecutor:
                 last_destruction=now
             target=policy.stars_target
             reason=policy.reason(stars,now-self.battle_start_time)
+            if not treasure_ready:
+                reason = None
             if reason:
                 labels={'star_target':f'đạt {policy.eligible_stars(stars)}/{target} sao theo nguồn đã chọn (tổng {stars}; nhà chính: {"đã xác minh" if policy.town_hall_destroyed else "chưa xác minh"})',
                         'loot_target':f'đạt {policy.loot_target}% tài nguyên đã chọn',
@@ -528,7 +549,7 @@ class CombatExecutor:
                     details += f' | Phá hủy {self._last_destruction if self._last_destruction is not None else "—"}/{policy.destruction_target}%'
                 log(details)
             self._wait(.35 if self._ultra_active else .6)
-        if policy.enabled and policy.time_enabled:
+        if policy.enabled and policy.time_enabled and (not self.treasure_hunt_active or self._treasure_found):
             done=self._surrender_and_exit(log)
             return self._result(stars,done,done,'timeout')
         log('[Combat] Hết khoảng theo dõi; tiếp tục chờ kết quả ở vòng sau theo cài đặt không tự rút quân.')
@@ -538,6 +559,7 @@ class CombatExecutor:
         self._log=log_callback or (lambda message:None)
         if self.settings.get('attack_strategy') == FixedAttackPlan.KEY:
             if not self._active_fight:
+                self._treasure_found=False;self._treasure_icon_streak=0
                 self.battle_start_time = time.monotonic()
                 self._active_fight = True
                 self._deployment_pending = False
@@ -585,6 +607,7 @@ class CombatExecutor:
             self.battle_start_time=time.monotonic()
             self.hero_actions=[];self._loot_initial=None;self._loot_gained={}
             self._end_policy=BattleEndPolicy.from_settings(self.settings)
+            self._treasure_found=False;self._treasure_icon_streak=0
             if self.settings.get('attack_strategy','perimeter')=='ultra_fast':
                 self._ultra_active=True;self._ultra_skill_slots=[];self._ultra_skill_repeats=3
                 self._end_policy=self.ultra_policy()
@@ -962,6 +985,7 @@ class CombatExecutor:
         self._troop_points_by_name={}
         self._opening_support_sent=False;self._prepared_spell_targets={}
         self._end_policy=BattleEndPolicy.from_settings(self.settings)
+        self._treasure_found=False;self._treasure_icon_streak=0
         self._last_destruction=None;self._last_loot_percent=None
         if self.settings.get('attack_strategy') == FixedAttackPlan.KEY:
             profile = FixedAttackPlan.load(self.settings, self._fixed_serial())

@@ -4,6 +4,7 @@ import numpy as np
 import threading
 import hashlib
 import re
+from pathlib import Path
 from collections import OrderedDict
 from typing import Optional, Tuple, List, Dict, Union, Any
 
@@ -53,6 +54,7 @@ class VisionEngine:
         self._template_cache: Dict[str, Optional[np.ndarray]] = {}
         self._digit_templates: Dict[int, List[np.ndarray]] = {}
         self._close_button_cache = None
+        self._village_resources_cache = None
         self._ocr = None
         self._init_digit_templates()
 
@@ -109,7 +111,7 @@ class VisionEngine:
 
     def _get_ocr(self):
         """Lazy-load RapidOCR with bounded threads and disabled rotation classifier."""
-        if self._ocr is None:
+        if getattr(self, '_ocr', None) is None:
             try:
                 from rapidocr import RapidOCR
                 params = {
@@ -118,7 +120,7 @@ class VisionEngine:
                     # Cropped HUD lines must not be enlarged until their SHORT
                     # edge reaches 736px (a 58px line becomes thousands wide).
                     'Det.limit_type': 'max',
-                    'EngineConfig.onnxruntime.intra_op_num_threads': self._ocr_threads,
+                    'EngineConfig.onnxruntime.intra_op_num_threads': getattr(self, '_ocr_threads', 1),
                     'EngineConfig.onnxruntime.inter_op_num_threads': 1
                 }
                 raw = RapidOCR(params=params)
@@ -375,7 +377,11 @@ class VisionEngine:
             if bg_top.size == 0:
                 continue
             bg_hsv = cv2.cvtColor(bg_top, cv2.COLOR_BGR2HSV)
-            if bg_hsv[:, :, 1].mean() > 50 or bg_hsv[:, :, 2].mean() < 130:
+            is_cream = bg_hsv[:, :, 1].mean() <= 50 and bg_hsv[:, :, 2].mean() >= 130
+            is_wood = (8 <= bg_hsv[:, :, 0].mean() <= 28
+                       and 90 <= bg_hsv[:, :, 1].mean() <= 210
+                       and bg_hsv[:, :, 2].mean() >= 120)
+            if not (is_cream or is_wood):
                 continue
             ocr = self._get_ocr()
             if ocr is not None:
@@ -383,11 +389,11 @@ class VisionEngine:
                     btn_crop = screen[max(0, ry+y-4):min(900, ry+y+h+4), max(0, rx+x-4):min(1600, rx+x+w+4)]
                     res = ocr(btn_crop)
                     txts = ' '.join(getattr(res, 'txts', None) or ()).lower()
-                    if any(k in txts for k in ('okay', 'ok', '0kay')):
+                    if any(k in txts for k in ('okay', 'ok', '0kay', 'claim', 'ciaim', 'nhận', 'nhan')):
                         return (cx, cy, w, h, fill)
                 except Exception:
                     pass
-            elif self.find_close_button(screen) is None:
+            elif is_cream and self.find_close_button(screen) is None:
                 return (cx, cy, w, h, fill)
         return None
 
@@ -419,9 +425,26 @@ class VisionEngine:
         return False
 
     def is_treasure_chest_tap_screen(self, screen: np.ndarray) -> bool:
-        """Recognize the full-screen chest event before tapping its center."""
+        """Recognize the full-screen chest event (initial Tap! or mid-open rolling-pin progress)."""
         if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
             return False
+        chest = screen[375:600, 670:930]
+        hsv = cv2.cvtColor(chest, cv2.COLOR_BGR2HSV)
+        wood = cv2.inRange(hsv, (0, 65, 65), (35, 255, 255))
+        if float((wood > 0).mean()) < 0.025:
+            return False
+        if not hasattr(self, '_chest_pin_templates'):
+            asset_root = Path(__file__).resolve().parents[1] / 'local_assets'
+            self._chest_pin_templates = [
+                tmpl for name in ('treasure_chest_pin_gold.png', 'treasure_chest_pin_dark.png')
+                if (tmpl := cv2.imread(str(asset_root / name), cv2.IMREAD_COLOR)) is not None
+            ]
+        pin_roi = screen[710:805, 630:960]
+        for tmpl in self._chest_pin_templates:
+            if pin_roi.shape[0] >= tmpl.shape[0] and pin_roi.shape[1] >= tmpl.shape[1]:
+                score = float(cv2.minMaxLoc(cv2.matchTemplate(pin_roi, tmpl, cv2.TM_CCOEFF_NORMED))[1])
+                if score >= 0.78:
+                    return True
         ocr = self._get_ocr()
         if ocr is None:
             return False
@@ -430,21 +453,76 @@ class VisionEngine:
             text = ' '.join(getattr(result, 'txts', None) or ())
         except Exception:
             return False
-        if not re.search(r'\btap\b', text, re.I):
-            return False
-        chest = screen[375:600, 670:930]
-        hsv = cv2.cvtColor(chest, cv2.COLOR_BGR2HSV)
-        wood = cv2.inRange(hsv, (5, 65, 65), (30, 255, 255))
-        return float((wood > 0).mean()) >= 0.025
+        return bool(re.search(r'\btap\b', text, re.I))
+
+    def find_treasure_chest_reward_button(self, screen: np.ndarray) -> Optional[Tuple[int, int]]:
+        """Locate the green Continue/Claim/Okay button on the chest reward screen."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return None
+        rx, ry, rw, rh = 620, 710, 360, 175
+        button = screen[ry:ry+rh, rx:rx+rw]
+        hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
+        green = cv2.inRange(hsv, (35, 80, 90), (95, 255, 255))
+        if float((green > 0).mean()) < 0.12:
+            return None
+        ocr = self._get_ocr()
+        if ocr is not None:
+            try:
+                res = ocr(button, use_det=True)
+                texts = getattr(res, 'txts', None) or ()
+                boxes = getattr(res, 'boxes', None)
+                if boxes is not None and len(texts) == len(boxes):
+                    for txt, box in zip(texts, boxes):
+                        if re.search(r'\b(continue|claim|okay|ok|collect|tiếp|nhận)\b', str(txt), re.I):
+                            cx = rx + int(round(float(box[:, 0].mean())))
+                            cy = ry + int(round(float(box[:, 1].mean())))
+                            return (cx, cy)
+            except Exception:
+                pass
+        ys, xs = np.where(green > 0)
+        if len(xs) > 0:
+            return (rx + int(round(float(xs.mean()))), ry + int(round(float(ys.mean()))))
+        return (790, 785)
 
     def is_treasure_chest_reward(self, screen: np.ndarray) -> bool:
         """Recognize the Continue button after a chest has opened."""
+        return self.find_treasure_chest_reward_button(screen) is not None
+
+    def read_treasure_hunt_collected(self, screen: np.ndarray):
+        """Read Collected x/y from the Treasure Hunt panel in the attack menu."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return None
+        ocr = self._get_ocr()
+        if ocr is None:
+            return None
+        try:
+            result = ocr(screen[540:715, 1250:1585], use_det=True)
+            text = ' '.join(str(part) for part in (getattr(result, 'txts', None) or ()))
+            match = re.search(r'collected\s*:?\s*(\d+)\s*/\s*(\d+)', text, re.I)
+            if match:
+                found, total = map(int, match.groups())
+                if 0 <= found <= total <= 20 and total > 0:
+                    return found, total
+        except Exception:
+            pass
+        return None
+
+    def has_treasure_hunt_chest_icon(self, screen: np.ndarray) -> bool:
+        """Match the earned chest beside Overall Damage during a live battle."""
         if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
             return False
-        button = screen[755:880, 660:940]
-        hsv = cv2.cvtColor(button, cv2.COLOR_BGR2HSV)
-        green = cv2.inRange(hsv, (35, 80, 90), (95, 255, 255))
-        return float((green > 0).mean()) >= 0.12
+        if not hasattr(self, '_treasure_hunt_hud_template'):
+            self._treasure_hunt_hud_template = cv2.imread(
+                str(Path(__file__).resolve().parents[1] / 'local_assets' /
+                    'treasure_hunt_chest_hud.png'), cv2.IMREAD_COLOR)
+        template = self._treasure_hunt_hud_template
+        if template is None:
+            return False
+        region = screen[25:155, 1460:1600]
+        if region.shape[0] < template.shape[0] or region.shape[1] < template.shape[1]:
+            return False
+        score = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+        return float(cv2.minMaxLoc(score)[1]) >= 0.84
 
     def battle_phase(self, screen):
         # ADB returns a new immutable BGR frame per capture. Reuse recognition
@@ -608,26 +686,39 @@ class VisionEngine:
         if crop is None or not crop.size:
             return None
         hsv=cv2.cvtColor(crop,cv2.COLOR_BGR2HSV)
-        mask=cv2.inRange(hsv,(0,0,191),(179,89,255))
-        contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
-        boxes=sorted((cv2.boundingRect(contour) for contour in contours),key=lambda box:box[0])
-        boxes=[box for box in boxes if 14<=box[3]<=36 and 3<=box[2]<=30]
-        anchor=next((box for box in boxes if box[0]<=18),None)
-        if anchor is None:
-            return None
-        baseline=anchor[1]+anchor[3]
-        group=[];right=anchor[0]
-        for box in boxes:
-            x,y,w,h=box
-            if x<anchor[0] or not .7*anchor[3]<=h<=1.35*anchor[3] or abs(y+h-baseline)>max(3,anchor[3]*.2):
+        masks=(
+            cv2.inRange(hsv,(0,0,191),(179,89,255)),
+            # Loot multiplier items (Battle Bake 2x/3x/4x) tint numerals bright yellow.
+            cv2.inRange(hsv,(26,110,225),(35,255,255)),
+        )
+        for index,mask in enumerate(masks):
+            contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+            boxes=sorted((cv2.boundingRect(contour) for contour in contours),key=lambda box:box[0])
+            boxes=[box for box in boxes if 14<=box[3]<=36 and 3<=box[2]<=30]
+            anchor=next((box for box in boxes if box[0]<=18),None)
+            if anchor is None:
                 continue
-            if x-right>20:
-                break
-            group.append(box);right=x+w
-        clean=np.zeros_like(crop)
-        for x,y,w,h in group:
-            clean[y:y+h,x:x+w]=crop[y:y+h,x:x+w]
-        return self.read_white_number(clean)
+            baseline=anchor[1]+anchor[3]
+            group=[];right=anchor[0]
+            for box in boxes:
+                x,y,w,h=box
+                if x<anchor[0] or not .7*anchor[3]<=h<=1.35*anchor[3] or abs(y+h-baseline)>max(3,anchor[3]*.2):
+                    continue
+                if x-right>20:
+                    break
+                group.append(box);right=x+w
+            clean=np.zeros_like(crop)
+            if index==0:
+                for x,y,w,h in group:
+                    clean[y:y+h,x:x+w]=crop[y:y+h,x:x+w]
+            else:
+                # Paint isolated yellow numerals white so read_white_number OCR handles them uniformly.
+                for x,y,w,h in group:
+                    clean[y:y+h,x:x+w][mask[y:y+h,x:x+w]>0]=(255,255,255)
+            value=self.read_white_number(clean)
+            if value is not None:
+                return value
+        return None
 
     def read_destruction_percent(self, screen):
         """Read only the battle HUD percentage, never infer it from stars."""
@@ -716,11 +807,45 @@ class VisionEngine:
         resources['valid'] = {}
         if screen is None:
             return resources
+        cache_key = None
+        if isinstance(screen, np.ndarray) and screen.ndim >= 2 and screen.shape[0] >= 252 and screen.shape[1] >= 1525:
+            hud_bytes = screen[25:252, 1320:1525].tobytes()
+            cache_key = (screen.shape, screen.dtype.str, bool(builder), hashlib.blake2b(hud_bytes, digest_size=16).digest())
+            cached = getattr(self, '_village_resources_cache', None)
+            if cached is not None and cached[0] == cache_key:
+                res = dict(cached[1])
+                res['valid'] = dict(cached[1]['valid'])
+                return res
         for key, (x, y, w, h) in rows.items():
             amount=self.read_white_number(screen[y:y+h,x:x+w])
             resources['valid'][key]=amount is not None
             resources[key]=amount if amount is not None else 0
+        if cache_key is not None:
+            stored = dict(resources)
+            stored['valid'] = dict(resources['valid'])
+            self._village_resources_cache = (cache_key, stored)
         return resources
+
+    def read_single_resource(self, screen, resource, *, builder=False):
+        rows = {'gold': (1320, 25, 205, 42), 'elixir': (1320, 85, 205, 45)}
+        if builder:
+            rows['gems'] = (1375, 151, 150, 40)
+        else:
+            rows.update(dark_elixir=(1320, 145, 205, 45), gems=(1400, 212, 125, 40))
+        if resource not in rows or screen is None:
+            return {resource: 0, 'valid': {resource: False}}
+        if isinstance(screen, np.ndarray) and screen.ndim >= 2 and screen.shape[0] >= 252 and screen.shape[1] >= 1525:
+            hud_bytes = screen[25:252, 1320:1525].tobytes()
+            cache_key = (screen.shape, screen.dtype.str, bool(builder), hashlib.blake2b(hud_bytes, digest_size=16).digest())
+            cached = getattr(self, '_village_resources_cache', None)
+            if cached is not None and cached[0] == cache_key:
+                return {
+                    resource: cached[1].get(resource, 0),
+                    'valid': {resource: cached[1].get('valid', {}).get(resource, False)},
+                }
+        x, y, w, h = rows[resource]
+        amount = self.read_white_number(screen[y:y+h, x:x+w])
+        return {resource: amount if amount is not None else 0, 'valid': {resource: amount is not None}}
 
     def read_player_profile_header(self, screen: np.ndarray) -> Optional[dict]:
         """Read top-left player profile banner: (level, player_name, account_key)."""
@@ -749,8 +874,161 @@ class VisionEngine:
             pass
         return None
 
-    def read_resource_capacity_popup(self, screen):
-        """Read only the Max line, never the hourly production or treasury."""
+    @staticmethod
+    def _parse_max_capacity_line(line: str) -> Optional[int]:
+        match = re.search(r'\bmax(?:imum)?\s*[:：.]?\s*([0-9OoIiIl|][0-9OoIiIl| ,.\u00a0]*)\s*$', line, re.I)
+        if not match:
+            return None
+        token = match.group(1).translate(str.maketrans({'O': '0', 'o': '0', 'I': '1',
+                                                      'i': '1', 'l': '1', '|': '1'}))
+        groups = re.split(r'[ ,.\u00a0]+', token.strip())
+        if len(groups) > 1 and (not 1 <= len(groups[0]) <= 3 or any(len(group) != 3 for group in groups[1:])):
+            return None
+        digits = re.sub(r'[ ,.\u00a0]', '', token)
+        if digits.isascii() and digits.isdigit() and 1000 <= int(digits) <= 2000000000:
+            return int(digits)
+        return None
+
+    @staticmethod
+    def _has_wide_merged_digits(crop) -> bool:
+        if crop is None or not crop.size:
+            return False
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        _, saturation, value = cv2.split(hsv)
+        mask = ((saturation < 90) & (value > 190)).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for contour in contours:
+            _, _, w, h = cv2.boundingRect(contour)
+            if 9 <= h <= 36 and w > 30:
+                return True
+        return False
+
+    @staticmethod
+    def has_resource_tooltip_open(screen) -> bool:
+        """Fast non-OCR check for whether a HUD resource tooltip is currently open."""
+        if not isinstance(screen, np.ndarray) or screen.shape[:2] != (900, 1600):
+            return False
+        panel = screen[190:320, 1100:1460]
+        hsv = cv2.cvtColor(panel, cv2.COLOR_BGR2HSV)
+        dark_bg = (hsv[:, :, 2] < 95) & (hsv[:, :, 1] < 120)
+        return float(dark_bg.mean()) >= 0.35
+
+    def _parse_capacity_from_popup_ocr(self, crop, ocr, texts, boxes) -> Optional[int]:
+        located = set()
+        saw_max = False
+        wide_merged = False
+        if boxes is not None and len(boxes) == len(texts):
+            for text, box in zip(texts, boxes):
+                if not re.search(r'\bmax(?:imum)?\b', text, re.I):
+                    continue
+                saw_max = True
+                left = max(0, int(box[:, 0].min()/2)-3)
+                top = max(0, int(box[:, 1].min()/2)-3)
+                bottom = min(crop.shape[0], int(box[:, 1].max()/2)+4)
+                row = crop[top:bottom, left:]
+                mask = cv2.inRange(cv2.cvtColor(row, cv2.COLOR_BGR2HSV),
+                                   (0, 0, 180), (180, 100, 255))
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                dots = [cv2.boundingRect(contour) for contour in contours
+                        if 1 <= cv2.boundingRect(contour)[2] <= 6
+                        and 1 <= cv2.boundingRect(contour)[3] <= 6]
+                colons = [max(a[0]+a[2], b[0]+b[2]) for a in dots for b in dots
+                          if abs(a[0]-b[0]) <= 2 and 4 <= b[1]-a[1] <= 12
+                          and a[0] < min(110, row.shape[1]*.5)]
+                if colons:
+                    digits_crop = row[:, max(colons)+2:]
+                    if self._has_wide_merged_digits(digits_crop):
+                        wide_merged = True
+                    else:
+                        value = self.read_white_number(digits_crop)
+                        if value is not None and 1000 <= value <= 2000000000:
+                            located.add(value)
+
+        lines = list(texts)
+        if boxes is not None and len(boxes) == len(texts):
+            words = sorted(((float(box[:, 1].mean()), float(box[:, 0].mean()), text)
+                            for text, box in zip(texts, boxes)), key=lambda item: item[0])
+            grouped = []
+            for y, x, text in words:
+                if grouped and abs(y-grouped[-1][0]) <= 14:
+                    grouped[-1][1].append((x, text))
+                else:
+                    grouped.append((y, [(x, text)]))
+            lines.extend(' '.join(text for _, text in sorted(row)) for _, row in grouped)
+
+        capacities = set()
+        for line in lines:
+            parsed = self._parse_max_capacity_line(line)
+            if parsed is not None:
+                capacities.add(parsed)
+
+        if (not capacities or all(c < 100_000 for c in capacities)) and boxes is not None and len(boxes) == len(texts):
+            row_capacities = set()
+            for text, box in zip(texts, boxes):
+                if not re.search(r'\bmax(?:imum)?\b', text, re.I):
+                    continue
+                left = max(0, int(box[:, 0].min()/2)-3)
+                top = max(0, int(box[:, 1].min()/2)-3)
+                bottom = min(crop.shape[0], int(box[:, 1].max()/2)+4)
+                row_img = crop[max(0, top-2):min(crop.shape[0], bottom+2), left:]
+                if not row_img.size:
+                    continue
+                row_res = ocr(cv2.resize(row_img, None, fx=2, fy=2), use_det=True)
+                r_txts = getattr(row_res, 'txts', None)
+                r_boxes = getattr(row_res, 'boxes', None)
+                if r_txts and r_boxes is not None and len(r_txts) == len(r_boxes):
+                    ordered = sorted(zip(r_boxes, r_txts), key=lambda item: float(item[0][:, 0].mean()))
+                    row_val = self._parse_max_capacity_line(' '.join(str(t) for _, t in ordered))
+                    if row_val is not None:
+                        row_capacities.add(row_val)
+            if row_capacities:
+                capacities = row_capacities
+
+        if saw_max and len(located) == 1 and not wide_merged:
+            loc_val = next(iter(located))
+            if len(capacities) == 1:
+                ocr_val = next(iter(capacities))
+                if ocr_val >= loc_val * 100 and str(ocr_val).startswith(str(loc_val)):
+                    return ocr_val
+            return loc_val
+        return capacities.pop() if len(capacities) == 1 else None
+
+    def _parse_treasury_from_popup_ocr(self, crop, ocr, texts, boxes) -> Optional[int]:
+        if boxes is None or len(texts) != len(boxes):
+            return None
+        rows = [(str(text), float(box[:, 0].mean()), float(box[:, 1].mean()), box)
+                for text, box in zip(texts, boxes)]
+        values = set()
+        for label, x, y, box in rows:
+            match = re.search(r'\bin\s+treasury\s*[:?.]?\s*([0-9OoIiIl|][0-9OoIiIl| ,.\u00a0]*)\s*$', label, re.I)
+            candidates = [match.group(1)] if match else []
+            if re.search(r'\bin\s+treasury\b', label, re.I):
+                candidates.extend(text for text, tx, ty, _ in rows
+                                  if tx > x + 30 and abs(ty-y) <= 45)
+                if not candidates:
+                    top = max(0, int(box[:, 1].min() / 2) - 8)
+                    bot = min(crop.shape[0], int(box[:, 1].max() / 2) + 8)
+                    right_x = int(box[:, 0].max() / 2)
+                    bar = crop[top:bot, min(crop.shape[1], right_x + 145):min(crop.shape[1], right_x + 228)]
+                    if bar.size > 0:
+                        bar_res = ocr(bar, use_det=False)
+                        candidates.extend(str(t) for t in (getattr(bar_res, 'txts', None) or ()))
+            for token in candidates:
+                token = token.strip().translate(str.maketrans({'O':'0', 'o':'0', 'I':'1',
+                                                               'i':'1', 'l':'1', '|':'1'}))
+                if not re.fullmatch(r'[0-9][0-9 ,.\u00a0]*', token):
+                    continue
+                groups = re.split(r'[ ,.\u00a0]+', token)
+                if len(groups) > 1 and (not 1 <= len(groups[0]) <= 4
+                                        or any(len(group) != 3 for group in groups[1:])):
+                    continue
+                value = int(re.sub(r'[ ,.\u00a0]', '', token))
+                if 0 <= value <= 2_000_000_000:
+                    values.add(value)
+        return values.pop() if len(values) == 1 else None
+
+    def read_resource_popup(self, screen) -> Optional[dict]:
+        """Read both Max capacity and In treasury rows from a single popup OCR pass."""
         if screen is None or not screen.size:
             return None
         height, width = screen.shape[:2]
@@ -764,61 +1042,24 @@ class VisionEngine:
             boxes = getattr(result, 'boxes', None)
             if texts is None:
                 return None
-            # Use OCR to locate the labelled line, then read only its digits.
-            # A full-line recognition can hallucinate a "1" in a thousands gap.
-            if boxes is not None and len(boxes) == len(texts):
-                located = set()
-                saw_max = False
-                for text, box in zip(texts, boxes):
-                    if not re.search(r'\bmax(?:imum)?\b', text, re.I):
-                        continue
-                    saw_max = True
-                    left = max(0, int(box[:, 0].min()/2)-3)
-                    top = max(0, int(box[:, 1].min()/2)-3)
-                    bottom = min(crop.shape[0], int(box[:, 1].max()/2)+4)
-                    # Include a separately detected number to the right.
-                    row = crop[top:bottom, left:]
-                    mask = cv2.inRange(cv2.cvtColor(row, cv2.COLOR_BGR2HSV),
-                                       (0, 0, 180), (180, 100, 255))
-                    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    dots = [cv2.boundingRect(contour) for contour in contours
-                            if 1 <= cv2.boundingRect(contour)[2] <= 6
-                            and 1 <= cv2.boundingRect(contour)[3] <= 6]
-                    colons = [max(a[0]+a[2], b[0]+b[2]) for a in dots for b in dots
-                              if abs(a[0]-b[0]) <= 2 and 4 <= b[1]-a[1] <= 12
-                              and a[0] < min(110, row.shape[1]*.5)]
-                    if colons:
-                        value = self.read_white_number(row[:, max(colons)+2:])
-                        if value is not None and 1000 <= value <= 2000000000:
-                            located.add(value)
-                if saw_max:
-                    return located.pop() if len(located) == 1 else None
-            lines = list(texts)
-            if boxes is not None and len(boxes) == len(texts):
-                # OCR sometimes separates "Max:" and the number into boxes.
-                words = sorted(((float(box[:, 1].mean()), float(box[:, 0].mean()), text)
-                                for text, box in zip(texts, boxes)), key=lambda item: item[0])
-                grouped = []
-                for y, x, text in words:
-                    if grouped and abs(y-grouped[-1][0]) <= 14:
-                        grouped[-1][1].append((x, text))
-                    else:
-                        grouped.append((y, [(x, text)]))
-                lines.extend(' '.join(text for _, text in sorted(row)) for _, row in grouped)
-            capacities = set()
-            for line in lines:
-                match = re.search(r'\bmax(?:imum)?\s*[:：.]?\s*([0-9OoIiIl|][0-9OoIiIl| ,.\u00a0]*)\s*$', line, re.I)
-                if not match:
-                    continue
-                token = match.group(1).translate(str.maketrans({'O':'0', 'o':'0', 'I':'1',
-                                                              'i':'1', 'l':'1', '|':'1'}))
-                groups = re.split(r'[ ,.\u00a0]+', token.strip())
-                if len(groups) > 1 and (not 1 <= len(groups[0]) <= 3
-                                        or any(len(group) != 3 for group in groups[1:])):
-                    continue
-                digits = re.sub(r'[ ,.\u00a0]', '', token)
-                if digits.isascii() and digits.isdigit() and 1000 <= int(digits) <= 2000000000:
-                    capacities.add(int(digits))
-            return capacities.pop() if len(capacities) == 1 else None
+            capacity = self._parse_capacity_from_popup_ocr(crop, ocr, texts, boxes)
+            treasury = None
+            if height == 900 and width == 1600:
+                treasury = self._parse_treasury_from_popup_ocr(crop, ocr, texts, boxes)
+            if capacity is None and treasury is None:
+                return None
+            return {'capacity': capacity, 'treasury': treasury}
         except Exception:
             return None
+
+    def read_resource_capacity_popup(self, screen):
+        """Read only the Max line, never the hourly production or treasury."""
+        popup = self.read_resource_popup(screen)
+        return popup.get('capacity') if isinstance(popup, dict) else None
+
+    def read_resource_treasury_popup(self, screen):
+        """Read the In treasury row of an opened resource HUD tooltip."""
+        if screen is None or screen.shape[:2] != (900, 1600):
+            return None
+        popup = self.read_resource_popup(screen)
+        return popup.get('treasury') if isinstance(popup, dict) else None

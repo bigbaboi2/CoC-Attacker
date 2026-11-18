@@ -179,12 +179,22 @@ class WallUpgrader:
             th_level=th_level,
         )
 
+    def _has_center_dialog_hint(self, frame) -> bool:
+        if frame is None or not hasattr(frame, 'shape') or frame.shape[:2] != (900, 1600):
+            return True
+        if self.vision.match_template(frame, 'okay', .70, roi=(500, 440, 600, 330)):
+            return True
+        center = frame[220:420, 480:1120]
+        return float((np.min(center, axis=2) > 175).mean()) >= 0.15
+
     def _dismiss_layout_obstacle(self, log):
         """Dismiss only a recognized obstacle notice, then verify it disappeared."""
         for _ in range(2):
             frame = self.adb.screencap()
             if frame is None:
                 return False
+            if not self._has_center_dialog_hint(frame):
+                return True
             words = ' '.join(self.texts(frame, (330, 180, 940, 480), scale=1)).lower()
             normalized = ''.join(c for c in unicodedata.normalize('NFD', words)
                                  if unicodedata.category(c) != 'Mn')
@@ -200,11 +210,15 @@ class WallUpgrader:
             self.adb.tap(button[0], button[1], jitter=0, delay_after=.5)
             log('[Wall] Đã bấm Okay để bỏ qua cảnh báo chướng ngại.')
         frame = self.adb.screencap()
-        words = ' '.join(self.texts(frame, (330, 180, 940, 480), scale=1)).lower() if frame is not None else ''
+        if frame is None:
+            return False
+        if not self._has_center_dialog_hint(frame):
+            return True
+        words = ' '.join(self.texts(frame, (330, 180, 940, 480), scale=1)).lower()
         normalized = ''.join(c for c in unicodedata.normalize('NFD', words)
                              if unicodedata.category(c) != 'Mn')
         compact = re.sub(r'[^a-z]', '', normalized)
-        return frame is not None and 'obstacle' not in compact and 'chuongngai' not in compact
+        return 'obstacle' not in compact and 'chuongngai' not in compact
 
     def verify_walls_via_layout_editor(self, log):
         """Fast fixed-coordinate wall verification via Layout Editor -> Edit layout -> Remove All."""
@@ -801,15 +815,16 @@ class WallUpgrader:
             self._selection_metrics['scrolls'] += 1
         if fast:
             self._cached_scroll_steps = getattr(self, '_cached_scroll_steps', 0)+1
+        duration_ms = 360 if fast else 550
         if direction == 'down':
-            self.adb.swipe(1410, 710, 1410, 310, duration_ms=550, jitter=0)
+            self.adb.swipe(1410, 710, 1410, 310, duration_ms=duration_ms, jitter=0)
         else:
-            self.adb.swipe(1410, 310, 1410, 710, duration_ms=550, jitter=0)
+            self.adb.swipe(1410, 310, 1410, 710, duration_ms=duration_ms, jitter=0)
         offset = getattr(self.manager, '_wall_menu_offset', 0)
         if not isinstance(offset, int):
             offset = 0
         self.manager._wall_menu_offset = max(0, offset + (1 if direction == 'down' else -1))
-        time.sleep(.35 if fast else .45)
+        time.sleep(.18 if fast else .45)
 
     @frame_analysis
     def cached_menu_row(self, screen, cached):

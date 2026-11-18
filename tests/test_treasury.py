@@ -60,7 +60,7 @@ class TreasuryCastleSearchTests(unittest.TestCase):
         self.assertEqual(collector.adb.tap.call_args_list[1].args, (580, 370))
         collector.adb.zoom_out_map.assert_not_called()
 
-    def test_matching_clan_name_gives_one_castle_hint(self):
+    def test_matching_clan_name_gives_castle_hints(self):
         collector, frame = self.make_collector()
         collector.words.side_effect = [
             [('the amigos', 816, 292)],
@@ -72,7 +72,7 @@ class TreasuryCastleSearchTests(unittest.TestCase):
 
         self.assertEqual(result, (frame, (820, 740)))
         collector.adb.tap.assert_called_once()
-        self.assertEqual(collector.adb.tap.call_args.args, (816, 337))
+        self.assertEqual(collector.adb.tap.call_args.args, (816, 284))
         collector.adb.zoom_out_map.assert_not_called()
 
     def test_enlarged_map_tile_finds_small_clan_label(self):
@@ -81,7 +81,9 @@ class TreasuryCastleSearchTests(unittest.TestCase):
 
         hints=collector.tiled_clan_hints(frame,{'the amigos'})
 
-        self.assertEqual(hints,[(854,558,'tên bang trên bản đồ')])
+        self.assertEqual(hints,[(854,520,'tên bang trên bản đồ'),
+                                (854,503,'tên bang trên bản đồ'),
+                                (854,558,'tên bang trên bản đồ')])
         collector.words.assert_called_once_with(frame,(700,400,220,170),scale=2)
 
     def test_requires_castle_title_beside_treasury_button(self):
@@ -148,7 +150,8 @@ class TreasuryCastleSearchTests(unittest.TestCase):
         collector.manager._treasury_next_check = 0
         collector.memory = {}
         collector.save_memory = Mock()
-        collector.adb.screencap.side_effect = [home, treasury, confirmation, toast]
+        collector.read_balances = Mock(return_value={'gold': 1000, 'elixir': 1000, 'dark_elixir': 50})
+        collector.adb.screencap.side_effect = [home, home, treasury, confirmation, toast]
         collector.vision.is_in_main_village.side_effect = [True, False, True]
         collector.vision.read_village_resources = Mock(return_value={
             'gold': 358950, 'elixir': 442697, 'dark_elixir': 37500,
@@ -168,6 +171,133 @@ class TreasuryCastleSearchTests(unittest.TestCase):
         self.assertEqual(collector.adb.tap.call_count, 3)
         self.assertEqual(collector.memory['last_result'], 'storage_full')
         self.assertTrue(any('không đủ chỗ' in call.args[0] for call in log.call_args_list))
+
+    def test_castle_not_found_reuses_balances_once_without_retapping_hud(self):
+        collector, home = self.make_collector()
+        collector.manager.settings = {'auto_collect_treasury': True, 'treasury_check_interval_min': 30}
+        collector.manager._treasury_next_check = 0
+        collector.memory = {}
+        collector.save_memory = Mock()
+        collector.read_balances = Mock(return_value={'gold': 1000, 'elixir': 1000, 'dark_elixir': 50})
+        collector.vision.read_village_resources = Mock(return_value={
+            'gold': 100, 'elixir': 100, 'dark_elixir': 10,
+            'valid': {'gold': True, 'elixir': True, 'dark_elixir': True}})
+        collector.open_castle = Mock(return_value=(None, None))
+        collector.close = Mock()
+        log = Mock()
+
+        with patch('bot.treasury.time.time', return_value=1000):
+            first = collector.run(log)
+        self.assertEqual(first['reason'], 'castle_not_found')
+        self.assertEqual(collector.read_balances.call_count, 1)
+
+        with patch('bot.treasury.time.time', return_value=1200):
+            second = collector.run(log)
+        self.assertEqual(second['reason'], 'castle_not_found')
+        self.assertEqual(collector.read_balances.call_count, 1)
+
+    def test_treasury_read_balances_saves_capacities_so_reader_skips_hud(self):
+        from bot.farm_finish import ResourceCapacityReader
+        from bot.village import VillageManager
+        import numpy as np
+        home = np.zeros((900, 1600, 3), np.uint8)
+        pop = np.ones((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(
+            screencap=Mock(side_effect=[home, pop, pop, home, pop, pop, home, pop, pop]),
+            tap=Mock(), _guard_input=Mock(),
+        )
+        vision = SimpleNamespace(
+            is_in_main_village=Mock(return_value=True),
+            read_resource_popup=Mock(side_effect=lambda f: None if f is home else (
+                {'capacity': 31_000_000, 'treasury': 0} if adb.tap.call_count <= 4
+                else {'capacity': 500_000, 'treasury': 0}
+            )),
+        )
+        manager = VillageManager.__new__(VillageManager)
+        manager.adb = adb
+        manager.vision = vision
+        manager.settings = {'device_serial': '127.0.0.1:16384'}
+        manager.current_account_key = '#TEST'
+        manager._session_player_tag = '#TEST'
+        manager._session_legacy_key = None
+        manager.account_capacities = {}
+        manager.village_state = None
+        manager._wall_builder_retry_at = 0.0
+        manager.wall_status = ''
+        manager._hud_treasury_cache = {}
+        manager._hud_tooltip_clean = False
+        manager.set_wall_wait = Mock()
+        manager.check_and_sync_account = Mock(return_value='#TEST')
+
+        collector = TreasuryCollector.__new__(TreasuryCollector)
+        collector.manager = manager
+        collector.adb = adb
+        collector.vision = vision
+        with patch('bot.treasury.time.sleep'):
+            balances = collector.read_balances(Mock())
+        self.assertEqual(balances, {'gold': 0, 'elixir': 0, 'dark_elixir': 0})
+        self.assertEqual(manager.account_capacities['#TEST']['gold'], 31_000_000)
+        self.assertEqual(manager.account_capacities['#TEST']['elixir'], 31_000_000)
+        self.assertEqual(manager.account_capacities['#TEST']['dark_elixir'], 500_000)
+
+        taps_after_treasury = adb.tap.call_count
+        adb.screencap = Mock(return_value=home)
+        reader = ResourceCapacityReader(manager)
+        caps = reader.read(('gold', 'elixir'), Mock())
+        self.assertEqual(caps, {'gold': 31_000_000, 'elixir': 31_000_000})
+        self.assertEqual(adb.tap.call_count, taps_after_treasury)
+        self.assertFalse(reader.last_tapped_hud)
+
+    def test_capacity_reader_populates_treasury_cache_so_treasury_reuses_it(self):
+        from bot.farm_finish import ResourceCapacityReader
+        from bot.village import VillageManager
+        import numpy as np
+        home = np.zeros((900, 1600, 3), np.uint8)
+        pop = np.ones((900, 1600, 3), np.uint8)
+        adb = SimpleNamespace(
+            screencap=Mock(side_effect=[home, pop, pop, home, pop, pop, home, pop, pop]),
+            tap=Mock(), _guard_input=Mock(),
+        )
+        popups = iter([
+            {'capacity': 31_000_000, 'treasury': 123_456}, {'capacity': 31_000_000, 'treasury': 123_456},
+            {'capacity': 31_000_000, 'treasury': 234_567}, {'capacity': 31_000_000, 'treasury': 234_567},
+            {'capacity': 500_000, 'treasury': 3_000}, {'capacity': 500_000, 'treasury': 3_000},
+        ])
+        vision = SimpleNamespace(
+            is_in_main_village=Mock(return_value=True),
+            read_resource_popup=Mock(side_effect=lambda f: None if f is home else next(popups)),
+        )
+        manager = VillageManager.__new__(VillageManager)
+        manager.adb = adb
+        manager.vision = vision
+        manager.settings = {'device_serial': '127.0.0.1:16384'}
+        manager.current_account_key = '#TEST'
+        manager._session_player_tag = '#TEST'
+        manager._session_legacy_key = None
+        manager.account_capacities = {}
+        manager.village_state = None
+        manager._wall_builder_retry_at = 0.0
+        manager.wall_status = ''
+        manager._hud_treasury_cache = {}
+        manager._hud_tooltip_clean = False
+        manager.set_wall_wait = Mock()
+        manager.check_and_sync_account = Mock(return_value='#TEST')
+
+        reader = ResourceCapacityReader(manager)
+        with patch('bot.farm_finish.time.sleep'):
+            caps = reader.read(('gold', 'elixir'), Mock())
+        self.assertEqual(caps, {'gold': 31_000_000, 'elixir': 31_000_000})
+        adb.tap.reset_mock()
+
+        collector = TreasuryCollector.__new__(TreasuryCollector)
+        collector.manager = manager
+        collector.adb = adb
+        collector.vision = vision
+        with patch('bot.treasury.time.sleep'):
+            balances = collector.read_balances(Mock())
+        self.assertEqual(balances, {'gold': 123_456, 'elixir': 234_567, 'dark_elixir': 3_000})
+        # Only dark_elixir should be tapped + dismissed (2 taps total)
+        self.assertEqual(adb.tap.call_count, 2)
 
 
 if __name__ == '__main__':
