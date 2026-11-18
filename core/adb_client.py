@@ -253,7 +253,10 @@ class ADBSocketClient:
                 if resp != b"OKAY":
                     return self._shell_fallback(command)
                 chunks = []
+                deadline = time.monotonic() + 12.0
                 while True:
+                    if time.monotonic() >= deadline:
+                        raise OSError("ADB shell response timeout")
                     data = s.recv(4096)
                     if not data:
                         break
@@ -294,10 +297,13 @@ class ADBSocketClient:
                     return self._screencap_fallback()
 
                 # Read header: 16 bytes (width: 4B, height: 4B, format: 4B, colorspace: 4B)
+                deadline = time.monotonic() + 12.0
                 header = bytearray(16)
                 view = memoryview(header)
                 pos = 0
                 while pos < 16:
+                    if time.monotonic() >= deadline:
+                        return self._screencap_fallback()
                     n = s.recv_into(view[pos:])
                     if not n:
                         break
@@ -309,6 +315,8 @@ class ADBSocketClient:
                 width = int.from_bytes(header[0:4], "little")
                 height = int.from_bytes(header[4:8], "little")
                 fmt = int.from_bytes(header[8:12], "little")
+                if width <= 0 or height <= 0 or width > 8192 or height > 8192:
+                    return self._screencap_fallback()
                 expected_bytes = width * height * 4
 
                 # Reusable buffer to minimize memory allocation and GC pauses
@@ -318,6 +326,8 @@ class ADBSocketClient:
                 view = memoryview(buf)
                 pos = 0
                 while pos < expected_bytes:
+                    if time.monotonic() >= deadline:
+                        raise OSError("ADB screencap body timeout")
                     n = s.recv_into(view[pos:])
                     if not n:
                         break
@@ -396,7 +406,10 @@ class ADBSocketClient:
                 if self._send_command(sock,('exec:'+command).encode('ascii'))!=b'OKAY':
                     raise ConnectionError('ADB rejected tap batch')
                 output=bytearray()
+                deadline = time.monotonic() + 15.0
                 while True:
+                    if time.monotonic() >= deadline:
+                        raise OSError("ADB tap batch response timeout")
                     chunk=sock.recv(4096)
                     if not chunk:break
                     output.extend(chunk)

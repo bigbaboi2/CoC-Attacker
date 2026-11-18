@@ -390,5 +390,127 @@ class FixTests(unittest.TestCase):
         self.assertTrue(any('Không thấy Phụ tá thợ xây rảnh; đóng menu Thợ xây.' in line for line in logs))
         assigner.ui.close_dialog.assert_called_once()
 
+    def test_worker_exit_without_disconnect_resets_running_state(self):
+        from bot.bot_engine import BotEngine
+        from core.adb_client import BotStoppedError
+        import threading
+        engine = BotEngine.__new__(BotEngine)
+        engine.adb = SimpleNamespace(device_unavailable=False)
+        engine.is_running = True
+        engine._thread = threading.current_thread()
+        engine.log = Mock()
+        engine.set_state = Mock()
+        engine.stop_bot = Mock(side_effect=lambda: setattr(engine, 'is_running', False))
+        engine._run_loop = Mock(side_effect=BotStoppedError())
+        engine.run()
+        engine.stop_bot.assert_called_once()
+
+        engine.is_running = True
+        engine.stop_bot.reset_mock()
+        engine.log.reset_mock()
+        engine._run_loop = Mock(side_effect=RuntimeError('boom'))
+        engine.run()
+        engine.stop_bot.assert_called_once()
+        self.assertTrue(any('boom' in str(c.args[0]) for c in engine.log.call_args_list))
+
+    def test_pause_resume_on_dead_worker_resets_instead_of_faking(self):
+        from bot.bot_engine import BotEngine
+        import threading
+        engine = BotEngine.__new__(BotEngine)
+        engine._lifecycle_lock = threading.RLock()
+        engine._thread = SimpleNamespace(is_alive=lambda: False)
+        engine.is_running = True
+        engine.is_paused = False
+        engine.log = Mock()
+        engine.set_state = Mock()
+        engine.save_stats = Mock()
+        engine.stop_bot = Mock(side_effect=lambda: setattr(engine, 'is_running', False))
+        engine.pause_bot()
+        engine.stop_bot.assert_called_once()
+        self.assertFalse(any('Đã tạm dừng bot.' in str(c.args[0]) for c in engine.log.call_args_list))
+
+        engine.is_running = True
+        engine.is_paused = True
+        engine.stop_bot.reset_mock()
+        engine.log.reset_mock()
+        engine.resume_bot()
+        engine.stop_bot.assert_called_once()
+        self.assertFalse(any('Tiếp tục chạy bot.' in str(c.args[0]) for c in engine.log.call_args_list))
+
+    def test_builder_active_non_home_panel_exits_after_six_misses(self):
+        from bot.bot_engine import BotEngine
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'main_village_enabled': False, 'builder_base_enabled': True}
+        engine.log = Mock()
+        engine._queue_screen_fault = Mock(return_value=False)
+        engine.village = SimpleNamespace(is_in_main_village=lambda _: False)
+        builder = SimpleNamespace(
+            active=True,
+            battle=SimpleNamespace(in_progress=False, find_now_failures=0, obstruction_buttons=lambda _: None),
+            dismiss_star_bonus=lambda s, l: False,
+            is_home=lambda _: False,
+            night_palette=lambda _: True,
+            close_panel=Mock(return_value=False),
+            is_main=lambda _: False,
+            due=lambda: False,
+        )
+        engine.builder = builder
+        screen = np.zeros((900, 1600, 3), np.uint8)
+        with patch('bot.bot_engine.time.sleep'):
+            for _ in range(5):
+                self.assertTrue(engine._handle_builder_base(screen))
+                self.assertTrue(builder.active)
+            self.assertFalse(engine._handle_builder_base(screen))
+        self.assertFalse(builder.active)
+        self.assertTrue(any('chuyển về khôi phục màn hình' in str(c.args[0]) for c in engine.log.call_args_list))
+
+    def test_adb_screencap_rejects_corrupt_header_and_falls_back(self):
+        from core.adb_client import ADBSocketClient
+        client = ADBSocketClient(adb_bin='adb')
+        client.device_serial = '127.0.0.1:16384'
+        client.device_unavailable = False
+        client._guard_input = Mock()
+        client._send_command = Mock(return_value=b'OKAY')
+        fake_sock = SimpleNamespace(
+            __enter__=lambda s: s,
+            __exit__=lambda s, *a: None,
+        )
+        def recv_into(view):
+            view[:16] = b'error: closed!! '
+            return 16
+        fake_sock.recv_into = recv_into
+        client._transport_socket = Mock(return_value=fake_sock)
+        sentinel = np.zeros((900, 1600, 3), np.uint8)
+        client._screencap_fallback = Mock(return_value=sentinel)
+        result = client.screencap()
+        self.assertIs(result, sentinel)
+        client._screencap_fallback.assert_called_once()
+
+    def test_reconnect_logs_frame_recovery_on_first_capture(self):
+        from bot.bot_engine import BotEngine
+        engine = BotEngine.__new__(BotEngine)
+        engine.settings = {'main_village_enabled': False, 'builder_base_enabled': True}
+        engine.log = Mock()
+        engine._service_recovery = Mock(return_value=False)
+        engine._just_reconnected = True
+        screen = np.zeros((900, 1600, 3), np.uint8)
+        engine.adb = SimpleNamespace(screencap=lambda: screen, device_unavailable=False, is_coc_foreground=lambda: True)
+        engine.screen_cb = None
+        engine.vision = SimpleNamespace(has_system_dialog=lambda _: False, game_fault=lambda _: None)
+        engine.village = SimpleNamespace(
+            dismiss_notification_prompt=lambda _: False,
+            is_in_main_village=lambda _: False,
+            open_treasure_chest_if_present=lambda s, l: False,
+            close_popups_and_dialogs=lambda _: True,
+        )
+        engine._prepare_village_startup = Mock(return_value=True)
+        engine._handle_builder_base = Mock(return_value=False)
+        engine.identify_screen_state = Mock(return_value='STATE_UNKNOWN')
+        engine._action_outcome = Mock()
+        with patch('bot.bot_engine.time.sleep'):
+            engine._iteration()
+        self.assertFalse(engine._just_reconnected)
+        self.assertTrue(any('Đã nhận lại khung hình sau kết nối lại ADB' in str(c.args[0]) for c in engine.log.call_args_list))
+
 if __name__ == '__main__':
     unittest.main()

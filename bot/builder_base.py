@@ -499,6 +499,8 @@ class BuilderBaseManager:
                            (.8, 1., 1.15)) or self.vision.find_close_button(screen)
         if close:
             self.tap(close)
+            return True
+        return False
 
     def wall_balances(self, screen, eligible=None):
         balances = self.vision.read_village_resources(screen, builder=True)

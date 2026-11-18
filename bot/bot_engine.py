@@ -357,6 +357,10 @@ class BotEngine:
     def pause_bot(self):
         with self._lifecycle_lock:
             if not self.is_running or self.is_paused:return
+            if self._thread is not None and not self._thread.is_alive():
+                self.stop_bot()
+                self.log('[Bot] Luồng bot trước đã dừng; đã đặt lại trạng thái sẵn sàng.')
+                return
             self._state_before_pause = self.current_state
             if self._run_started_at is not None:
                 self._uptime_accumulated+=max(0,time.monotonic()-self._run_started_at)
@@ -369,6 +373,10 @@ class BotEngine:
     def resume_bot(self):
         with self._lifecycle_lock:
             if not self.is_running or not self.is_paused:return
+            if self._thread is not None and not self._thread.is_alive():
+                self.stop_bot()
+                self.log('[Bot] Luồng bot trước đã dừng; hãy bấm Bắt đầu để chạy lại.')
+                return
             self._run_started_at=time.monotonic()
             self.is_paused = False
             if getattr(self, '_recovery_paused', False):
@@ -624,17 +632,26 @@ class BotEngine:
         return True
 
     def run(self):
+        unexpected_error = None
         try:
             self._run_loop()
         except BotStoppedError:
             # Stop/reconnect can race with ADB guards outside the iteration.
             # Cancellation is a normal worker exit, not an unhandled traceback.
             pass
+        except Exception as exc:
+            unexpected_error = exc
+            self.log(f'[Bot] Luồng tự động gặp lỗi bất ngờ: {exc}')
         finally:
-            if self._is_current_worker() and self.adb.device_unavailable is True:
-                self.stop_bot()
-                self.set_state('ADB_DISCONNECTED')
-                self.log('[ADB] Mất kết nối MuMu. Đã dừng bot. Mở MuMu rồi bấm Kết nối hoặc Bắt đầu.')
+            if self._is_current_worker():
+                if self.adb.device_unavailable is True:
+                    self.stop_bot()
+                    self.set_state('ADB_DISCONNECTED')
+                    self.log('[ADB] Mất kết nối MuMu. Đã dừng bot. Mở MuMu rồi bấm Kết nối hoặc Bắt đầu.')
+                else:
+                    if unexpected_error is None:
+                        self.log('[Bot] Luồng tự động đã kết thúc; đặt lại trạng thái dừng.')
+                    self.stop_bot()
 
     def _run_loop(self):
         """Main Automation Loop."""
@@ -668,12 +685,15 @@ class BotEngine:
                             return
                         time.sleep(.5)
                     continue
+                self._just_reconnected = True
                 self.set_state(self.STATE_RECOVERY)
             try:
                 self._iteration()
             except BotStoppedError:
                 if self.adb.device_unavailable and self.settings.get('auto_reconnect', True):
                     continue
+                if self._is_current_worker():
+                    self.log('[Bot] Vòng xử lý dừng do mất quyền điều khiển thiết bị hoặc lệnh dừng.')
                 return
             except Exception as e:
                 self.log(f"Ngoại lệ vòng lặp: {e}")
@@ -683,7 +703,10 @@ class BotEngine:
                 self._action_outcome('Vòng xử lý game', True)
 
             # Update uptime
-            self._publish_stats()
+            try:
+                self._publish_stats()
+            except Exception as exc:
+                self.log(f'[Stats] Lỗi cập nhật thống kê: {exc}')
 
             time.sleep(0.25 if getattr(self, 'current_state', None) in (self.STATE_VILLAGE, self.STATE_SEARCHING, self.STATE_COMBAT) else 0.6)
 
@@ -766,15 +789,21 @@ class BotEngine:
         if self._service_recovery():
             return
         # 1. Chụp màn hình giả lập
+        just_reconnected = getattr(self, '_just_reconnected', False)
         screen = self.adb.screencap()
         if screen is None:
             if self.adb.device_unavailable is True:
+                if just_reconnected:
+                    self.log('[Recovery] Mất lại kết nối ADB khi chụp màn hình phục hồi.')
                 return
             self.log("Không nhận được hình ảnh giả lập. Đang kiểm tra game...")
             if self.settings.get('auto_reconnect',True):
                 self.adb.connect_device(self.settings.get('device_serial','127.0.0.1:5555'), start_server=False)
             self._action_outcome('Chụp màn hình MuMu', False, inspect=False)
             return
+        if just_reconnected:
+            self._just_reconnected = False
+            self.log('[Recovery] Đã nhận lại khung hình sau kết nối lại ADB; đang xác định màn hình...')
         self._action_outcome('Chụp màn hình MuMu', True)
         if screen.shape[:2] != (900, 1600):
             screen = self._ensure_game_resolution(screen)
@@ -1033,6 +1062,7 @@ class BotEngine:
                     self._queue_screen_fault(self.adb.screencap())
                 return True
         if home:
+            self._builder_panel_misses = 0
             self.set_state(self.STATE_BUILDER)
             builder.battle.in_progress = False
             if hasattr(self, 'village_state'):
@@ -1082,11 +1112,20 @@ class BotEngine:
         if builder.active:
             if self.village.is_in_main_village(screen) and not builder.night_palette(screen):
                 builder.active = False
+                self._builder_panel_misses = 0
             else:
                 if not self._queue_screen_fault(screen):
                     builder.close_panel(screen)
+                misses = getattr(self, '_builder_panel_misses', 0) + 1
+                self._builder_panel_misses = misses
+                if misses >= 6:
+                    self.log('[BH] Không thấy lại màn hình làng đêm sau khi thử đóng bảng; chuyển về khôi phục màn hình.')
+                    builder.active = False
+                    self._builder_panel_misses = 0
+                    return False
                 time.sleep(.7)
                 return True
+        self._builder_panel_misses = 0
         if (self.settings.get('main_village_enabled', True)
                 and self.settings.get('builder_base_enabled', False)
                 and not getattr(builder, 'main_schedule_checked', False)

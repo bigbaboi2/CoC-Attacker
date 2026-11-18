@@ -2664,6 +2664,11 @@ class MainWindow(QMainWindow):
 
     def _toggle_run_pause(self):
         if self.bot.is_running:
+            if getattr(self.bot, '_thread', None) is not None and not self.bot.is_alive():
+                self.bot.stop_bot()
+                self._on_log('[Bot] Tiến trình bot trước đã dừng; tự khởi động lại...')
+                self._start_bot()
+                return
             self._pause_bot()
         else:
             self._start_bot()
