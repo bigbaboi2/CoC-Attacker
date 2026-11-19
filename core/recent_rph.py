@@ -40,3 +40,19 @@ def rates(history):
     seconds=sum(row['elapsed_seconds'] for row in history)
     return ({key:round(sum(row[key] for row in history)*3600/seconds) if seconds else None
              for key in ('gold','elixir','dark_elixir')},len(history))
+
+
+PEAK_KEYS = (
+    ('gold', 'max_gold_rph'),
+    ('elixir', 'max_elixir_rph'),
+    ('dark_elixir', 'max_dark_rph'),
+)
+
+
+def update_peak_rates(stats):
+    recent_rates, _ = rates(village_history(stats))
+    for key, peak_key in PEAK_KEYS:
+        value = recent_rates[key]
+        if value is not None and value > stats.get(peak_key, 0):
+            stats[peak_key] = int(value)
+    return recent_rates

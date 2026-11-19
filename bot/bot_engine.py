@@ -101,7 +101,10 @@ class BotEngine:
             "rph_history": [],
             "rph_window_start_uptime_seconds": 0,
             "rph_window_version": 0,
-            "rph_village_start_battle": 0
+            "rph_village_start_battle": 0,
+            "max_gold_rph": 0,
+            "max_elixir_rph": 0,
+            "max_dark_rph": 0
         }
         self.start_timestamp = 0.0
         stats_file = stats_path or str(Path(getattr(settings, 'filepath', Path(__file__).resolve().parents[1] / 'config.json')).with_name('stats.json'))
@@ -111,6 +114,8 @@ class BotEngine:
             self.stats['rph_window_start_uptime_seconds']=self.stats['uptime_seconds']
             self.stats['rph_village_start_battle'] = self.stats['battles_completed']
             self.stats['rph_window_version'] = 2
+        from core.recent_rph import update_peak_rates
+        update_peak_rates(self.stats)
         self._uptime_accumulated = float(self.stats['uptime_seconds'])
         self._run_started_at = None
         self._builder_elapsed = float(self.stats['builder_uptime_seconds'])
@@ -1294,8 +1299,9 @@ class BotEngine:
             self.stats[stat]+=max(0,int(gained.get(key,0)))
         snapshot = self.get_stats()
         uptime = max(0, snapshot['uptime_seconds'] - snapshot['builder_uptime_seconds'])
-        from core.recent_rph import append_battle
+        from core.recent_rph import append_battle, update_peak_rates
         append_battle(self.stats,gained,uptime)
+        update_peak_rates(self.stats)
         self.stats['rph_updated_uptime_seconds'] = uptime
         self._publish_stats()
         self.save_stats(force=True)

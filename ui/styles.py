@@ -116,6 +116,7 @@ def theme_qss(theme='dark', text_size='medium'):
     QLabel#metricValue, QLabel#sectionTitle { color: __TEXT__; font-size: __METRIC__px; font-weight: 700; }
     __RESOURCE_STYLES__
     QLabel#statValue { color: __TEXT__; font-size: __STAT__px; font-weight: 700; }
+    QLabel#statSub { color: __MUTED__; font-size: __STAT_SUB__px; font-weight: 600; }
     __STAT_TONE_STYLES__
     QLabel#stateBadge { background: __RAISED__; color: __TEXT__; border: 1px solid __BORDER__; border-radius: 7px; padding: 6px 12px; font-weight: 700; }
     QLabel#stateBadge[village="main"] { background: #1e6948; color: #ffffff; border-color: #51c88b; }
@@ -126,7 +127,7 @@ def theme_qss(theme='dark', text_size='medium'):
     QStatusBar { color: __MUTED__; }
     """
     values = {**p, 'base': base, 'title': base + 10, 'hint': base - 1,
-              'metric': base + 2, 'stat': base + 7,
+              'metric': base + 2, 'stat': base + 7, 'stat_sub': max(10, base - 3),
               'section': base + 2, 'button': base + 1, 'control': base + 14, 'check': base + 13,
               'checked': checked}
     resource_rules = []
@@ -143,7 +144,8 @@ def theme_qss(theme='dark', text_size='medium'):
             f'QFrame#statCard[tone="{tone}"] {{ background: {background}; border: 1px solid {border}; '
             f'border-bottom: 3px solid {border}; }} '
             f'QFrame#statCard[tone="{tone}"] QLabel#statTitle, '
-            f'QFrame#statCard[tone="{tone}"] QLabel#statValue {{ color: {foreground}; }}'
+            f'QFrame#statCard[tone="{tone}"] QLabel#statValue, '
+            f'QFrame#statCard[tone="{tone}"] QLabel#statSub {{ color: {foreground}; }}'
         )
     qss = qss.replace('__STAT_TONE_STYLES__', '\n'.join(stat_rules))
     qss = qss.replace('__LIGHT_READABILITY__', light_readability)

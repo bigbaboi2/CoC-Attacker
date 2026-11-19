@@ -339,6 +339,7 @@ class MainWindow(QMainWindow):
             self.log_console.append_log(message)
         self._pending_logs.clear()
         initial_stats = self.bot.get_stats()
+        self._session_baseline = dict(initial_stats) if isinstance(initial_stats, dict) else {}
         if isinstance(initial_stats, dict):
             self._on_stats(initial_stats)
         self._refresh_devices()
@@ -1027,8 +1028,11 @@ class MainWindow(QMainWindow):
         self.card_elixir_hour = StatCard('', 'Tiên dược RPH', '—', tone='elixir')
         self.card_dark_hour = StatCard('', 'Hắc tiên dược RPH', '—', tone='dark_elixir')
         self.card_attack_scan = StatCard('', 'Lượt đánh / đã quét', '0 / 0', tone='blue')
+        for card in (self.card_total_battles, self.card_main_total, self.card_builder_total,
+                     self.card_uptime, self.card_gold, self.card_elixir, self.card_dark):
+            card.setToolTip('Góc dưới phải hiển thị số liệu ghi nhận từ lúc bật tool gần nhất.')
         for card in (self.card_gold_hour, self.card_elixir_hour, self.card_dark_hour):
-            card.setToolTip('RPH lấy tài nguyên tối đa 50 trận làng chính đã xác nhận, chia theo thời gian chu kỳ làng chính. Chỉ dùng mẫu ghi từ khi tool tách thời gian hai làng.')
+            card.setToolTip('RPH lấy tài nguyên tối đa 50 trận làng chính đã xác nhận, chia theo thời gian chu kỳ làng chính. Chỉ dùng mẫu ghi từ khi tool tách thời gian hai làng. Góc dưới phải hiển thị kỷ lục RPH cao nhất đã ghi nhận.')
         self.card_attack_scan.setToolTip('Số lượt triển khai tấn công mới / tổng căn cứ đã đánh giá, gồm cả đánh và bỏ qua. Trận đã đánh ở hàng trên là số trận xác nhận kết thúc.')
         self.card_cpu.setToolTip('CPU tiến trình tool / tổng CPU các tiến trình MuMu. Chuẩn hóa theo tổng CPU máy (0–100%); lấy mẫu mỗi 2 giây.')
         self.card_fps.setToolTip('FPS từ thời điểm trình bày khung hình SurfaceView của game qua SurfaceFlinger; không phải FPS preview. — khi không có mẫu hợp lệ hoặc khung hình không cập nhật.')
@@ -3534,19 +3538,37 @@ class MainWindow(QMainWindow):
         self._update_active_subtabs()
 
     def _on_stats(self, stats: dict):
+        baseline = getattr(self, '_session_baseline', None)
+        if not isinstance(baseline, dict):
+            baseline = dict(stats)
+            self._session_baseline = baseline
         main_battles = stats.get('battles_completed', 0)
         builder_battles = stats.get('builder_battles_completed', 0)
         builder_stars = stats.get('builder_stars_earned', 0)
+        delta_main = max(0, main_battles - baseline.get('battles_completed', 0))
+        delta_builder = max(0, builder_battles - baseline.get('builder_battles_completed', 0))
+        delta_total = delta_main + delta_builder
+        delta_uptime = max(0, stats.get('uptime_seconds', 0) - baseline.get('uptime_seconds', 0))
+        delta_gold = max(0, stats.get('gold_looted', 0) - baseline.get('gold_looted', 0))
+        delta_elixir = max(0, stats.get('elixir_looted', 0) - baseline.get('elixir_looted', 0))
+        delta_dark = max(0, stats.get('dark_looted', 0) - baseline.get('dark_looted', 0))
+
         self.card_total_battles.set_value(f'{main_battles + builder_battles:,}')
+        self.card_total_battles.set_sub_value(f'Phiên: +{delta_total:,}')
         self.card_main_total.set_value(f'{main_battles:,}')
+        self.card_main_total.set_sub_value(f'Phiên: +{delta_main:,}')
         self.card_builder_total.set_value(f'{builder_battles:,}')
+        self.card_builder_total.set_sub_value(f'Phiên: +{delta_builder:,}')
         self.card_builder_stars.set_value(f'{builder_stars:,}')
         self.card_builder_started.set_value(f"{stats.get('builder_battles_started', 0):,}")
         self.card_battles.set_value(f'{main_battles:,}')
         self.card_stars.set_value(f"{stats.get('stars_earned', 0):,}")
         self.card_gold.set_value(f"{stats.get('gold_looted', 0):,}")
+        self.card_gold.set_sub_value(f'Phiên: +{delta_gold:,}')
         self.card_elixir.set_value(f"{stats.get('elixir_looted', 0):,}")
+        self.card_elixir.set_sub_value(f'Phiên: +{delta_elixir:,}')
         self.card_dark.set_value(f"{stats.get('dark_looted', 0):,}")
+        self.card_dark.set_sub_value(f'Phiên: +{delta_dark:,}')
         samples=stats.get('battle_duration_samples',0)
         average=stats.get('battle_duration_ms',0)/1000/samples if samples else None
         self.lbl_avg_battle.setText('TB thời gian mỗi trận: '+(f'{average:.1f} giây · {samples:,} trận có dữ liệu' if average is not None else '—'))
@@ -3556,14 +3578,17 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_fastest_50.setText('Kỷ lục 50%: chưa có số đo')
 
-        from core.recent_rph import rates, village_history
+        from core.recent_rph import PEAK_KEYS, rates, village_history
         recent_rates,samples=rates(village_history(stats))
         self.lbl_rph_window.setText(f'RPH · {samples}/50 trận gần nhất có dữ liệu')
-        for card,key in ((self.card_gold_hour,'gold'),(self.card_elixir_hour,'elixir'),(self.card_dark_hour,'dark_elixir')):
+        for card,(key,peak_key) in zip((self.card_gold_hour,self.card_elixir_hour,self.card_dark_hour),PEAK_KEYS):
             value=recent_rates[key]
             card.set_value(f'{value:,}' if value is not None else '—')
+            peak=max(stats.get(peak_key,0),value or 0)
+            card.set_sub_value(f'Kỷ lục: {peak:,}' if peak > 0 else 'Kỷ lục: —')
         self.card_attack_scan.set_value(f"{stats.get('battles_started', 0):,} / {stats.get('bases_scanned', 0):,}")
         self.card_uptime.set_value(self._format_uptime(stats.get('uptime_seconds', 0)))
+        self.card_uptime.set_sub_value(f'Phiên: +{self._format_uptime(delta_uptime)}')
         self.card_builder_uptime.set_value(self._format_uptime(stats.get('builder_uptime_seconds', 0)))
 
     @staticmethod

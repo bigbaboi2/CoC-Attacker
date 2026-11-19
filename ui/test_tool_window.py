@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from bot.builder_army import COMBOS, REINFORCEMENT_CHOICES
 from bot.flow_tester import (
     FLOW_BY_ID,
     FLOW_DEFINITIONS,
@@ -815,6 +816,113 @@ class TestToolWindow(QMainWindow):
         v_cbt.addStretch(1)
         self._add_setting_page("main_combat", p_cbt)
 
+        # 10. Combat Làng Đêm (Builder Base)
+        p_bb = QWidget()
+        v_bb = QVBoxLayout(p_bb)
+        f_bb = QFormLayout()
+        f_bb.setSpacing(8)
+        self.combo_bb_combo = NoWheelComboBox()
+        for key, (label, _) in COMBOS.items():
+            self.combo_bb_combo.addItem(label, key)
+        self.combo_bb_combo.currentIndexChanged.connect(
+            lambda _i: self.settings.set("builder_base_combo", self.combo_bb_combo.currentData())
+        )
+        f_bb.addRow("Combo chính:", self.combo_bb_combo)
+
+        self.combo_bb_reinf1 = NoWheelComboBox()
+        self.combo_bb_reinf2 = NoWheelComboBox()
+        for key, label in REINFORCEMENT_CHOICES.items():
+            self.combo_bb_reinf1.addItem(label, key)
+            self.combo_bb_reinf2.addItem(label, key)
+        self.combo_bb_reinf1.currentIndexChanged.connect(
+            lambda _i: self.settings.set("builder_base_reinforcement_1", self.combo_bb_reinf1.currentData())
+        )
+        self.combo_bb_reinf2.currentIndexChanged.connect(
+            lambda _i: self.settings.set("builder_base_reinforcement_2", self.combo_bb_reinf2.currentData())
+        )
+        f_bb.addRow("Tiếp viện 1:", self.combo_bb_reinf1)
+        f_bb.addRow("Tiếp viện 2:", self.combo_bb_reinf2)
+
+        self.chk_bb_obstacle = QCheckBox("Vẫn bấm Attack khi gặp chướng ngại vật (nhổ cây)")
+        self.chk_bb_obstacle.toggled.connect(lambda v: self.settings.set("builder_base_obstacle_attack", v))
+        f_bb.addRow(self.chk_bb_obstacle)
+        v_bb.addLayout(f_bb)
+
+        grp_bb_sim = QGroupBox("Tùy chọn Test Combat Làng Đêm")
+        v_bb_sim = QVBoxLayout(grp_bb_sim)
+        self.chk_bb_auto_switch = QCheckBox("Tự bấm thuyền sang Làng Đêm nếu đang ở Làng chính")
+        self.chk_bb_auto_switch.setChecked(True)
+        self.chk_bb_close_menu = QCheckBox("Đóng menu Find Now sau khi soi ở chế độ Chỉ quét")
+        self.chk_bb_close_menu.setChecked(True)
+        v_bb_sim.addWidget(self.chk_bb_auto_switch)
+        v_bb_sim.addWidget(self.chk_bb_close_menu)
+        v_bb.addWidget(grp_bb_sim)
+        v_bb.addStretch(1)
+        self._add_setting_page("builder_combat", p_bb)
+
+        # 11. Nâng tường Làng Đêm (Builder Base Walls)
+        p_bb_wall = QWidget()
+        v_bb_wall = QVBoxLayout(p_bb_wall)
+        f_bb_wall = QFormLayout()
+        f_bb_wall.setSpacing(8)
+
+        self.chk_bb_wall_lowest = QCheckBox("Ưu tiên nâng tường cấp thấp nhất (quét toàn bảng)")
+        self.chk_bb_wall_lowest.toggled.connect(lambda v: self.settings.set("builder_base_wall_lowest_first", v))
+        f_bb_wall.addRow(self.chk_bb_wall_lowest)
+
+        self.combo_bb_wall_trigger = NoWheelComboBox()
+        for key, label in (
+            ("either", "Vàng hoặc dầu đạt ngưỡng"),
+            ("both", "Cả vàng và dầu đều đạt ngưỡng"),
+            ("gold", "Chỉ vàng đạt ngưỡng"),
+            ("elixir", "Chỉ dầu đạt ngưỡng"),
+        ):
+            self.combo_bb_wall_trigger.addItem(label, key)
+        self.combo_bb_wall_trigger.currentIndexChanged.connect(
+            lambda _i: self.settings.set("builder_base_wall_trigger", self.combo_bb_wall_trigger.currentData())
+        )
+        f_bb_wall.addRow("Điều kiện mở lượt:", self.combo_bb_wall_trigger)
+
+        self.spin_bb_wall_gold = NoWheelSpinBox()
+        self.spin_bb_wall_gold.setRange(0, 30_000_000)
+        self.spin_bb_wall_gold.setSingleStep(500_000)
+        self.spin_bb_wall_gold.setGroupSeparatorShown(True)
+        self.spin_bb_wall_gold.valueChanged.connect(lambda v: self.settings.set("builder_base_wall_min_gold", v))
+        f_bb_wall.addRow("Ngưỡng Builder Gold:", self.spin_bb_wall_gold)
+
+        self.spin_bb_wall_elixir = NoWheelSpinBox()
+        self.spin_bb_wall_elixir.setRange(0, 30_000_000)
+        self.spin_bb_wall_elixir.setSingleStep(500_000)
+        self.spin_bb_wall_elixir.setGroupSeparatorShown(True)
+        self.spin_bb_wall_elixir.valueChanged.connect(lambda v: self.settings.set("builder_base_wall_min_elixir", v))
+        f_bb_wall.addRow("Ngưỡng Builder Elixir:", self.spin_bb_wall_elixir)
+
+        self.spin_bb_wall_gap = NoWheelSpinBox()
+        self.spin_bb_wall_gap.setRange(100, 1000)
+        self.spin_bb_wall_gap.setSingleStep(20)
+        self.spin_bb_wall_gap.setSuffix(" ms")
+        self.spin_bb_wall_gap.valueChanged.connect(lambda v: self.settings.set("wall_quantity_fixed_gap_ms", v))
+        f_bb_wall.addRow("Độ trễ bấm +10/+1:", self.spin_bb_wall_gap)
+        v_bb_wall.addLayout(f_bb_wall)
+
+        grp_bb_wall_sim = QGroupBox("Tùy chọn Test Nâng tường Làng Đêm")
+        v_bb_wall_sim = QVBoxLayout(grp_bb_wall_sim)
+        self.chk_bb_wall_auto_switch = QCheckBox("Tự bấm thuyền sang Làng Đêm nếu đang ở Làng chính")
+        self.chk_bb_wall_auto_switch.setChecked(True)
+        self.chk_bb_wall_layout_scan = QCheckBox("Quét kiểm đếm tường 2 Stage qua Layout Editor trước")
+        self.chk_bb_wall_layout_scan.setChecked(False)
+        self.chk_bb_wall_bypass_min = QCheckBox("Bỏ qua ngưỡng Gold/Elixir tối thiểu (chỉ Giả lập)")
+        self.chk_bb_wall_bypass_min.setChecked(False)
+        self.chk_bb_wall_force_verify = QCheckBox("Xóa cache nhóm tường & ép quét lại bảng thợ")
+        self.chk_bb_wall_force_verify.setChecked(True)
+        v_bb_wall_sim.addWidget(self.chk_bb_wall_auto_switch)
+        v_bb_wall_sim.addWidget(self.chk_bb_wall_layout_scan)
+        v_bb_wall_sim.addWidget(self.chk_bb_wall_bypass_min)
+        v_bb_wall_sim.addWidget(self.chk_bb_wall_force_verify)
+        v_bb_wall.addWidget(grp_bb_wall_sim)
+        v_bb_wall.addStretch(1)
+        self._add_setting_page("builder_walls", p_bb_wall)
+
     def _add_setting_page(self, flow_id: str, widget: QWidget):
         if widget.layout() is not None:
             widget.layout().setContentsMargins(4, 4, 16, 8)
@@ -997,6 +1105,39 @@ class TestToolWindow(QMainWindow):
         self.chk_cbt_end_time.setChecked(bool(s.get("end_on_time", True)))
         self.chk_cbt_end_time.blockSignals(False)
 
+        bb_idx = max(0, self.combo_bb_combo.findData(s.get("builder_base_combo", "current")))
+        self.combo_bb_combo.blockSignals(True)
+        self.combo_bb_combo.setCurrentIndex(bb_idx)
+        self.combo_bb_combo.blockSignals(False)
+        r1_idx = max(0, self.combo_bb_reinf1.findData(s.get("builder_base_reinforcement_1", "current")))
+        self.combo_bb_reinf1.blockSignals(True)
+        self.combo_bb_reinf1.setCurrentIndex(r1_idx)
+        self.combo_bb_reinf1.blockSignals(False)
+        r2_idx = max(0, self.combo_bb_reinf2.findData(s.get("builder_base_reinforcement_2", "current")))
+        self.combo_bb_reinf2.blockSignals(True)
+        self.combo_bb_reinf2.setCurrentIndex(r2_idx)
+        self.combo_bb_reinf2.blockSignals(False)
+        self.chk_bb_obstacle.blockSignals(True)
+        self.chk_bb_obstacle.setChecked(bool(s.get("builder_base_obstacle_attack", False)))
+        self.chk_bb_obstacle.blockSignals(False)
+
+        self.chk_bb_wall_lowest.blockSignals(True)
+        self.chk_bb_wall_lowest.setChecked(bool(s.get("builder_base_wall_lowest_first", False)))
+        self.chk_bb_wall_lowest.blockSignals(False)
+        bwt_idx = max(0, self.combo_bb_wall_trigger.findData(s.get("builder_base_wall_trigger", "either")))
+        self.combo_bb_wall_trigger.blockSignals(True)
+        self.combo_bb_wall_trigger.setCurrentIndex(bwt_idx)
+        self.combo_bb_wall_trigger.blockSignals(False)
+        self.spin_bb_wall_gold.blockSignals(True)
+        self.spin_bb_wall_gold.setValue(int(s.get("builder_base_wall_min_gold", 0)))
+        self.spin_bb_wall_gold.blockSignals(False)
+        self.spin_bb_wall_elixir.blockSignals(True)
+        self.spin_bb_wall_elixir.setValue(int(s.get("builder_base_wall_min_elixir", 0)))
+        self.spin_bb_wall_elixir.blockSignals(False)
+        self.spin_bb_wall_gap.blockSignals(True)
+        self.spin_bb_wall_gap.setValue(max(100, min(1000, int(s.get("wall_quantity_fixed_gap_ms", 120)))))
+        self.spin_bb_wall_gap.blockSignals(False)
+
     def _on_flow_changed(self, _index: int):
         flow_id = self.combo_flow.currentData()
         meta = FLOW_BY_ID.get(flow_id)
@@ -1014,7 +1155,7 @@ class TestToolWindow(QMainWindow):
             "real": "Thực thi thật: Đánh hoàn chỉnh 1 trận",
         }
         for m in meta["modes"]:
-            lbl = combat_labels.get(m, MODE_LABELS.get(m, m)) if flow_id == "main_combat" else MODE_LABELS.get(m, m)
+            lbl = combat_labels.get(m, MODE_LABELS.get(m, m)) if flow_id in ("main_combat", "builder_combat") else MODE_LABELS.get(m, m)
             self.combo_mode.addItem(lbl, m)
         def_idx = max(0, self.combo_mode.findData(meta["default_mode"]))
         self.combo_mode.setCurrentIndex(def_idx)
@@ -1396,6 +1537,18 @@ class TestToolWindow(QMainWindow):
                 "ignore_loot_filter": self.chk_cbt_ignore_loot.isChecked(),
                 "return_home_after_scan": self.chk_cbt_return_home.isChecked(),
             }
+        if flow_id == "builder_combat":
+            return {
+                "auto_switch_to_builder": self.chk_bb_auto_switch.isChecked(),
+                "close_menu_after_scan": self.chk_bb_close_menu.isChecked(),
+            }
+        if flow_id == "builder_walls":
+            return {
+                "auto_switch_to_builder": self.chk_bb_wall_auto_switch.isChecked(),
+                "scan_layout_editor": self.chk_bb_wall_layout_scan.isChecked(),
+                "bypass_min_threshold": self.chk_bb_wall_bypass_min.isChecked(),
+                "force_verify_walls": self.chk_bb_wall_force_verify.isChecked(),
+            }
         return {}
 
     def _start_test(self):
@@ -1408,7 +1561,7 @@ class TestToolWindow(QMainWindow):
             QMessageBox.warning(self, "Thiếu thiết bị", "Hãy nhập hoặc quét chọn thiết bị ADB trước khi chạy test.")
             return
 
-        if mode == "real" and flow_id in ("upgrade_buildings", "upgrade_walls", "upgrade_army", "buy_new_buildings", "assign_apprentice", "main_combat"):
+        if mode == "real" and flow_id in ("upgrade_buildings", "upgrade_walls", "upgrade_army", "buy_new_buildings", "assign_apprentice", "main_combat", "builder_combat", "builder_walls"):
             reply = QMessageBox.question(
                 self,
                 "Xác nhận chạy Thực thi thật",

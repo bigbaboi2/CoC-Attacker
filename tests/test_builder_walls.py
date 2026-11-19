@@ -440,4 +440,108 @@ class BuilderWallQuantityTests(unittest.TestCase):
         worker.words.return_value[-1] = ('2 200 000', 820, 735)
         self.assertIsNone(base.builder_building_confirmation(frame, candidate, worker))
 
+    def test_lowest_wall_row_fast_picks_cheapest_when_more_expensive_badges_are_unknown(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        rng = np.random.default_rng(7)
+        frame = rng.integers(0, 256, (900, 1600, 3), dtype=np.uint8)
+        rows = [
+            dict(x=1290, y=180, cost=1_000_000, available=2),
+            dict(x=1290, y=300, cost=800_000, available=97),
+            dict(x=1290, y=420, cost=600_000, available=71),
+        ]
+        base.adb = SimpleNamespace(_guard_input=Mock(), screencap=Mock(return_value=frame), swipe=Mock())
+        base.walls = SimpleNamespace(
+            menu_words=Mock(return_value=[('page', 0, 0)]),
+            menu_rows=Mock(side_effect=lambda *args, **kwargs: [dict(r) for r in rows]),
+            menu_signature=Mock(return_value=('page',)),
+            ocr_positions=Mock(return_value=[]),
+            stable_menu_row=Mock(side_effect=lambda row: row),
+            is_menu_open=Mock(return_value=False),
+        )
+        base.capture_wall_pages = Mock(return_value=([frame], frame))
+        base.builder_wall_badge_template = Mock(side_effect=lambda _img, y: 8 if y == 420 else None)
+        base.wait_for_wall_selection = Mock(return_value=(frame, 7))
+        base.tap = Mock()
+        logs = []
+        with patch('bot.builder_base.time.sleep'):
+            row, _ = base.lowest_wall_row(frame, 1_315_062, logs.append, min_level=1)
+        self.assertIsNotNone(row)
+        self.assertEqual((row['available'], row['cost'], row['upgrade_level']), (71, 600_000, 8))
+        # Verified only once without falling back to precise=True full scan!
+        self.assertEqual(base.wait_for_wall_selection.call_count, 1)
+        self.assertTrue(any('Chọn nhanh nhóm giá thấp nhất' in line for line in logs))
+
+    def test_wall_quantity_buttons_detects_builder_base_add_wall_via_ocr_fallback(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.LOCAL = BuilderBaseManager.LOCAL
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        base.walls = SimpleNamespace(
+            ocr_positions=Mock(return_value=[('Remove', 538, 731), ('Add Wall', 713, 743), ('Upgrade', 889, 746)])
+        )
+        buttons = base.wall_quantity_buttons(frame, 71)
+        self.assertEqual(buttons, {1: (713, 743)})
+
+    def test_wall_payment_button_single_wall_accepts_popup_confirmation(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        base.match = Mock(return_value=None)
+        base.vision = SimpleNamespace(
+            wall_confirmation=Mock(return_value=True),
+            match_template=Mock(return_value=(890, 610)),
+        )
+        base.walls = SimpleNamespace(texts=Mock(return_value=['Upgrade 1 wall for 600 000 Builder Gold?']))
+        pt = base.wall_payment_button(frame, 7, 'gold', 600_000, 1)
+        self.assertEqual(pt, (890, 610))
+
+    def test_enter_and_leave_zoom_out_before_searching_boat(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        frame = object()
+        base.is_home = Mock(return_value=False)
+        base.is_main = Mock(return_value=True)
+        base.match = Mock(return_value=(500, 480, 40, 40, .9))
+        base.adb = SimpleNamespace(zoom_out_map=Mock(), swipe=Mock(), screencap=Mock(return_value=frame))
+        base.tap = Mock()
+        base.wait_for = Mock(return_value=frame)
+        with patch('bot.builder_base.time.sleep'):
+            self.assertTrue(base.enter(frame))
+        base.adb.zoom_out_map.assert_called_once_with(times=2)
+
+        base.adb.zoom_out_map.reset_mock()
+        base.is_home = Mock(return_value=True)
+        base.night_palette = Mock(return_value=True)
+        base.match = Mock(return_value=(1000, 350, 40, 40, .9))
+        with patch('bot.builder_base.time.sleep'):
+            self.assertTrue(base.leave(frame))
+        base.adb.zoom_out_map.assert_called_once_with(times=2)
+
+    def test_run_cycle_retries_enter_immediately_without_60s_cooldown(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        base.settings = {'builder_base_enabled': True, 'builder_base_collect_cart': False}
+        base.retry_after = 0
+        base.next_cart_check = 0
+        base.next_resource_scan = 0
+        base.ready_actions = Mock(return_value=[('builder_base_battle', Mock())])
+        base.enter = Mock(side_effect=[False, False])
+        base.deselect = Mock()
+        base.adb = SimpleNamespace(screencap=Mock(return_value=object()))
+        logs = []
+        base.run_cycle(object(), logs.append)
+        self.assertEqual(base.enter.call_count, 2)
+        self.assertEqual(base.retry_after, 0)
+        self.assertTrue(any('không đợi 60 giây' in line for line in logs))
+
+    def test_wall_payment_button_single_wall_supports_right_side_confirm_layout(self):
+        base = BuilderBaseManager.__new__(BuilderBaseManager)
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        # Layout B: Confirm button at (1100, 760) with purple elixir icon at (1190..1230, 775..815)
+        frame[775:815, 1185:1235] = (220, 40, 180)
+        base.match = Mock(side_effect=[None, (1100, 760, 140, 40, 0.92), None])
+        base.vision = SimpleNamespace(wall_confirmation=Mock(return_value=False))
+        base.walls = SimpleNamespace(
+            texts=Mock(return_value=['Upgrade Wall to Level 8?']),
+            amount=Mock(return_value=600_000),
+        )
+        pt = base.wall_payment_button(frame, 7, 'elixir', 600_000, 1)
+        self.assertEqual(pt, (1100, 760))
+
 if __name__ == '__main__': unittest.main()

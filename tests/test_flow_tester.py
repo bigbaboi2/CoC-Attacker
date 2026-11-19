@@ -513,6 +513,112 @@ class FlowTesterTests(unittest.TestCase):
         self.assertEqual(res.status, "PASS")
         self.assertIn("2 sao", res.summary)
 
+    def test_builder_combat_scan_only_opens_menu_without_finding(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        with patch("bot.builder_base.BuilderBaseManager.is_home", return_value=True), \
+             patch("bot.builder_battle.BuilderBattle.phase", return_value=None), \
+             patch("bot.builder_battle.BuilderBattle.find_now", side_effect=[None, (1180, 620, 180, 60)]), \
+             patch("bot.builder_battle.BuilderBattle.open_menu", return_value=adb.screencap()) as mock_open, \
+             patch("bot.builder_base.BuilderBaseManager.close_panel", return_value=True) as mock_close:
+            res = runner.run_flow("builder_combat", mode="scan_only", options={"close_menu_after_scan": True})
+
+        mock_open.assert_called_once()
+        mock_close.assert_called_once()
+        self.assertEqual(res.status, "PASS")
+        self.assertEqual(res.details["find_now"], (1180, 620))
+        self.assertEqual(adb.taps, [])
+
+    def test_builder_combat_until_confirm_scans_active_battle_without_dropping(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        fake_approach = ((880, 180), [0.8, 0.6], [-0.6, 0.8], 80)
+        with patch("bot.builder_battle.BuilderBattle.phase", return_value="scouting"), \
+             patch("bot.builder_battle.BuilderBattle.cards", return_value=[("night_witch", (303, 808)), ("bomber", (937, 818))]), \
+             patch("bot.builder_battle.BuilderBattle.entry", return_value=fake_approach), \
+             patch("bot.builder_battle.BuilderBattle.stack_count", return_value=None), \
+             patch("bot.builder_battle.BuilderBattle.slot_state", return_value="waiting"):
+            res = runner.run_flow("builder_combat", mode="until_confirm")
+
+        self.assertEqual(res.status, "PASS")
+        self.assertEqual(res.details["drop_points"], 2)
+        self.assertEqual(adb.taps, [])
+
+    def test_builder_combat_real_runs_battle(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        with patch("bot.builder_base.BuilderBaseManager.is_home", return_value=True), \
+             patch("bot.builder_battle.BuilderBattle.phase", return_value=None), \
+             patch("bot.builder_battle.BuilderBattle.find_now", return_value=None), \
+             patch("bot.builder_battle.BuilderBattle.start", return_value=True) as mock_start:
+            res = runner.run_flow("builder_combat", mode="real")
+
+        mock_start.assert_called_once()
+        self.assertEqual(res.status, "PASS")
+
+    def test_builder_walls_scan_only_reports_balances_and_never_taps(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        fake_res = {"gold": 1_250_000, "elixir": 900_000, "valid": {"gold": True, "elixir": True}}
+        with patch("bot.builder_base.BuilderBaseManager.is_home", return_value=True), \
+             patch.object(vision, "read_village_resources", return_value=fake_res), \
+             patch("bot.builder_base.BuilderBaseManager.confirmed_free_builders", return_value=2):
+            res = runner.run_flow("builder_walls", mode="scan_only", options={"bypass_min_threshold": True})
+
+        self.assertEqual(res.status, "PASS")
+        self.assertEqual(res.details["gold"], 1_250_000)
+        self.assertEqual(res.details["free_builders"], 2)
+        self.assertEqual(adb.taps, [])
+
+    def test_builder_walls_until_confirm_intercepts_payment_tap(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        fake_res = {"gold": 1_500_000, "elixir": 0, "valid": {"gold": True, "elixir": False}}
+
+        def fake_upgrade_wall(self_mgr, screen, log, eligible_resources=None):
+            return self_mgr.confirm_wall_upgrade(screen, 7, log, row={"cost": 600_000}, quantity=2, eligible_resources=eligible_resources)
+
+        with patch("bot.builder_base.BuilderBaseManager.is_home", return_value=True), \
+             patch.object(vision, "read_village_resources", return_value=fake_res), \
+             patch("bot.builder_base.BuilderBaseManager.confirmed_free_builders", return_value=1), \
+             patch("bot.builder_base.BuilderBaseManager.upgrade_wall", new=fake_upgrade_wall), \
+             patch("bot.builder_base.BuilderBaseManager.wall_offer", side_effect=lambda _s, r: ((450, 760), 1_200_000) if r == "gold" else None), \
+             patch("bot.builder_base.BuilderBaseManager.wall_payment_button", return_value=(890, 620)), \
+             patch("bot.flow_tester.FlowTestRunner._cleanup_builder_dialogs"):
+            res = runner.run_flow("builder_walls", mode="until_confirm", options={"bypass_min_threshold": True})
+
+        self.assertEqual(res.status, "PASS")
+        self.assertEqual(res.details["confirm_point"], (890, 620))
+        self.assertEqual(res.details["quantity"], 2)
+        # Opened dialog at (450, 760) but NEVER tapped the final payment button (890, 620)!
+        self.assertIn((450, 760), adb.taps)
+        self.assertNotIn((890, 620), adb.taps)
+
+    def test_builder_walls_real_runs_wall_cycle(self):
+        adb = _FakeADB()
+        vision = _FakeVision()
+        runner = FlowTestRunner(adb, vision, self.settings, log_cb=self.logs.append)
+
+        fake_res = {"gold": 1_500_000, "elixir": 0, "valid": {"gold": True, "elixir": False}}
+        with patch("bot.builder_base.BuilderBaseManager.is_home", return_value=True), \
+             patch.object(vision, "read_village_resources", return_value=fake_res), \
+             patch("bot.builder_base.BuilderBaseManager.confirmed_free_builders", return_value=1), \
+             patch("bot.builder_base.BuilderBaseManager.upgrade_wall_cycle", return_value=True) as mock_cycle:
+            res = runner.run_flow("builder_walls", mode="real")
+
+        mock_cycle.assert_called_once()
+        self.assertEqual(res.status, "PASS")
+
     def test_ui_test_tool_window_smoke(self):
         app = QApplication.instance() or QApplication(sys.argv)
         win = TestToolWindow(
@@ -520,7 +626,7 @@ class FlowTesterTests(unittest.TestCase):
             main_config_path=str(Path(self.tmpdir.name) / "nonexistent_main.json"),
         )
         try:
-            self.assertEqual(win.combo_flow.count(), 9)
+            self.assertEqual(win.combo_flow.count(), 11)
             for idx in range(win.combo_flow.count()):
                 win.combo_flow.setCurrentIndex(idx)
                 app.processEvents()

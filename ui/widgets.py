@@ -173,11 +173,11 @@ class StatCard(QFrame):
         super().__init__()
         self.setObjectName('statCard')
         self.setProperty('tone', tone)
-        self.setMinimumHeight(92)
+        self.setMinimumHeight(94)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(7)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(4)
 
         header_layout = QHBoxLayout()
         self.icon_lbl = QLabel(icon)
@@ -190,12 +190,25 @@ class StatCard(QFrame):
         self.value_lbl = QLabel(default_val)
         self.value_lbl.setObjectName('statValue')
 
+        footer_layout = QHBoxLayout()
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.addStretch()
+        self.sub_lbl = QLabel('')
+        self.sub_lbl.setObjectName('statSub')
+        self.sub_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        footer_layout.addWidget(self.sub_lbl)
+
         layout.addLayout(header_layout)
         layout.addWidget(self.value_lbl)
+        layout.addLayout(footer_layout)
 
     def set_value(self, val: str):
         if self.value_lbl.text() != val:
             self.value_lbl.setText(val)
+
+    def set_sub_value(self, val: str):
+        if self.sub_lbl.text() != val:
+            self.sub_lbl.setText(val)
 
 class LiveScreenViewer(QLabel):
     """

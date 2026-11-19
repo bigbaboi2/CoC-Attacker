@@ -324,6 +324,90 @@ class AppearanceTests(unittest.TestCase):
             finally:
                 window._exit_completely()
 
+    def test_overview_session_deltas_and_rph_peaks(self):
+        from core.recent_rph import append_battle, update_peak_rates
+        from core.stats_store import StatsStore
+
+        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
+            config_path = Path(directory) / 'config.json'
+            stats_path = Path(directory) / 'stats.json'
+            store = StatsStore(str(stats_path))
+            seed = {
+                'battles_completed': 100,
+                'builder_battles_completed': 10,
+                'uptime_seconds': 3600,
+                'builder_uptime_seconds': 600,
+                'gold_looted': 10_000_000,
+                'elixir_looted': 8_000_000,
+                'dark_looted': 50_000,
+                'rph_updated_uptime_seconds': 3000,
+                'rph_window_start_uptime_seconds': 2940,
+                'rph_window_version': 2,
+                'rph_village_start_battle': 99,
+                'rph_history': [
+                    {'battle': 100, 'uptime_seconds': 3000, 'elapsed_seconds': 60,
+                     'gold': 500_000, 'elixir': 400_000, 'dark_elixir': 3_000},
+                ],
+                'max_gold_rph': 30_000_000,
+                'max_elixir_rph': 24_000_000,
+                'max_dark_rph': 180_000,
+            }
+            store.save(seed)
+
+            with patch.object(ui, 'BotSettings', side_effect=lambda: BotSettings(str(config_path))):
+                window = ui.MainWindow()
+            try:
+                # Initially session deltas are 0 and peaks reflect stored records
+                self.assertEqual(window.card_total_battles.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_main_total.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_builder_total.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_uptime.sub_lbl.text(), 'Phiên: +00:00')
+                self.assertEqual(window.card_gold.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_elixir.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_dark.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_gold_hour.sub_lbl.text(), 'Kỷ lục: 30,000,000')
+                self.assertEqual(window.card_elixir_hour.sub_lbl.text(), 'Kỷ lục: 24,000,000')
+                self.assertEqual(window.card_dark_hour.sub_lbl.text(), 'Kỷ lục: 180,000')
+                self.assertIn('QLabel#statSub', theme_qss('dark', 'medium'))
+                self.assertIn('QLabel#statSub', theme_qss('light', 'large'))
+
+                # Simulate progress in this session with a slower battle (lower current RPH, peak preserved)
+                updated = window.bot.get_stats()
+                updated['battles_completed'] += 1
+                updated['builder_battles_completed'] += 2
+                updated['uptime_seconds'] += 125
+                updated['gold_looted'] += 250_000
+                updated['elixir_looted'] += 180_000
+                updated['dark_looted'] += 1_500
+                append_battle(updated, {'gold': 250_000, 'elixir': 180_000, 'dark_elixir': 1_500}, 3120)
+                update_peak_rates(updated)
+                window._on_stats(updated)
+
+                self.assertEqual(window.card_total_battles.sub_lbl.text(), 'Phiên: +3')
+                self.assertEqual(window.card_main_total.sub_lbl.text(), 'Phiên: +1')
+                self.assertEqual(window.card_builder_total.sub_lbl.text(), 'Phiên: +2')
+                self.assertEqual(window.card_uptime.sub_lbl.text(), 'Phiên: +02:05')
+                self.assertEqual(window.card_gold.sub_lbl.text(), 'Phiên: +250,000')
+                self.assertEqual(window.card_elixir.sub_lbl.text(), 'Phiên: +180,000')
+                self.assertEqual(window.card_dark.sub_lbl.text(), 'Phiên: +1,500')
+                # Peak RPH must not drop below 30,000,000 / 24,000,000 / 180,000
+                self.assertEqual(window.card_gold_hour.sub_lbl.text(), 'Kỷ lục: 30,000,000')
+                self.assertEqual(window.card_elixir_hour.sub_lbl.text(), 'Kỷ lục: 24,000,000')
+                self.assertEqual(window.card_dark_hour.sub_lbl.text(), 'Kỷ lục: 180,000')
+
+                # Simulate a faster battle pushing peak RPH higher and verify persistence
+                updated['battles_completed'] += 1
+                append_battle(updated, {'gold': 5_000_000, 'elixir': 4_000_000, 'dark_elixir': 30_000}, 3150)
+                update_peak_rates(updated)
+                self.assertGreater(updated['max_gold_rph'], 30_000_000)
+                store.save(updated)
+                reloaded = store.load(updated)
+                self.assertEqual(reloaded['max_gold_rph'], updated['max_gold_rph'])
+                window._on_stats(updated)
+                self.assertEqual(window.card_gold_hour.sub_lbl.text(), f"Kỷ lục: {updated['max_gold_rph']:,}")
+            finally:
+                window._exit_completely()
+
 
 if __name__ == '__main__':
     unittest.main()

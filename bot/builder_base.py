@@ -59,6 +59,8 @@ class BuilderBaseManager:
         self._wall_verified_at = 0
         self._elixir_wall_unavailable_at = 0
         self._building_transaction_pending_until = 0
+        self._wall_payment_armed = False
+        self._pending_wall_confirm = None
 
     def pause_tool(self, log, reason):
         log(f"[BH] {reason}. Tạm dừng tool theo thiết lập.")
@@ -245,7 +247,18 @@ class BuilderBaseManager:
     def enter(self, screen):
         if self.is_home(screen):
             return True
-        for attempt in range(3):
+        if not self.is_main(screen):
+            return False
+        zoom_out = getattr(self.adb, "zoom_out_map", None)
+        if callable(zoom_out):
+            zoom_out(times=2)
+            time.sleep(.35)
+            fresh = self.adb.screencap()
+            if fresh is not None:
+                screen = fresh
+        for attempt in range(4):
+            if self.is_home(screen):
+                return True
             if not self.is_main(screen):
                 return False
             boat = self.match(screen, ("builder_boat_home", "thuyensun", "builder_boat_badge"),
@@ -253,7 +266,7 @@ class BuilderBaseManager:
             if self.boat_tap_is_clear(boat):
                 self.tap(boat)
                 return self.wait_for(self.is_home, 15) is not None
-            if attempt < 2:
+            if attempt < 3:
                 # Move the southwest shore away from the bottom-left HUD.
                 self.adb.swipe(520, 570, 870, 320, duration_ms=510, jitter=0)
                 time.sleep(.55)
@@ -283,6 +296,13 @@ class BuilderBaseManager:
     def leave(self, screen):
         if not self.is_home(screen):
             return self.is_main(screen)
+        zoom_out = getattr(self.adb, "zoom_out_map", None)
+        if callable(zoom_out):
+            zoom_out(times=2)
+            time.sleep(.35)
+            fresh = self.adb.screencap()
+            if fresh is not None:
+                screen = fresh
         boat = self.locate_shore(screen, ("thuyennight", "thuyensun", "builder_return_boat"),
                                  (690, 60, 910, 595), .84)
         if not boat:
@@ -533,6 +553,20 @@ class BuilderBaseManager:
         eligible = self.wall_opening_resources(balances)
         mode = self.settings.get('builder_base_wall_trigger', 'either')
         allowed = {'gold', 'elixir'} if mode in ('either', 'both') else {mode}
+        log(
+            f"[BH] Cấu hình tường: trigger={mode}, resource={self.settings.get('builder_base_wall_resource', 'both')}, "
+            f"lowest_first={bool(self.settings.get('builder_base_wall_lowest_first', False))}, "
+            f"min_gold={self.settings.get('builder_base_wall_min_gold', 0):,}, "
+            f"min_elixir={self.settings.get('builder_base_wall_min_elixir', 0):,}."
+        )
+        raw_read = getattr(self, '_last_wall_balance_read', {}) or {}
+        if isinstance(raw_read, dict):
+            raw_valid = raw_read.get('valid', {}) if isinstance(raw_read.get('valid'), dict) else {}
+            log(
+                f"[BH] Ví BH đọc được: gold={raw_read.get('gold')}(hợp_lệ={raw_valid.get('gold')}), "
+                f"elixir={raw_read.get('elixir')}(hợp_lệ={raw_valid.get('elixir')}), "
+                f"eligible={sorted(eligible) if eligible else []}."
+            )
         for name, label in (("gold", "Builder Gold"), ("elixir", "Builder Elixir")):
             if name not in allowed:
                 continue
@@ -567,6 +601,7 @@ class BuilderBaseManager:
             log("[BH] Vàng và dầu đều đủ điều kiện; tìm tường theo tùy chọn ưu tiên hiện tại.")
 
         free_builders = self.confirmed_free_builders(screen)
+        log(f"[BH] Thợ xây làng đêm rảnh: {free_builders if free_builders is not None else 'chưa đọc chắc'}.")
         if free_builders == 0:
             log("[BH] Đã dùng hết thợ xây làng đêm (0 thợ rảnh).")
             if self.settings.get("builder_base_pause_on_no_upgrades", False):
@@ -575,16 +610,20 @@ class BuilderBaseManager:
             return False
 
         upgraded = False
-        for _ in range(10):
+        for attempt_idx in range(10):
             self.adb._guard_input()
             if not (self.settings.get("builder_base_enabled", False)
                     and self.settings.get("builder_base_upgrade_walls", False)):
+                log("[BH] Tùy chọn tự nâng tường làng đêm đang tắt; dừng chu trình.")
                 break
+            log(f"[BH] Bắt đầu lượt chọn tường #{attempt_idx + 1}/10 (eligible={sorted(eligible)}).")
             result = self.upgrade_wall(screen, log, eligible_resources=eligible)
             if result is None:
+                log(f"[BH] Lượt #{attempt_idx + 1} trả về None (hoãn/chưa rõ); bỏ chọn và kết thúc chu trình.")
                 self.deselect()
                 return None
             if not result:
+                log(f"[BH] Lượt #{attempt_idx + 1} trả về False (không nâng được thêm); dừng vòng lặp.")
                 break
             upgraded = True
             self._wall_verified_groups = {}
@@ -593,6 +632,7 @@ class BuilderBaseManager:
             self.consecutive_no_wall_count = 0
             screen = self.adb.screencap()
             if not self.is_home(screen):
+                log("[BH] Không còn ở màn hình làng đêm sau khi nâng; dừng vòng lặp.")
                 break
 
             # Re-read balances and re-verify threshold conditions
@@ -820,22 +860,32 @@ class BuilderBaseManager:
         """Try the suggested wall, then a bounded single-wall fallback before payment."""
         elixir_only = eligible_resources is not None and set(eligible_resources) == {'elixir'}
         budget = max(self.wall_balances(screen, eligible_resources).values(), default=0) if eligible_resources is not None else None
+        priority = self.settings.get("builder_base_wall_lowest_first", False) or elixir_only
+        log(
+            f"[BH] upgrade_wall: eligible={sorted(eligible_resources) if eligible_resources else 'any'}, "
+            f"elixir_only={elixir_only}, budget={f'{budget:,}' if type(budget) is int else budget}, "
+            f"priority_lowest={priority}, menu_open={self.walls.is_menu_open(screen)}."
+        )
         if not self.walls.is_menu_open(screen):
             tab = self.match(screen, ("upgrade2/ui/night_builder_tab",), (1390, 640, 140, 90),
                              .80, (.85, 1., 1.15))
             # The Builder Base builder badge is on the right, above Build.
             if not self.is_home(screen):
+                log("[BH] Không ở màn hình làng đêm trước khi mở bảng thợ.")
                 return False
             builder_button = tab or (1455, 690)
+            log(f"[BH] Mở bảng thợ qua {'template ' + str(tab[:2]) if tab else 'tọa độ mặc định (1455, 690)'}.")
             self.tap(builder_button)
             screen = self.wait_for(self.walls.is_menu_open, 2)
             if screen is None and self.is_home(self.adb.screencap()):
                 # The first tap can clear a selected wall instead of opening the menu.
+                log("[BH] Tap lần 1 chưa mở bảng thợ (có thể vừa bỏ chọn đối tượng); thử tap lần 2.")
                 self.tap(builder_button)
                 screen = self.wait_for(self.walls.is_menu_open, 2)
+            if screen is None:
+                log("[BH] Không mở được bảng thợ để chọn tường.")
 
         row = None
-        priority = self.settings.get("builder_base_wall_lowest_first", False) or elixir_only
         if screen is not None and priority and self.walls.is_menu_open(screen):
             row, screen = self.lowest_wall_row(screen, budget, log, min_level=6 if elixir_only else 1)
             if row is None:
@@ -844,15 +894,22 @@ class BuilderBaseManager:
                     self.tap((1570, 30), .35)
                 return None
             if not row.get('_already_selected'):
+                log(f"[BH] Bấm chọn hàng tường x{row.get('available')} giá {row.get('cost'):,} tại ({row['x']}, {row['y'] + 12}).")
                 self.tap((row["x"], row["y"] + 12), .55)
                 screen = self.adb.screencap()
         if screen is not None and not priority:
             previous = None
             for step in range(8):
                 if not self.walls.is_menu_open(screen):
+                    log(f"[BH] Bảng thợ đã đóng ở bước gợi ý {step+1}.")
                     break
                 words = self.walls.ocr_positions(screen, (1180, 65, 415, 730))
                 rows = self.walls.menu_rows(screen, words)
+                log(
+                    f"[BH] Gợi ý trang {step+1}/8: đọc {len(words or ())} từ OCR, "
+                    f"thấy {len(rows)} hàng tường"
+                    + (": " + ", ".join(f"x{r['available']}@{r['cost']:,}(y={r['y']})" for r in rows) if rows else ".")
+                )
                 if step == 0 and not rows:
                     all_done = False
                     try:
@@ -878,12 +935,16 @@ class BuilderBaseManager:
                             self.pause_tool(log, "Hết thứ để nâng (All Upgrades Complete)")
                         break
                 if budget is not None:
+                    before_len = len(rows)
                     rows = [row for row in rows if row["cost"] <= budget]
+                    if before_len and len(rows) < before_len:
+                        log(f"[BH] Lọc theo ngân sách {budget:,}: giữ {len(rows)}/{before_len} hàng.")
                 if rows:
                     candidate = min(rows, key=lambda item: item["cost"])
                     stable = self.walls.stable_menu_row(candidate)
                     if stable is not None and 65 <= stable["y"] <= 775:
                         row = stable
+                        log(f"[BH] Chọn ứng viên gợi ý rẻ nhất: Wall x{row['available']} giá {row['cost']:,} tại ({row['x']}, {row['y'] + 12}).")
                         # OCR reports the title near the top of the card.
                         # Tap the card interior after the scrolling list settles.
                         self.tap((row["x"], row["y"] + 12), .55)
@@ -894,6 +955,7 @@ class BuilderBaseManager:
                     break
                 signature = self.walls.menu_signature(words)
                 if (signature and signature == previous) or step == 7:
+                    log(f"[BH] Dừng cuộn bảng gợi ý tại bước {step+1} ({'trùng chữ ký cuối bảng' if signature == previous else 'hết 8 bước'}).")
                     break
                 previous = signature
                 self.adb.swipe(1445, 746, 1445, 290, duration_ms=510, jitter=0)
@@ -911,10 +973,11 @@ class BuilderBaseManager:
         level = None
         if row:
             screen, level = self.wait_for_wall_selection()
+            log(f"[BH] Kết quả đọc thanh tường sau chọn: level={level}, row_upgrade_level={row.get('upgrade_level')}.")
         if row and level is None:
             log("[BH] Chưa đọc được cấp tường ổn định sau khi chọn; chuyển sang chọn trên bản đồ.")
         if priority and (level is None or level + 1 != row.get('upgrade_level')):
-            log("[BH] Cấp tường đã chọn chưa khớp nhóm ưu tiên; hoãn lượt nâng.")
+            log(f"[BH] Cấp tường đã chọn ({level}) chưa khớp nhóm ưu tiên (mục tiêu sau nâng={row.get('upgrade_level') if row else None}); hoãn lượt nâng.")
             return None
         if level is not None:
             log(f"[BH] Đã chọn tường cấp {level} từ bảng gợi ý; kiểm tra số lượng và giá.")
@@ -955,7 +1018,7 @@ class BuilderBaseManager:
 
     def lowest_wall_row(self, screen, budget, log, precise=False, _deadline=None, min_level=1):
         """Scan the whole builder list before choosing a verified lowest level."""
-        log("[BH] Đang quét toàn bộ bảng thợ để tìm nhóm tường cấp thấp nhất.")
+        log(f"[BH] Đang quét toàn bộ bảng thợ để tìm nhóm tường cấp thấp nhất (precise={precise}, min_level={min_level}, budget={f'{budget:,}' if type(budget) is int else budget}).")
         deadline = _deadline if _deadline is not None else time.monotonic() + 100
         def expired():
             self.adb._guard_input()
@@ -972,7 +1035,10 @@ class BuilderBaseManager:
             rows = [item for item in self.walls.menu_rows(frame, words, read_level=False) if 80 <= item['y'] <= 735]
             if not precise:
                 for item in rows:
-                    item['badge_level'] = self.builder_wall_badge_template(frame, item['y'])
+                    badge = self.builder_wall_badge_template(frame, item['y'])
+                    if badge is None and getattr(self, 'vision', None) is not None:
+                        badge = self.builder_wall_badge_level(frame, item['y'])
+                    item['badge_level'] = badge
             return words, rows, self.walls.menu_signature(words)
 
         def find_group(item, frame, directions=('up', 'down')):
@@ -1033,6 +1099,12 @@ class BuilderBaseManager:
             known = [item for item in groups.values()
                      if type(item.get('badge_level')) is int and not item.get('badge_conflict')
                      and item['badge_level'] >= min_level + 1]
+            if groups:
+                summary = ', '.join(
+                    f"x{g['available']}@{g['cost']:,}[p{g['page']+1},huy_hieu={g.get('badge_level') or '?'}{'*' if g.get('badge_conflict') else ''}]"
+                    for g in groups.values()
+                )
+                log(f"[BH] Tổng hợp {len(groups)} nhóm tường: {summary} | không rõ={len(unknown)}, hợp lệ(>=cấp {min_level})={len(known)}.")
             if min_level > 1:
                 skipped = sum(1 for item in groups.values() if type(item.get('badge_level')) is int
                               and not item.get('badge_conflict') and item['badge_level'] < min_level + 1)
@@ -1048,9 +1120,24 @@ class BuilderBaseManager:
                 log(f"[BH] Bảng thợ không có nhóm tường từ cấp {min_level} có thể nâng. "
                     "Tường đã đạt cấp tối đa không xuất hiện trong danh sách nâng cấp.")
                 return None, screen
-            if groups and len(unknown) <= 1:
-                candidate = unknown[0] if unknown else min(known, key=lambda item: (item['badge_level'], item['cost']))
-                if not unknown and budget is not None and candidate['cost'] > budget:
+            cheapest = min(groups.values(), key=lambda r: (r['cost'], r['available'])) if groups else None
+            cheapest_is_lowest = (
+                cheapest is not None
+                and min_level == 1
+                and all(u is cheapest or u['cost'] > cheapest['cost'] for u in unknown)
+            )
+            if groups and (len(unknown) <= 1 or cheapest_is_lowest):
+                if cheapest_is_lowest and len(unknown) > 1:
+                    candidate = cheapest
+                    candidate_is_unknown = cheapest in unknown
+                    log(
+                        f"[BH] Chọn nhanh nhóm giá thấp nhất Wall x{candidate['available']} giá {candidate['cost']:,} "
+                        f"(huy hiệu={candidate.get('badge_level') or '?'}; các nhóm chưa rõ đều đắt hơn)."
+                    )
+                else:
+                    candidate = unknown[0] if unknown else min(known, key=lambda item: (item['badge_level'], item['cost']))
+                    candidate_is_unknown = bool(unknown)
+                if not candidate_is_unknown and budget is not None and candidate['cost'] > budget:
                     log(f"[BH] Tường cấp thấp nhất cần {candidate['cost']:,}; chưa đủ tài nguyên hợp lệ.")
                     return None, screen
                 log(f"[BH] Wall x{candidate['available']} giá {candidate['cost']:,} xuất hiện ở trang {candidate['page']+1}; tìm lại bằng ảnh hàng đã chụp.")
@@ -1069,12 +1156,13 @@ class BuilderBaseManager:
                         y = 75 + point[1] + 20
                         log(f"[BH] Thấy ảnh hàng sau {step} lần vuốt về, điểm khớp {score:.3f}, y={y}; đối chiếu số lượng và giá.")
                         words = self.walls.ocr_positions(screen, (1235, max(50, y-25), 365, 105))
-                        found = next((r for r in self.walls.menu_rows(screen, words, read_level=False)
+                        ocr_rows = self.walls.menu_rows(screen, words, read_level=False)
+                        found = next((r for r in ocr_rows
                                       if r['cost'] == candidate['cost'] and r['available'] == candidate['available']
                                       and abs(r['y']-y) <= 25), None)
                         if found:
                             break
-                        log("[BH] Ảnh hàng khớp nhưng chữ hoặc giá chưa khớp; tiếp tục tìm.")
+                        log(f"[BH] Ảnh hàng khớp nhưng chữ hoặc giá chưa khớp (OCR thấy {[(r['available'], r['cost'], r['y']) for r in ocr_rows]}); tiếp tục tìm.")
                     self.adb.swipe(1410, 300, 1410, 600, duration_ms=420, jitter=0)
                     time.sleep(.55)
                     fresh = self.adb.screencap()
@@ -1095,10 +1183,10 @@ class BuilderBaseManager:
                 if self.walls.is_menu_open(menu):
                     self.tap((1570, 30), .4)
                 selected, level = self.wait_for_wall_selection()
-                if level is None or (not unknown and level + 1 != candidate['badge_level']):
-                    log("[BH] Cấp tường thực tế chưa khớp huy hiệu; hoãn nâng.")
+                if level is None or (not candidate_is_unknown and level + 1 != candidate['badge_level']):
+                    log(f"[BH] Cấp tường thực tế ({level}) chưa khớp huy hiệu ({candidate.get('badge_level')}); hoãn nâng.")
                     return None, self.adb.screencap()
-                if unknown and (level < min_level or (known and level + 1 > min(item['badge_level'] for item in known))):
+                if candidate_is_unknown and (level < min_level or (known and level + 1 > min(item['badge_level'] for item in known))):
                     if not known:
                         log(f"[BH] Nhóm chưa rõ là cấp {level}; kiểm tra lại toàn bảng bằng OCR để tìm tường từ cấp {min_level}.")
                         self.tap((1455, 690))
@@ -1233,7 +1321,8 @@ class BuilderBaseManager:
         self._wall_verified_at = time.monotonic()
         cache = self._wall_verified_groups
         verified = []
-        for item in sorted(groups.values(), key=lambda row: row['cost']):
+        sorted_groups = sorted(groups.values(), key=lambda row: row['cost'])
+        for idx_g, item in enumerate(sorted_groups):
             if expired():
                 return None, screen
             key = (item['cost'], item['available'])
@@ -1256,13 +1345,20 @@ class BuilderBaseManager:
                 self.tap(close if close and close[0] > 1530 and close[1] < 55 else (1570, 30), .4)
             selected, level = self.wait_for_wall_selection()
             if level is None:
+                log(f"[BH] Chưa đọc được cấp tường thực tế cho Wall x{item['available']} (giá {item['cost']:,}); hoãn lượt.")
                 return None, self.adb.screencap()
             item['upgrade_level'] = level + 1
             cache[key] = level
             if level >= min_level:
                 verified.append(item)
             log(f"[BH] Đã kiểm tra nhóm này là tường cấp {level}.")
-            if level == min_level:
+            remaining = sorted_groups[idx_g + 1:]
+            strictly_cheapest_eligible = (
+                level >= min_level
+                and all(other['cost'] > item['cost'] for other in remaining)
+                and (not verified or all(v is item or v['upgrade_level'] >= item['upgrade_level'] for v in verified))
+            )
+            if level == min_level or strictly_cheapest_eligible:
                 if budget is not None and item['cost'] > budget:
                     log(f"[BH] Tường cấp thấp nhất cần {item['cost']:,}, số dư hợp lệ cao nhất {budget:,}.")
                     return None, selected
@@ -1275,6 +1371,7 @@ class BuilderBaseManager:
                 self.tap((1455, 690))
                 screen = self.wait_for(self.walls.is_menu_open, 3)
             if screen is None:
+                log("[BH] Không mở lại được bảng thợ để kiểm tra nhóm tường tiếp theo.")
                 return None, self.adb.screencap()
         if not verified:
             log(f"[BH] Không xác nhận được tường từ cấp {min_level} phù hợp tài nguyên; kết thúc lượt.")
@@ -1297,13 +1394,13 @@ class BuilderBaseManager:
         def region(frame):
             if not isinstance(frame, np.ndarray) or frame.shape[:2] != (900, 1600):
                 return None
-            return cv2.resize(cv2.cvtColor(frame[75:790, 1220:1580], cv2.COLOR_BGR2GRAY), (180, 358))
+            return cv2.resize(cv2.cvtColor(frame[95:775, 1245:1570], cv2.COLOR_BGR2GRAY), (162, 340))
 
         def move(direction):
             self.adb._guard_input()
             a, b = (300, 600) if direction == 'up' else (700, 400)
-            self.adb.swipe(1410, a, 1410, b, duration_ms=420, jitter=0)
-            time.sleep(.55)
+            self.adb.swipe(1410, a, 1410, b, duration_ms=380, jitter=0)
+            time.sleep(.38)
             return self.adb.screencap()
 
         for _ in range(24):
@@ -1313,7 +1410,7 @@ class BuilderBaseManager:
             fresh = move('up')
             if region(fresh) is None:
                 return None
-            if np.mean(cv2.absdiff(region(screen), region(fresh))) < 2.0:
+            if np.mean(cv2.absdiff(region(screen), region(fresh))) < 2.6:
                 screen = fresh
                 break
             screen = fresh
@@ -1328,7 +1425,7 @@ class BuilderBaseManager:
             fresh = move('down')
             if region(fresh) is None:
                 return None
-            if np.mean(cv2.absdiff(region(screen), region(fresh))) < 2.0:
+            if np.mean(cv2.absdiff(region(screen), region(fresh))) < 2.6:
                 return pages, fresh
             pages.append(fresh)
             screen = fresh
@@ -1365,10 +1462,10 @@ class BuilderBaseManager:
         top = max(0, int(title_y) + 10)
         region = cv2.cvtColor(screen[top:min(900, top+38), 1179:1217], cv2.COLOR_BGR2GRAY)
         scores = []
-        for level in (2, 3, 4, 5, 6, 7, 8, 9):
+        for level in (2, 3, 4, 5, 6, 7, 8, 9, 10):
             paths = list((self.LOCAL / 'wall_badges').glob(f'{level}*.png'))
             if not paths:
-                return None
+                continue
             best = -1.0
             for path in paths:
                 template = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -1376,9 +1473,12 @@ class BuilderBaseManager:
                     continue
                 _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED))
                 best = max(best, score)
-            scores.append((best, level))
+            if best > -1.0:
+                scores.append((best, level))
+        if len(scores) < 2:
+            return None
         scores.sort(reverse=True)
-        if scores[0][0] >= .95 and scores[0][0] - scores[1][0] >= .06:
+        if scores[0][0] >= .93 and scores[0][0] - scores[1][0] >= .05:
             return scores[0][1]
         return None
 
@@ -1450,10 +1550,18 @@ class BuilderBaseManager:
         affordable = []
         for resource, balance in balances.items():
             offer = self.wall_offer(screen, resource)
+            if offer:
+                log(
+                    f"[BH] Kiểm tra giá chọn nhiều đoạn ({resource}): "
+                    f"nút={offer[0]}, giá đọc={offer[1]:,}, giá hàng={row['cost']:,}, ví={balance:,}."
+                )
+            else:
+                log(f"[BH] Không đọc được nút/giá nâng tường bằng {resource} (chưa mở khóa, chữ đỏ hoặc lệch OCR).")
             if offer and offer[1] == row["cost"]:
                 affordable.append(balance // offer[1])
         target = min(cap, max(affordable, default=1))
         if target <= 1:
+            log(f"[BH] Giữ mức chọn 1 đoạn (cap={cap}, affordable={affordable}, target={target}).")
             return screen, 1
         log(f"[BH] Dự kiến chọn tối đa {target} đoạn; kiểm tra nút chọn và số tiền trước khi nâng.")
         more = self.walls.enter_more(screen)
@@ -1493,6 +1601,31 @@ class BuilderBaseManager:
                 buttons[step] = (x+w//2, y+580+h//2)
                 if step == 10:
                     excluded = (x, y, x+w, y+h)
+        if 1 not in buttons:
+            bb_tpl = cv2.imread(str(self.LOCAL / 'wall_add_1_bb.png'))
+            if bb_tpl is not None:
+                best = None
+                for scale in (.85, .95, 1., 1.05, 1.15):
+                    sample = cv2.resize(bb_tpl, None, fx=scale, fy=scale) if scale != 1. else bb_tpl
+                    if sample.shape[0] > crop.shape[0] or sample.shape[1] > crop.shape[1]:
+                        continue
+                    scores = cv2.matchTemplate(crop, sample, cv2.TM_CCOEFF_NORMED)
+                    _, score, _, (x, y) = cv2.minMaxLoc(scores)
+                    if score >= .82 and (best is None or score > best[0]):
+                        best = (score, x, y, sample.shape[1], sample.shape[0])
+                if best:
+                    _, x, y, w, h = best
+                    buttons[1] = (x + w // 2, y + 580 + h // 2)
+        if 1 not in buttons and hasattr(getattr(self, 'walls', None), 'ocr_positions'):
+            words = self.walls.ocr_positions(screen, (350, 660, 820, 145), scale=1) or ()
+            for text, cx, cy in words:
+                clean = re.sub(r'[^a-z0-9+]', '', str(text).lower())
+                if 'remove' in clean:
+                    continue
+                if ('addwall' in clean or clean in ('+1', 'add1')) and 1 not in buttons:
+                    buttons[1] = (int(cx), int(cy))
+                elif available >= 10 and ('add10' in clean or clean == '+10') and 10 not in buttons:
+                    buttons[10] = (int(cx), int(cy))
         if 10 in buttons and 1 in buttons:
             dx = buttons[1][0] - buttons[10][0]
             if not (120 <= dx <= 230 and abs(buttons[1][1] - buttons[10][1]) <= 20):
@@ -1506,7 +1639,10 @@ class BuilderBaseManager:
             save = getattr(getattr(self, 'walls', None), 'save_wall_frame', None)
             if callable(save):
                 save('builder-wall-quantity-uncertain.png', screen)
-            log("[BH] Chưa nhận diện chắc số đoạn hoặc nút +1; hoãn nâng.")
+            log(
+                f"[BH] Chưa nhận diện chắc số đoạn hoặc nút +1 "
+                f"(current={current}, target={target}, available={available}, buttons={ {k: v for k, v in buttons.items()} }); hoãn nâng."
+            )
             return None, 1
         remaining = target - current
         tens = remaining // 10 if 10 in buttons else 0
@@ -1515,18 +1651,20 @@ class BuilderBaseManager:
         if points:
             gap = max(100, min(1000, int(self.settings.get('wall_quantity_fixed_gap_ms', 120))))
             log(f"[BH] Wall x{available}: nhận diện +1" + (" và +10" if 10 in buttons else " (không có +10 khả dụng)")
-                + f"; gửi {tens} lần +10, {ones} lần +1 để chọn {target} đoạn.")
+                + f"; gửi {tens} lần +10, {ones} lần +1 để chọn {target} đoạn (gap={gap}ms).")
             self.adb.tap_batch(points, jitter=0, interval_ms=gap, delay_after=.5)
         previous = None
+        reads = []
         for _ in range(4):
             frame = self.adb.screencap()
             actual = self.builder_wall_quantity(frame)
+            reads.append(actual)
             if actual == previous and type(actual) is int and 1 <= actual <= target:
                 log(f"[BH] Đã đối chiếu số đoạn sau chọn: {actual}/{target}.")
                 return frame, actual
             previous = actual
             time.sleep(.2)
-        log("[BH] Không đọc được số đoạn ổn định sau chọn nhanh; bỏ giao dịch.")
+        log(f"[BH] Không đọc được số đoạn ổn định sau chọn nhanh (reads={reads}, target={target}); bỏ giao dịch.")
         save = getattr(getattr(self, 'walls', None), 'save_wall_frame', None)
         if callable(save):
             save('builder-wall-quantity-uncertain.png', frame)
@@ -1563,18 +1701,22 @@ class BuilderBaseManager:
         tried = []
         for material in ("wood_wall", "stone_wall", "pink_wall"):
             if not self.is_home(screen):
+                log("[BH] Mất màn hình làng đêm khi dò tường trên bản đồ.")
                 return False
             point = self.match(screen, (material,), (180, 130, 1220, 480), .86,
                                (.75, .87, 1., 1.13), tried)
             if not point:
                 continue
             tried.append(point[:2])
+            log(f"[BH] Thử chạm tường {material} trên bản đồ tại {point[:2]}.")
             self.tap(point, .45)
             screen, level = self.wait_for_wall_selection()
             if level is not None:
                 if not self.walls.wall_controls_present(screen):
+                    log(f"[BH] Chạm {material} tại {point[:2]} (cấp {level}) nhưng không thấy thanh nút nâng tường.")
                     self.deselect()
                     continue
+                log(f"[BH] Đã chọn được tường {material} cấp {level} trên bản đồ; tiến hành xác nhận.")
                 result = self.confirm_wall_upgrade(screen, level, log, eligible_resources=eligible_resources)
                 if result is None:
                     return None
@@ -1592,14 +1734,15 @@ class BuilderBaseManager:
     def wall_payment_button(self, screen, level, resource, price, quantity):
         if screen is None:
             return None
-        if quantity > 1:
+
+        def match_popup_confirmation():
             if not self.vision.wall_confirmation(screen):
                 return None
             import unicodedata
             raw_body = "".join(self.walls.texts(screen, (420, 330, 760, 200))).lower()
             norm_body = "".join(c for c in unicodedata.normalize("NFD", raw_body) if unicodedata.category(c) != "Mn").replace("đ", "d")
             body = re.sub(r"[^a-z0-9]", "", norm_body)
-            match_en = re.search(r"(?:(\d+))?wallsfor(\d+)(?:builder)?(gold|elixir)", body)
+            match_en = re.search(r"(?:(\d+))?walls?for(\d+)(?:builder)?(gold|elixir)", body)
             res_vn = r"vang" if resource == "gold" else r"(?:dau|elixir)"
             match_vn = re.search(r"(?:(\d+))?(?:doan)?tuong.*?(?:voi)?(\d+).*?" + res_vn, body)
             button = self.vision.match_template(screen, "okay", .80, roi=(750, 450, 450, 250))
@@ -1611,38 +1754,76 @@ class BuilderBaseManager:
                 return button
             return None
 
+        if quantity > 1:
+            return match_popup_confirmation()
+
         icon = "okaywallbase2" if resource == "gold" else "okaywallbase"
-        hit = self.match(screen, (icon, "confirmwall", "okay"), (580, 680, 480, 200), .80, (.82, 1., 1.15))
-        if not hit:
-            return None
-        title = " ".join(self.walls.texts(screen, (230, 10, 1100, 175), scale=1)).lower()
-        target = re.search(r"(?:level|c[aấâ]p)\s*(\d+)", title)
-        if not target or int(target[1]) != level + 1 or not re.search(r"\b(?:wall|tường|tuong)\b", title):
-            return None
-        x, y = hit[:2]
-        final_price = self.walls.amount(screen, (x-225, y-26, 196, 52))
-        button = (x-100, y)
-        crop = screen[y-24:y+24, x-130:x-70]
-        green = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), (27, 70, 100), (95, 255, 255))
-        return button if final_price == price and (green > 0).mean() >= .18 else None
+        title = None
+
+        def title_matches():
+            nonlocal title
+            if title is None:
+                title = " ".join(self.walls.texts(screen, (230, 10, 1100, 175), scale=1)).lower()
+            target = re.search(r"(?:level|c[aấâ]p)\s*(\d+)", title)
+            return bool(target and int(target[1]) == level + 1 and re.search(r"\b(?:wall|tường|tuong)\b", title))
+
+        # Layout A: single-wall upgrade dialog with resource icon on the right side of the green button.
+        hit = self.match(screen, (icon,), (580, 660, 740, 225), .80, (.82, 1., 1.15))
+        if hit and title_matches():
+            x, y = hit[:2]
+            final_price = self.walls.amount(screen, (max(0, x - 225), max(0, y - 28), 205, 56))
+            button = (x - 100, y)
+            crop = screen[max(0, y - 24):min(screen.shape[0], y + 24), max(0, x - 130):min(screen.shape[1], x - 70)]
+            green = cv2.inRange(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV), (27, 70, 100), (95, 255, 255)) if crop.size else np.zeros((1, 1), dtype=np.uint8)
+            if final_price == price and (green > 0).mean() >= .18:
+                return button
+
+        # Layout B: newer single-wall dialog with "Confirm" header above the price & resource icon (x=880..1320).
+        confirm_hit = self.match(screen, ("confirmwall", "okay"), (880, 670, 440, 210), .80, (.82, 1., 1.15))
+        if confirm_hit and title_matches():
+            bx, by = confirm_hit[:2]
+            final_price = self.walls.amount(screen, (max(0, bx - 140), max(0, by - 15), 260, 95))
+            if final_price == price:
+                icon_near = self.match(screen, (icon,), (max(0, bx - 40), max(0, by - 35), 260, 130), .76, (.8, 1., 1.15))
+                if icon_near:
+                    return (bx, by)
+                rc = screen[max(0, by - 10):min(screen.shape[0], by + 85), max(0, bx + 20):min(screen.shape[1], bx + 200)]
+                if rc.size:
+                    hsv_r = cv2.cvtColor(rc, cv2.COLOR_BGR2HSV)
+                    hue, sat, val = cv2.split(hsv_r)
+                    gold_px = int(((hue >= 15) & (hue <= 40) & (sat > 120) & (val > 100)).sum())
+                    elixir_px = int(((hue >= 125) & (hue <= 175) & (sat > 100) & (val > 80)).sum())
+                    actual = "gold" if gold_px > max(40, elixir_px) else ("elixir" if elixir_px > max(40, gold_px) else None)
+                    if actual == resource:
+                        return (bx, by)
+
+        return match_popup_confirmation()
 
     def confirm_wall_upgrade(self, screen, level, log, row=None, quantity=1, eligible_resources=None):
         """Return None if payment may have been sent and must not be retried."""
         if level is None or not self.is_home(screen):
+            log(f"[BH] Dừng xác nhận nâng tường: level={level}, is_home={self.is_home(screen) if screen is not None else False}.")
             return False
         balances = self.wall_balances(screen, eligible_resources)
         if level < 6:
             balances.pop('elixir', None)
+        if not balances:
+            log(f"[BH] Không có số dư khả dụng để xác nhận nâng tường cấp {level} (eligible={sorted(eligible_resources) if eligible_resources else 'any'}).")
+            return False
         for resource in balances:
             offer = self.wall_offer(screen, resource)
             if not offer:
+                log(f"[BH] Bỏ {resource}: không tìm thấy nút hoặc giá nâng tường khả dụng trên thanh dưới.")
                 continue
             button, price = offer
             if (price > balances[resource]
                     or (row is not None and price != row["cost"] * quantity)):
-                log(f"[BH] Bỏ {resource}: giá {price:,}, số dư {balances[resource]:,}, số đoạn {quantity}; giá hoặc số dư chưa khớp.")
+                log(
+                    f"[BH] Bỏ {resource}: giá {price:,}, số dư {balances[resource]:,}, số đoạn {quantity}, "
+                    f"giá kỳ vọng={row['cost'] * quantity if row is not None else 'n/a'}; giá hoặc số dư chưa khớp."
+                )
                 continue
-            log(f"[BH] Đang mở xác nhận nâng {quantity} đoạn cấp {level} → {level + 1}, giá {price:,} {resource}.")
+            log(f"[BH] Đang mở xác nhận nâng {quantity} đoạn cấp {level} → {level + 1}, giá {price:,} {resource} (tại {button}).")
             self.tap(button, .55)
 
             payment = None
@@ -1654,11 +1835,37 @@ class BuilderBaseManager:
             popup = self.wait_for(read_popup, 3)
             if popup is None:
                 fresh = self.adb.screencap()
+                diag = ""
+                if fresh is not None:
+                    save = getattr(getattr(self, "walls", None), "save_wall_frame", None)
+                    if callable(save):
+                        save("builder-wall-popup-mismatch.png", fresh)
+                    try:
+                        diag_title = " ".join(self.walls.texts(fresh, (230, 10, 1100, 175), scale=1))
+                        diag_wc = bool(self.vision.wall_confirmation(fresh))
+                        diag = f" [diag: title={diag_title!r}, wall_confirm={diag_wc}]"
+                    except Exception:
+                        diag = ""
                 if fresh is not None and self.vision.has_open_dialog(fresh):
                     self.adb.keyevent(4)
-                log("[BH] Hộp thoại nâng tường chưa khớp cấp, giá hoặc loại tài nguyên.")
+                log(
+                    f"[BH] Hộp thoại nâng tường chưa khớp cấp {level}→{level+1}, "
+                    f"giá {price:,} ({quantity} đoạn) hoặc tài nguyên {resource}.{diag}"
+                )
                 return False
-            self.tap(payment, .8)
+            self._pending_wall_confirm = {
+                "level": level,
+                "target_level": level + 1,
+                "quantity": quantity,
+                "price": price,
+                "resource": resource,
+                "payment_point": payment[:2],
+            }
+            self._wall_payment_armed = True
+            try:
+                self.tap(payment, .8)
+            finally:
+                self._wall_payment_armed = False
             log("[BH] Đã gửi xác nhận nâng; đang đối chiếu số dư, không gửi lại khi kết quả chưa rõ.")
 
             verified = 0
@@ -1742,9 +1949,13 @@ class BuilderBaseManager:
                 self.scan_resources(screen)
             return
         if not self.enter(screen):
-            self.retry_after = time.monotonic() + 60
-            log("[BH] Chưa xác nhận sang làng đêm. Sẽ thử lại sau 60 giây.")
-            return
+            log("[BH] Chưa xác nhận sang làng đêm; thử thu nhỏ bản đồ và tìm thuyền lại ngay.")
+            self.deselect()
+            fresh = self.adb.screencap()
+            if fresh is None or not self.enter(fresh):
+                self.retry_after = 0
+                log("[BH] Vẫn chưa xác nhận sang làng đêm; sẽ thử lại ngay ở vòng kế tiếp (không đợi 60 giây).")
+                return
         self.active = True
         engine = getattr(self, 'engine', None)
         if engine is not None and not engine._verify_builder_walls_once(self):

@@ -14,6 +14,8 @@ import numpy as np
 from bot.apprentice import ApprenticeAssigner
 from bot.army_upgrades import ArmyUpgrader
 from bot.battle import BattleSearcher
+from bot.builder_base import BuilderBaseManager
+from bot.builder_battle import Troop
 from bot.combat import CombatExecutor
 from bot.farm_finish import FarmFinishController, ResourceCapacityReader
 from bot.new_buildings import NewBuildingBuyer
@@ -118,6 +120,20 @@ FLOW_DEFINITIONS: Tuple[Dict[str, Any], ...] = (
         "id": "main_combat",
         "name": "Combat làng chính (Tìm nhà, Soi, Thả quân)",
         "description": "Test riêng luồng đánh làng chính: mở Tìm trận, soi nhà/lọc loot, quét deck & điểm thả, hoặc đánh hoàn chỉnh 1 trận.",
+        "modes": ("until_confirm", "scan_only", "real"),
+        "default_mode": "until_confirm",
+    },
+    {
+        "id": "builder_combat",
+        "name": "Combat làng đêm (Viền đỏ, Stage 1 & Stage 2)",
+        "description": "Test riêng luồng đánh Làng đêm: kiểm tra nút Find Now/đội quân, phân tích nền (Hang Đá/Rừng Cỏ), vẽ vùng thả an toàn & viền đỏ, hoặc đánh hoàn chỉnh Stage 1 & Stage 2.",
+        "modes": ("until_confirm", "scan_only", "real"),
+        "default_mode": "until_confirm",
+    },
+    {
+        "id": "builder_walls",
+        "name": "Check Nâng tường (Làng đêm)",
+        "description": "Kiểm tra số dư Builder Gold/Elixir, điều kiện mở lượt, thợ rảnh, quét bảng thợ/Layout Editor, chọn nhóm tường & số lượng tới bước Confirm (KHÔNG bấm trả tiền ở giả lập).",
         "modes": ("until_confirm", "scan_only", "real"),
         "default_mode": "until_confirm",
     },
@@ -273,6 +289,17 @@ class FlowTestRunner:
         village = VillageManager(adb_client or self.adb, self.vision, self.settings, village_state=state)
         return state, village
 
+    def _new_builder(self, adb_client=None) -> Tuple[VillageStateManager, VillageManager, BuilderBaseManager]:
+        state, village = self._new_village(adb_client=adb_client)
+        builder = BuilderBaseManager(
+            adb_client or self.adb,
+            self.vision,
+            self.settings,
+            village,
+            village_state=state,
+        )
+        return state, village, builder
+
     def _ensure_home_screen(self, village: VillageManager, auto_close_popups: bool = True) -> Optional[np.ndarray]:
         self._checkpoint()
         screen = village.adb.screencap()
@@ -372,6 +399,10 @@ class FlowTestRunner:
                 res = self._run_assign_apprentice(effective_mode, opts)
             elif flow_id == "main_combat":
                 res = self._run_main_combat(effective_mode, opts)
+            elif flow_id == "builder_combat":
+                res = self._run_builder_combat(effective_mode, opts)
+            elif flow_id == "builder_walls":
+                res = self._run_builder_walls(effective_mode, opts)
             else:
                 res = FlowTestResult(flow_id=flow_id, flow_name=flow_meta["name"], status="FAIL", summary="Chưa hỗ trợ luồng này.", mode=effective_mode)
         except BotStoppedError:
@@ -1817,3 +1848,566 @@ class FlowTestRunner:
             details=result,
             mode=mode,
         )
+
+    # ------------------------------------------------------------------
+    # 10. Combat Làng Đêm (Builder Base)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def annotate_builder_battlefield(
+        frame: np.ndarray,
+        safe_mask: Optional[np.ndarray],
+        approach: Optional[Tuple[Any, ...]],
+        cards: List[Tuple[str, Tuple[int, int]]],
+        slot_statuses: List[Dict[str, Any]],
+        drop_points: List[Tuple[str, Tuple[int, int]]],
+    ) -> np.ndarray:
+        canvas = frame.copy()
+        if isinstance(safe_mask, np.ndarray) and safe_mask.shape[:2] == canvas.shape[:2]:
+            overlay = canvas.copy()
+            overlay[safe_mask] = (40, 220, 40)
+            canvas = cv2.addWeighted(canvas, 0.72, overlay, 0.28, 0)
+
+        if approach is not None:
+            point, _, inward, _ = approach
+            px, py = int(point[0]), int(point[1])
+            inv = np.asarray(inward, dtype=float)
+            tip = (int(round(px + 55 * inv[0])), int(round(py + 55 * inv[1])))
+            cv2.circle(canvas, (px, py), 10, (255, 255, 255), -1)
+            cv2.circle(canvas, (px, py), 8, (0, 140, 255), -1)
+            cv2.arrowedLine(canvas, (px, py), tip, (255, 255, 0), 3)
+
+        for idx, (kind, pt) in enumerate(drop_points):
+            x, y = int(pt[0]), int(pt[1])
+            cv2.circle(canvas, (x, y), 6, (40, 230, 255), -1)
+            cv2.putText(canvas, f"{idx+1}:{kind[:5]}", (x + 8, max(20, y - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (40, 230, 255), 1)
+
+        for info in slot_statuses:
+            cx, cy = info["card"]
+            st = info["status"]
+            color = (40, 230, 90) if st == "deployed" else ((40, 220, 255) if st == "waiting" else (160, 160, 160))
+            cv2.rectangle(canvas, (max(0, cx - 44), max(0, cy - 68)), (min(canvas.shape[1] - 1, cx + 44), min(canvas.shape[0] - 1, cy + 56)), color, 2)
+            label = f"{info['kind'][:6]}:{st}"
+            cv2.putText(canvas, label, (max(2, cx - 44), max(18, cy - 72)), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
+        return canvas
+
+    def _log_builder_combat_settings(self, auto_switch: bool, close_menu: bool):
+        s = self.settings
+        self.log("[Cấu hình Combat Làng Đêm]")
+        self.log(
+            f"   • Combo: {s.get('builder_base_combo', 'current')} | "
+            f"Tiếp viện 1: {s.get('builder_base_reinforcement_1', 'current')} | "
+            f"Tiếp viện 2: {s.get('builder_base_reinforcement_2', 'current')}"
+        )
+        self.log(
+            f"   • Vẫn bấm Attack khi chướng ngại={bool(s.get('builder_base_obstacle_attack', False))} | "
+            f"Tự sang Làng Đêm={auto_switch} | Đóng menu sau quét={close_menu}"
+        )
+
+    def _detect_builder_stage(self, screen: np.ndarray, builder: BuilderBaseManager) -> int:
+        words = builder.walls.texts(screen, (530, 5, 540, 110), scale=1)
+        title = "".join(ch for ch in "".join(words).lower() if ch.isalnum())
+        if "stage2" in title:
+            return 2
+        if builder.match(screen, ("1starbuilder_white",), (1200, 550, 395, 185), .82):
+            return 2
+        return 1
+
+    def _analyze_builder_battlefield(
+        self,
+        screen: np.ndarray,
+        builder: BuilderBaseManager,
+        allow_reveal: bool = False,
+    ) -> Dict[str, Any]:
+        battle = builder.battle
+        stage = self._detect_builder_stage(screen, builder)
+        battle.stage = stage
+        battle.rejected_entries = []
+        battle.safe_mask = None
+        threshold = .72 if stage == 2 else .80
+        cards = battle.cards(screen, threshold=threshold)
+        approach = battle.entry(screen)
+        source = "viền_đỏ" if approach else None
+        if not approach and allow_reveal:
+            fresh = battle.reveal_boundary(screen, cards=cards)
+            if fresh is not None and battle.phase(fresh) in ("scouting", "combat"):
+                screen = fresh
+                approach = battle.entry(screen)
+                if approach:
+                    source = "reveal_viền_đỏ"
+        if not approach:
+            approach = battle.terrain_entry(screen)
+            if approach:
+                source = "địa_hình"
+
+        slot_statuses: List[Dict[str, Any]] = []
+        drop_points: List[Tuple[str, Tuple[int, int]]] = []
+        p = d = inv = None
+        if approach is not None:
+            point, direction, inward, _ = approach
+            p = np.asarray(point, dtype=float)
+            d = np.asarray(direction, dtype=float)
+            inv = np.asarray(inward, dtype=float)
+
+        for idx, (kind, card) in enumerate(cards):
+            troop = Troop(kind, card, 0.0)
+            count = None if kind in ("machine", "copter") else battle.stack_count(screen, card)
+            if count is not None:
+                status = "0x" if count == 0 else f"{count}x"
+                waiting = count > 0
+            else:
+                state = battle.slot_state(screen, troop)
+                if stage == 2 and state == "deployed":
+                    status = "survivor_waiting"
+                    waiting = True
+                else:
+                    status = state
+                    waiting = state == "waiting"
+            slot_statuses.append({"kind": kind, "card": card, "status": status, "count": count})
+            if waiting and p is not None:
+                spacing = (0, -15, 15, -25, 25)[idx % 5]
+                depth = 9 if kind in battle.FRONTLINE else 17
+                raw_drop = tuple(int(round(v)) for v in p + spacing * d - depth * inv)
+                drop_pt = battle.resolve_drop_point(raw_drop, p, d, inv, depth=depth)
+                drop_points.append((kind, drop_pt))
+
+        threats = battle.detect_anti_bat_threats(screen) if hasattr(battle, "detect_anti_bat_threats") else {"air_bombs": [], "roasters": []}
+        info = getattr(battle, "last_battlefield_info", None) or {}
+        return {
+            "screen": screen,
+            "stage": stage,
+            "is_cave": info.get("is_cave"),
+            "segments": info.get("segments", 0),
+            "source": source,
+            "approach": approach,
+            "cards": cards,
+            "slot_statuses": slot_statuses,
+            "drop_points": drop_points,
+            "safe_mask": battle.safe_mask,
+            "threats": threats,
+        }
+
+    def _run_builder_combat(self, mode: str, options: Dict[str, Any]) -> FlowTestResult:
+        auto_switch = bool(options.get("auto_switch_to_builder", True))
+        close_menu = bool(options.get("close_menu_after_scan", True))
+        self._log_builder_combat_settings(auto_switch, close_menu)
+
+        _, village, builder = self._new_builder()
+        battle = builder.battle
+
+        screen = self.adb.screencap()
+        if screen is None:
+            return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không chụp được màn hình từ giả lập.", mode=mode)
+        self.publish_frame(screen, "Màn hình ban đầu")
+
+        phase = battle.phase(screen)
+        menu_btn = battle.find_now(screen)
+        is_bb_home = builder.is_home(screen)
+        is_main_home = False if (phase or is_bb_home or menu_btn) else village.is_in_main_village(screen)
+        self.log(f"[Trạng thái BH] phase={phase}, is_bb_home={is_bb_home}, find_now_open={bool(menu_btn)}, is_main_home={is_main_home}")
+
+        if not phase and not is_bb_home and not menu_btn and is_main_home and auto_switch:
+            self.log("[BH] Đang ở Làng chính -> bấm thuyền sang Làng Đêm...")
+            if not builder.enter(screen):
+                return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không chuyển được từ Làng chính sang Làng Đêm.", mode=mode)
+            screen = self.adb.screencap()
+            if screen is None:
+                return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Mất khung hình sau khi sang Làng Đêm.", mode=mode)
+            is_bb_home = builder.is_home(screen)
+            self.publish_frame(screen, "Đã sang Làng Đêm")
+
+        if mode == "scan_only":
+            if phase in ("scouting", "combat"):
+                plan = self._analyze_builder_battlefield(screen, builder, allow_reveal=False)
+                annotated = self.annotate_builder_battlefield(
+                    plan["screen"],
+                    plan["safe_mask"],
+                    plan["approach"],
+                    plan["cards"],
+                    plan["slot_statuses"],
+                    plan["drop_points"],
+                )
+                terrain = "Hang Đá" if plan["is_cave"] else "Rừng Cỏ"
+                self.publish_frame(annotated, f"BH Stage {plan['stage']} ({terrain}): {len(plan['drop_points'])} điểm thả")
+                self.log(
+                    f"[Soi trận BH] Stage {plan['stage']} | Nền={terrain} | Đoạn đỏ={plan['segments']} | "
+                    f"Nguồn={plan['source']} | Thẻ={[(s['kind'], s['status']) for s in plan['slot_statuses']]}"
+                )
+                if plan["approach"] is None:
+                    return FlowTestResult(
+                        "builder_combat",
+                        FLOW_BY_ID["builder_combat"]["name"],
+                        "WARN",
+                        f"[Giả lập Stage {plan['stage']}] Đọc được {len(plan['cards'])} ô quân nhưng chưa xác định được hướng thả ({terrain}).",
+                        details={"stage": plan["stage"], "terrain": terrain, "cards": len(plan["cards"]), "slots": plan["slot_statuses"]},
+                        mode=mode,
+                    )
+                return FlowTestResult(
+                    "builder_combat",
+                    FLOW_BY_ID["builder_combat"]["name"],
+                    "PASS",
+                    f"[Giả lập Stage {plan['stage']}] Nền={terrain}, nguồn={plan['source']} ({plan['segments']} đoạn đỏ), "
+                    f"đọc {len(plan['cards'])} ô quân, vẽ {len(plan['drop_points'])} điểm thả an toàn — KHÔNG thả.",
+                    details={"stage": plan["stage"], "terrain": terrain, "source": plan["source"], "segments": plan["segments"], "slots": plan["slot_statuses"], "drop_points": len(plan["drop_points"])},
+                    mode=mode,
+                )
+
+            if not menu_btn:
+                if not is_bb_home:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không ở Làng Đêm, menu Find Now hoặc trận đánh Làng Đêm.", mode=mode)
+                menu_scr = battle.open_menu(screen)
+                if menu_scr is None:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không mở được menu Tìm trận Builder Base (Find Now).", mode=mode)
+                screen = menu_scr
+                menu_btn = battle.find_now(screen)
+            request = battle.army.request()
+            uses_current = battle.army.uses_current_lineup(request)
+            self.log(f"[Menu BH] Find Now={menu_btn[:2] if menu_btn else None} | Request={request} | Dùng đội hình hiện tại={uses_current}")
+            if menu_btn:
+                self.publish_frame(self.annotate_point(screen, menu_btn[:2], "FIND NOW (GIA LAP)"), "Menu Tìm trận Làng Đêm (giả lập dừng)")
+            else:
+                self.publish_frame(screen, "Menu Làng Đêm")
+            if close_menu:
+                builder.close_panel(screen)
+            return FlowTestResult(
+                "builder_combat",
+                FLOW_BY_ID["builder_combat"]["name"],
+                "PASS",
+                f"[Giả lập] Đã mở & xác minh Menu Làng Đêm (Find Now tại {menu_btn[:2] if menu_btn else None}, combo={request[0]}) — KHÔNG bấm tìm trận.",
+                details={"find_now": menu_btn[:2] if menu_btn else None, "request": request},
+                mode=mode,
+            )
+
+        if mode == "until_confirm":
+            if phase not in ("scouting", "combat"):
+                if not menu_btn:
+                    if not is_bb_home:
+                        return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không ở Làng Đêm hoặc trận đánh Làng Đêm.", mode=mode)
+                    menu_scr = battle.open_menu(screen)
+                    if menu_scr is None:
+                        return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không mở được menu Find Now.", mode=mode)
+                    screen = menu_scr
+                request = battle.army.request()
+                if not battle.army.uses_current_lineup(request):
+                    self.log(f"[Đội hình BH] Đang chuẩn bị đội hình {request}...")
+                    screen = battle.army.prepare(screen, *request, self.log)
+                    if screen is None:
+                        return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không chuẩn bị được đội hình Làng Đêm.", mode=mode)
+                btn = battle.find_now(screen)
+                if not btn:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không thấy nút Find Now xanh.", mode=mode)
+                builder.tap(btn, 1.0)
+                self.log("[BH] Đã bấm Find Now, chờ vào căn cứ đối thủ để phân tích...")
+                matched = builder.wait_for(lambda f: battle.phase(f) in ("scouting", "combat"), 45)
+                if matched is None:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Hết 45s chờ tìm trận Làng Đêm.", mode=mode)
+                self.log("[BH] Đã tìm thấy căn cứ đối thủ. Đợi 3s load intro rồi zoom out...")
+                time.sleep(3.0)
+                self.adb.zoom_out_map(times=2)
+                time.sleep(0.35)
+                screen = self.adb.screencap()
+                if screen is None:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Mất khung hình sau zoom out.", mode=mode)
+
+            plan = self._analyze_builder_battlefield(screen, builder, allow_reveal=True)
+            annotated = self.annotate_builder_battlefield(
+                plan["screen"],
+                plan["safe_mask"],
+                plan["approach"],
+                plan["cards"],
+                plan["slot_statuses"],
+                plan["drop_points"],
+            )
+            terrain = "Hang Đá" if plan["is_cave"] else "Rừng Cỏ"
+            self.publish_frame(annotated, f"Giả lập BH Stage {plan['stage']} ({terrain}): {len(plan['drop_points'])} điểm (KHÔNG thả)")
+            self.log(
+                f"[GIẢ LẬP BH] Stage {plan['stage']} | Nền={terrain} | Nguồn={plan['source']} | "
+                f"Đoạn đỏ={plan['segments']} | Thẻ={[(s['kind'], s['status']) for s in plan['slot_statuses']]} | "
+                f"Điểm thả={plan['drop_points']}"
+            )
+            if plan["approach"] is None:
+                return FlowTestResult(
+                    "builder_combat",
+                    FLOW_BY_ID["builder_combat"]["name"],
+                    "FAIL",
+                    f"Chưa xác định được hướng thả quân ở Stage {plan['stage']} ({terrain}).",
+                    details={"stage": plan["stage"], "terrain": terrain, "slots": plan["slot_statuses"]},
+                    mode=mode,
+                )
+            return FlowTestResult(
+                "builder_combat",
+                FLOW_BY_ID["builder_combat"]["name"],
+                "PASS",
+                f"Giả lập BH Stage {plan['stage']} OK ({terrain}, {plan['source']}): đọc {len(plan['cards'])} ô quân, "
+                f"{len(plan['drop_points'])} điểm thả hợp lệ — KHÔNG thả quân.",
+                details={"stage": plan["stage"], "terrain": terrain, "source": plan["source"], "segments": plan["segments"], "slots": plan["slot_statuses"], "drop_points": len(plan["drop_points"])},
+                mode=mode,
+            )
+
+        # Real execution (Stage 1 & Stage 2)
+        orig_screencap = self.adb.screencap
+        last_pub = [0.0]
+
+        def _live_screencap(*args, **kwargs):
+            frame = orig_screencap(*args, **kwargs)
+            now = time.monotonic()
+            if frame is not None and now - last_pub[0] >= 0.8:
+                last_pub[0] = now
+                self.publish_frame(frame, f"Live Combat Làng Đêm (Stage {max(1, battle.stage)})")
+            return frame
+
+        self.adb.screencap = _live_screencap
+        try:
+            if phase in ("scouting", "combat"):
+                self.log("[BH] Phát hiện trận Làng Đêm đang mở -> bám sát điều khiển tới khi kết thúc...")
+                battle.stage = self._detect_builder_stage(screen, builder)
+                battle.in_progress = True
+                battle.match_requested = time.monotonic()
+                ok = battle.monitor(self.log)
+            else:
+                if not is_bb_home and not menu_btn:
+                    return FlowTestResult("builder_combat", FLOW_BY_ID["builder_combat"]["name"], "FAIL", "Không ở Làng Đêm để bắt đầu trận đánh.", mode=mode)
+                ok = battle.start(screen, self.log)
+        finally:
+            self.adb.screencap = orig_screencap
+
+        final = self.adb.screencap()
+        if final is not None:
+            self.publish_frame(final, "Sau trận Làng Đêm")
+        return FlowTestResult(
+            "builder_combat",
+            FLOW_BY_ID["builder_combat"]["name"],
+            "PASS" if ok else "WARN",
+            f"Hoàn thành trận Làng Đêm (tới Stage {battle.stage})." if ok else f"Trận Làng Đêm dừng/chưa xác nhận về làng (Stage {battle.stage}).",
+            details={"completed": ok, "stage_reached": battle.stage},
+            mode=mode,
+        )
+
+    # ------------------------------------------------------------------
+    # 11. Check Nâng tường Làng Đêm (Builder Base)
+    # ------------------------------------------------------------------
+    def _cleanup_builder_dialogs(self, builder: BuilderBaseManager):
+        """Close any open Builder Base wall confirmation dialog / builder menu / selection."""
+        try:
+            for _ in range(3):
+                self._checkpoint()
+                frame = builder.adb.screencap()
+                if frame is None:
+                    break
+                if self.vision.has_open_dialog(frame) or builder.walls.is_menu_open(frame):
+                    if not builder.close_panel(frame):
+                        builder.adb.keyevent(4)
+                    time.sleep(0.3)
+                    continue
+                if builder.is_home(frame):
+                    builder.deselect()
+                    break
+                builder.adb.keyevent(4)
+                time.sleep(0.3)
+        except BotStoppedError:
+            raise
+        except Exception as exc:
+            self.log(f"[BH][Dọn dẹp] Cảnh báo khi đóng hộp thoại Làng Đêm: {exc}")
+
+    def _run_builder_walls(self, mode: str, options: Dict[str, Any]) -> FlowTestResult:
+        auto_switch = bool(options.get("auto_switch_to_builder", True))
+        scan_layout = bool(options.get("scan_layout_editor", False))
+        bypass_min = bool(options.get("bypass_min_threshold", False)) and mode != "real"
+        force_verify = bool(options.get("force_verify_walls", True))
+
+        s = self.settings
+        trigger = s.get("builder_base_wall_trigger", "either")
+        resource_cfg = s.get("builder_base_wall_resource", "both")
+        lowest_first = bool(s.get("builder_base_wall_lowest_first", False))
+        min_gold = int(s.get("builder_base_wall_min_gold", 0))
+        min_elixir = int(s.get("builder_base_wall_min_elixir", 0))
+        gap_ms = int(s.get("wall_quantity_fixed_gap_ms", 120))
+        self.log("[Cấu hình Nâng tường Làng Đêm]")
+        self.log(
+            f"   • điều_kiện={trigger} | tài_nguyên={resource_cfg} | ưu_tiên_cấp_thấp={lowest_first} | "
+            f"ngưỡng_vàng={min_gold:,} | ngưỡng_dầu={min_elixir:,} | gap={gap_ms}ms"
+        )
+        self.log(
+            f"   • Tự sang Làng Đêm={auto_switch} | Quét Layout Editor={scan_layout} | "
+            f"Bỏ qua ngưỡng tối thiểu={bypass_min} | Xóa cache quét lại={force_verify}"
+        )
+
+        intercept_state: Dict[str, Any] = {"builder": None}
+
+        def should_intercept(x: int, y: int):
+            if mode != "until_confirm":
+                return None
+            b = intercept_state["builder"]
+            if b is not None and getattr(b, "_wall_payment_armed", False):
+                pending = dict(getattr(b, "_pending_wall_confirm", None) or {})
+                pending["confirm_point"] = (int(x), int(y))
+                return ("builder_wall_confirm", pending)
+            return None
+
+        adb_used = _DryRunADBProxy(self.adb, should_intercept) if mode == "until_confirm" else self.adb
+        _, village, builder = self._new_builder(adb_client=adb_used)
+        intercept_state["builder"] = builder
+        if force_verify:
+            builder._wall_verified_groups = {}
+            builder._wall_verified_signature = None
+            builder._wall_verified_at = 0
+            builder._elixir_wall_unavailable_at = 0
+            builder.walls_confirmed_maxed = False
+            builder.consecutive_no_wall_count = 0
+
+        screen = adb_used.screencap()
+        if screen is None:
+            return FlowTestResult("builder_walls", FLOW_BY_ID["builder_walls"]["name"], "FAIL", "Không chụp được màn hình từ giả lập.", mode=mode)
+        self.publish_frame(screen, "Màn hình ban đầu")
+
+        is_bb_home = builder.is_home(screen)
+        is_main_home = False if is_bb_home else village.is_in_main_village(screen)
+        self.log(f"[Trạng thái BH] is_bb_home={is_bb_home}, is_main_home={is_main_home}")
+        if not is_bb_home and is_main_home and auto_switch:
+            self.log("[BH] Đang ở Làng chính -> bấm thuyền sang Làng Đêm...")
+            if not builder.enter(screen):
+                return FlowTestResult("builder_walls", FLOW_BY_ID["builder_walls"]["name"], "FAIL", "Không chuyển được từ Làng chính sang Làng Đêm.", mode=mode)
+            screen = adb_used.screencap()
+            if screen is None or not builder.is_home(screen):
+                return FlowTestResult("builder_walls", FLOW_BY_ID["builder_walls"]["name"], "FAIL", "Mất màn hình Làng Đêm sau khi chuyển làng.", mode=mode)
+            is_bb_home = True
+            self.publish_frame(screen, "Đã sang Làng Đêm")
+        if not is_bb_home:
+            return FlowTestResult("builder_walls", FLOW_BY_ID["builder_walls"]["name"], "FAIL", "Không ở màn hình chính Làng Đêm 1600x900.", mode=mode)
+
+        layout_ok = None
+        if scan_layout:
+            self.log("[BH] Bắt đầu quét tường 2 Stage qua Layout Editor...")
+            layout_ok = builder.scan_initial_layout_walls(self.log)
+            screen = adb_used.screencap()
+            if screen is not None:
+                self.publish_frame(screen, "Sau khi quét Layout Editor Làng Đêm")
+            if screen is None or not builder.is_home(screen):
+                return FlowTestResult("builder_walls", FLOW_BY_ID["builder_walls"]["name"], "FAIL", "Không xác nhận về được Làng Đêm sau Layout Editor.", mode=mode)
+
+        old_cfg = {
+            k: s.data.get(k)
+            for k in (
+                "builder_base_enabled",
+                "builder_base_upgrade_walls",
+                "builder_base_wall_min_gold",
+                "builder_base_wall_min_elixir",
+                "builder_base_pause_on_no_upgrades",
+            )
+            if k in s.data
+        }
+        try:
+            s.data["builder_base_enabled"] = True
+            s.data["builder_base_upgrade_walls"] = True
+            s.data["builder_base_pause_on_no_upgrades"] = False
+            if bypass_min:
+                s.data["builder_base_wall_min_gold"] = 0
+                s.data["builder_base_wall_min_elixir"] = 0
+
+            raw_res = self.vision.read_village_resources(screen, builder=True)
+            balances = builder.wall_balances(screen)
+            eligible = sorted(builder.wall_opening_resources(balances))
+            free_builders = builder.confirmed_free_builders(screen)
+            gold_val = raw_res.get("gold") if raw_res.get("valid", {}).get("gold") else None
+            elixir_val = raw_res.get("elixir") if raw_res.get("valid", {}).get("elixir") else None
+            self.log(
+                f"[Tường BH] Gold={f'{gold_val:,}' if type(gold_val) is int else '?'} | "
+                f"Elixir={f'{elixir_val:,}' if type(elixir_val) is int else '?'} | "
+                f"Thợ rảnh BH={free_builders} | Đạt điều kiện={eligible or 'Không'}"
+            )
+
+            if mode == "scan_only":
+                return FlowTestResult(
+                    "builder_walls",
+                    FLOW_BY_ID["builder_walls"]["name"],
+                    "PASS" if free_builders != 0 else "WARN",
+                    (
+                        f"[Giả lập BH] Gold={f'{gold_val:,}' if type(gold_val) is int else '?'}, "
+                        f"Elixir={f'{elixir_val:,}' if type(elixir_val) is int else '?'}, "
+                        f"Thợ rảnh={free_builders}, Đạt điều kiện={eligible or 'Chưa đạt'}"
+                        + (f", LayoutEditor={'OK' if layout_ok else 'Chưa đủ'}" if scan_layout else "")
+                        + "."
+                    ),
+                    details={
+                        "gold": gold_val,
+                        "elixir": elixir_val,
+                        "free_builders": free_builders,
+                        "eligible": eligible,
+                        "layout_ok": layout_ok,
+                    },
+                    mode=mode,
+                )
+
+            if mode == "until_confirm":
+                try:
+                    result = builder.upgrade_wall_cycle(screen, self.log)
+                    self._cleanup_builder_dialogs(builder)
+                    if result is True:
+                        msg = "Đã hoàn thành kiểm tra (không phát sinh giao dịch)."
+                    elif builder.walls_confirmed_maxed:
+                        msg = "Bảng thợ báo đã Max toàn bộ nâng cấp Làng Đêm."
+                    elif not eligible:
+                        msg = f"Chưa mở lượt nâng tường: tài nguyên chưa đạt điều kiện ({trigger})."
+                    elif free_builders == 0:
+                        msg = "Đã hết thợ xây Làng Đêm rảnh (0 thợ)."
+                    else:
+                        msg = "Chưa tới bước hộp thoại Confirm tường Làng Đêm (xem log chi tiết để biết bước dừng)."
+                    return FlowTestResult(
+                        "builder_walls",
+                        FLOW_BY_ID["builder_walls"]["name"],
+                        "WARN",
+                        msg,
+                        details={"result": result, "eligible": eligible, "free_builders": free_builders, "maxed": builder.walls_confirmed_maxed},
+                        mode=mode,
+                    )
+                except DryRunReached as reached:
+                    builder._wall_payment_armed = False
+                    pt = reached.info.get("confirm_point", (0, 0))
+                    lvl = reached.info.get("level", "?")
+                    target_lvl = reached.info.get("target_level", "?")
+                    qty = reached.info.get("quantity", 1)
+                    price = reached.info.get("price", 0)
+                    res_name = reached.info.get("resource", "?")
+                    label = f"BH WALL CONFIRM ({qty}x Lv{lvl}->{target_lvl})"
+                    annotated = self.annotate_point(reached.frame, pt, label)
+                    if annotated is not None:
+                        self.publish_frame(annotated, f"Giả lập dừng tại nút Confirm nâng {qty} đoạn tường BH cấp {lvl}->{target_lvl}")
+                    self.log(
+                        f"[GIẢ LẬP BH] ✅ Đã mở tới hộp thoại Confirm nâng {qty} đoạn tường cấp {lvl}→{target_lvl}, "
+                        f"giá {price:,} {res_name} tại {pt} — KHÔNG BẤM TRẢ TIỀN!"
+                    )
+                    self._cleanup_builder_dialogs(builder)
+                    return FlowTestResult(
+                        "builder_walls",
+                        FLOW_BY_ID["builder_walls"]["name"],
+                        "PASS",
+                        f"Giả lập OK tới nút Confirm {qty} đoạn cấp {lvl}→{target_lvl} ({price:,} {res_name}) tại {pt} — KHÔNG bấm nâng.",
+                        details=dict(reached.info),
+                        mode=mode,
+                    )
+
+            # Real execution
+            ok = builder.upgrade_wall_cycle(screen, self.log)
+            after = self.adb.screencap()
+            if after is not None:
+                self.publish_frame(after, "Sau khi chạy nâng tường Làng Đêm")
+            return FlowTestResult(
+                "builder_walls",
+                FLOW_BY_ID["builder_walls"]["name"],
+                "PASS" if ok else "WARN",
+                "Đã hoàn thành chu trình nâng tường Làng Đêm." if ok else "Chu trình nâng tường Làng Đêm kết thúc chưa nâng thêm (xem log chi tiết).",
+                details={"upgraded": ok, "walls_confirmed_maxed": builder.walls_confirmed_maxed},
+                mode=mode,
+            )
+        finally:
+            builder._wall_payment_armed = False
+            for k in (
+                "builder_base_enabled",
+                "builder_base_upgrade_walls",
+                "builder_base_wall_min_gold",
+                "builder_base_wall_min_elixir",
+                "builder_base_pause_on_no_upgrades",
+            ):
+                if k in old_cfg:
+                    s.data[k] = old_cfg[k]
+                else:
+                    s.data.pop(k, None)
