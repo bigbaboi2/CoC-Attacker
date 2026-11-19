@@ -417,6 +417,56 @@ class BuilderBattleRecoveryTests(unittest.TestCase):
         battle.use_abilities(frame, logs.append)
         battle.base.tap.assert_called_once_with((430, 808), .16)
 
+    def test_bomber_triggers_ability_immediately_after_drop(self):
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        battle = BuilderBattle.__new__(BuilderBattle)
+        battle.stage = 1
+        battle.approach = None
+        battle.safe_mask = None
+        battle.troops = []
+        battle.empty_stacks = set()
+        battle.stage_dispatched = set()
+        battle.rejected_entries = []
+        battle.last_deploy_notice = 0
+        battle.zoomed_for_stage = True
+        battle.revealed_for_stage = False
+        battle.combat_seen = False
+        battle.map_pan_attempts = 0
+        battle.entry = Mock(return_value=((880, 180), np.array([0.8, 0.6]), np.array([-0.6, 0.8]), None))
+        battle.cards = Mock(return_value=[('bomber', (937, 818))])
+        battle.stack_count = Mock(return_value=None)
+        battle.slot_state = Mock(side_effect=['waiting', 'deployed'])
+        battle.phase = Mock(return_value='combat')
+        battle.observe_combat = Mock()
+        battle.send_drop = Mock()
+        battle.base = SimpleNamespace(tap=Mock())
+        battle.adb = SimpleNamespace(screencap=Mock(return_value=frame))
+        logs = []
+
+        self.assertTrue(battle.deploy(frame, logs.append))
+        battle.send_drop.assert_called_once()
+        battle.base.tap.assert_called_once_with((937, 818), .12)
+        self.assertTrue(any('kích hoạt kỹ năng bomber@937 ngay sau khi thả' in line for line in logs))
+
+    def test_bomber_retriggers_ability_after_cooldown_even_after_three_attempts(self):
+        from bot.builder_battle import Troop
+        frame = np.zeros((900, 1600, 3), dtype=np.uint8)
+        battle = BuilderBattle.__new__(BuilderBattle)
+        battle.stage = 1
+        battle.base = SimpleNamespace(tap=Mock(), village_state=None, match=Mock(return_value=None))
+        now = time.monotonic()
+        bomber = Troop('bomber', (937, 818), now - 20.0)
+        bomber.attempts = 3
+        bomber.last_attempt = now - 8.0
+        bomber.pending_charge = 0.85
+        battle.troops = [bomber]
+        battle.ability_hud = Mock(return_value=(0.95, 0.80))
+        logs = []
+
+        battle.use_abilities(frame, logs.append)
+        battle.base.tap.assert_called_once_with((937, 818), .16)
+        self.assertEqual(bomber.attempts, 1)
+
 
 if __name__ == '__main__':
     unittest.main()

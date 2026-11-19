@@ -168,22 +168,30 @@ class BuilderBattle:
     def cards(self, screen, roi=None, threshold=.82):
         x, y, w, h = roi or self.CARDS
         crop = screen[y:y+h, x:x+w]
+        if not crop.size:
+            return []
+        half = cv2.resize(crop, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
         detected = []
         for kind in self.ORDER:
+            best_kind_score = 0.0
             for scale in self.CARD_SCALES:
-                template = self.base.template(self.PORTRAITS[kind], scale)
+                template = self.base.template(self.PORTRAITS[kind], scale * 0.5)
                 if template is None:
                     break
-                if any(a > b for a, b in zip(template.shape[:2], crop.shape[:2])):
+                if any(a > b for a, b in zip(template.shape[:2], half.shape[:2])):
                     continue
-                scores = cv2.matchTemplate(crop, template, cv2.TM_CCOEFF_NORMED)
+                scores = cv2.matchTemplate(half, template, cv2.TM_CCOEFF_NORMED)
                 th, tw = template.shape[:2]
                 for _ in range(8):
                     _, score, _, (px, py) = cv2.minMaxLoc(scores)
                     if score < threshold:
                         break
-                    detected.append((kind, (x+px+tw//2, y+py+th//2), score))
-                    scores[:, max(0, px-tw//2):px+tw//2+1] = -1
+                    if score > best_kind_score:
+                        best_kind_score = score
+                    detected.append((kind, (x + (px + tw // 2) * 2, y + (py + th // 2) * 2), score))
+                    scores[:, max(0, px - tw // 2):px + tw // 2 + 1] = -1
+                if best_kind_score >= .88:
+                    break
         unique = []
         for kind, point, score in sorted(detected, key=lambda item: -item[2]):
             if all(abs(point[0]-prior[1][0]) > 45 for prior in unique):
@@ -669,27 +677,14 @@ class BuilderBattle:
             log(f"[BH] Stage {self.stage}: đọc thanh quân ({len(cards)} ô): " + ", ".join(slot_summary))
 
         if first_wave and pending:
-            # Protect the Bomber before committing the support wave.
+            # Place a frontline cover unit first in the wave so it tanks ahead of Bomber without blocking 10+ seconds.
             lead = next((item for item in pending if item[0].kind in self.FRONTLINE),
                         next((item for item in pending if item[0].kind != "bomber"), None))
-            if lead is not None and any(item[0].kind == "bomber" for item in pending):
-                troop, count, drop, had_hp = lead
-                if count is None and not had_hp and self.deploy_survivor(troop, drop, direction, inward, log=log):
-                    self._mark_dispatched(troop)
-                    accepted = True
-                    pending.remove(lead)
-                else:
-                    # Keep the cover unit first even if its first drop was not confirmed.
-                    pending.remove(lead)
-                    pending.insert(0, lead)
+            has_bomber = any(item[0].kind == "bomber" for item in pending)
+            if lead is not None and has_bomber:
+                pending.remove(lead)
+                pending.insert(0, lead)
 
-            if lead is not None:
-                fresh = self.adb.screencap()
-                phase = self.phase(fresh)
-                if phase not in ("scouting", "combat") or (phase == "scouting" and self.combat_seen and self.stage == 1):
-                    return False
-                if phase == "combat":
-                    self.observe_combat(fresh)
             sent_notes = []
             for idx_p, (troop, count, drop, _) in enumerate(pending):
                 points = self.drop_candidates(drop, direction, inward)
@@ -697,7 +692,10 @@ class BuilderBattle:
                 if target is None:
                     continue
                 sent_notes.append(f"{troop.kind}@{troop.card[0]}->{target}({min(count or 1, 12)})")
-                self.send_drop(troop.card, target, min(count or 1, 12), settle=.03, screen=screen if idx_p == 0 else None)
+                lead_pause = .18 if (idx_p == 0 and lead is not None and has_bomber and troop is lead[0]) else .03
+                self.send_drop(troop.card, target, min(count or 1, 12), settle=lead_pause, screen=screen if idx_p == 0 else None)
+                if troop.kind == "bomber":
+                    self.trigger_bomber_ability_now(troop, log=log)
             if sent_notes:
                 log(f"[BH] Stage {self.stage}: đã gửi đợt thả đầu ({len(sent_notes)} ô): " + ", ".join(sent_notes))
 
@@ -824,8 +822,15 @@ class BuilderBattle:
             return None
         x, y = card
         crop = screen[max(0, y-92):y-35, max(0, x+4):min(screen.shape[1], x+60)]
+        if not crop.size:
+            return None
+        # Skip expensive OCR when the top-right badge region has no bright white xN text.
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        white_px = int(np.count_nonzero((hsv[:, :, 1] <= 45) & (hsv[:, :, 2] >= 225)))
+        if white_px < 12:
+            return None
         ocr = self.vision._get_ocr()
-        if ocr is None or not crop.size:
+        if ocr is None:
             return None
         for image in (crop, cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)):
             result = ocr(image, use_det=False)
@@ -963,6 +968,18 @@ class BuilderBattle:
             return "deployed"
         return "waiting"
 
+    def trigger_bomber_ability_now(self, troop, log=None):
+        """Immediately press Bomber's Bouncing Bomb ability right after deployment."""
+        if troop.kind != "bomber" or not hasattr(getattr(self, "base", None), "tap"):
+            return
+        now = time.monotonic()
+        self.base.tap(troop.card, .12)
+        troop.last_attempt = now
+        troop.attempts = 1
+        troop.pending_charge = max(troop.pending_charge, 0.85)
+        if log:
+            log(f"[BH] Stage {self.stage}: kích hoạt kỹ năng bomber@{troop.card[0]} ngay sau khi thả.")
+
     def deploy_survivor(self, troop, drop, direction, inward, log=None, allow_initial_hp=False):
         candidates = list(self.drop_candidates(drop, direction, inward))
         for idx_c, point in enumerate(candidates):
@@ -983,10 +1000,14 @@ class BuilderBattle:
                 if charge < 0.15 and hasattr(self.base, "tap"):
                     still_in_dock = self._probe_card_in_dock(fresh, troop.card)
                 if not still_in_dock and (phase == "combat" or not self.is_card_selected(fresh, troop.card)):
+                    if troop.kind == "bomber":
+                        self.trigger_bomber_ability_now(troop, log=log)
                     if log and idx_c > 0:
                         log(f"[BH] Stage {self.stage}: thả {troop.kind}@{troop.card[0]} thành công tại điểm dự phòng #{idx_c+1} {point} (survivor).")
                     return True
             elif state != "waiting":
+                if troop.kind == "bomber" and state != "dead":
+                    self.trigger_bomber_ability_now(troop, log=log)
                 if log and idx_c > 0:
                     log(f"[BH] Stage {self.stage}: thả {troop.kind}@{troop.card[0]} thành công tại điểm dự phòng #{idx_c+1} {point} ({state}).")
                 return True
@@ -1199,11 +1220,17 @@ class BuilderBattle:
                 troop.used = not repeatable
                 log(f"[BH] Stage {self.stage}: đã xác nhận kỹ năng {kind} đổi trạng thái.")
                 continue
-            if troop.attempts >= 3 or (troop.attempts and now-troop.last_attempt < 1.7):
+            if repeatable and troop.attempts >= 3 and now - troop.last_attempt >= 4.0:
+                # Repeatable abilities (Bomber/Hero) must never be permanently locked out after cooldown.
+                troop.attempts = 0
+                if now - troop.last_attempt >= 6.0:
+                    troop.pending_charge = 0.
+            retry_gap = 2.2 if kind == "bomber" else 1.7
+            if troop.attempts >= 3 or (troop.attempts and now - troop.last_attempt < retry_gap):
                 continue
             age = now-troop.deployed
             if kind == "bomber":
-                ready = charge >= .50 and age >= .45
+                ready = charge >= .65 and health >= .05
             elif kind in ("machine", "copter"):
                 ready = charge >= .25 and health >= .10 and age >= 4 and (
                     health < .48 or charge >= .83)
@@ -1479,6 +1506,8 @@ class BuilderBattle:
                 ", ".join(f"{t.kind}@{t.card[0]}({c})->{pt}" for t, c, _, pt in drop_targets))
             for idx_t, (troop, count, had_hp, drop_pt) in enumerate(drop_targets):
                 self.send_drop(troop.card, drop_pt, min(count, 8), settle=.05, screen=screen if idx_t == 0 else None)
+                if troop.kind == "bomber":
+                    self.trigger_bomber_ability_now(troop, log=log)
             time.sleep(0.3)
             screen = self.adb.screencap()
             if screen is None:
@@ -1605,11 +1634,11 @@ class BuilderBattle:
                 if self.record_stat:
                     self.record_stat("builder_battles_started")
                 if phase in ("scouting", "combat"):
-                    log("[BH] Đã tìm thấy căn cứ đối thủ. Đợi 3s load intro trận đấu...")
-                    time.sleep(3.0)
+                    log("[BH] Đã tìm thấy căn cứ đối thủ. Đợi 1.2s load intro trận đấu...")
+                    time.sleep(1.2)
                     log(f"[BH] Stage {self.stage}: Thu nhỏ bản đồ làng đêm (zoom out) khi vào trận.")
                     self.adb.zoom_out_map(times=2)
-                    time.sleep(0.35)
+                    time.sleep(0.25)
                     screen = self.adb.screencap()
                     self.zoomed_for_stage = True
             if result:
