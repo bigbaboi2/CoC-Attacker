@@ -51,6 +51,19 @@ class ADBSocketClient:
         return subprocess.run(args, **kwargs)
 
     def _find_adb_binary(self) -> str:
+        # Prefer MuMu Player's bundled adb.exe so the server version matches
+        # MuMu's own ADB daemon (avoids port-5037 version-mismatch kills).
+        mumu_candidates = (
+            r"C:\Program Files\Netease\MuMuPlayer\nx_main\adb.exe",
+            r"C:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\adb.exe",
+            r"C:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
+            r"D:\Program Files\Netease\MuMuPlayer\nx_main\adb.exe",
+            r"D:\Program Files\Netease\MuMuPlayerGlobal-12.0\shell\adb.exe",
+            r"D:\Program Files\Netease\MuMuPlayer-12.0\shell\adb.exe",
+        )
+        for candidate in mumu_candidates:
+            if os.path.exists(candidate):
+                return candidate
         local_bin = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin", "adb.exe")
         if os.path.exists(local_bin):
             return local_bin
@@ -66,7 +79,14 @@ class ADBSocketClient:
             pass
 
         try:
-            self._run_adb([self.adb_bin, "start-server"], check=True, capture_output=True, timeout=5)
+            self._run_adb(
+                [self.adb_bin, "start-server"],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
             time.sleep(0.5)
         except Exception as e:
             print(f"[ADB] Warning: Could not start adb server: {e}")

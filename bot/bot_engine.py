@@ -244,7 +244,7 @@ class BotEngine:
             if attempt:
                 self.log(f'[ADB] Thử kết nối lại {serial} ({attempt + 1}/{attempts})...')
             try:
-                connected = self.adb.connect_device(serial, start_server=(attempt == 0))
+                connected = self.adb.connect_device(serial, start_server=True)
             except BotStoppedError:
                 cancelled = (self._start_cancelled.is_set() if startup else
                              not self._is_current_worker() or getattr(self, 'stop_requested', False))

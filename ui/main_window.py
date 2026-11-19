@@ -1061,6 +1061,7 @@ class MainWindow(QMainWindow):
         self.card_builder_stars = StatCard('', 'Sao đạt được', tone='amber')
         self.card_builder_uptime = StatCard('', 'Thời gian làng đêm', '00:00', tone='green')
         for index, card in enumerate((self.card_builder_started, self.card_builder_stars, self.card_builder_uptime)):
+            card.setToolTip('Góc dưới phải hiển thị số liệu ghi nhận từ lúc bật tool gần nhất.')
             builder_grid.addWidget(card, 0, index)
         builder_layout.addLayout(builder_grid)
         builder_note = QLabel('Ghi nhận thông số làng đêm (tối đa 6 sao mỗi trận gồm 2 stage).')
@@ -3552,6 +3553,9 @@ class MainWindow(QMainWindow):
         delta_gold = max(0, stats.get('gold_looted', 0) - baseline.get('gold_looted', 0))
         delta_elixir = max(0, stats.get('elixir_looted', 0) - baseline.get('elixir_looted', 0))
         delta_dark = max(0, stats.get('dark_looted', 0) - baseline.get('dark_looted', 0))
+        delta_builder_started = max(0, stats.get('builder_battles_started', 0) - baseline.get('builder_battles_started', 0))
+        delta_builder_stars = max(0, builder_stars - baseline.get('builder_stars_earned', 0))
+        delta_builder_uptime = max(0, stats.get('builder_uptime_seconds', 0) - baseline.get('builder_uptime_seconds', 0))
 
         self.card_total_battles.set_value(f'{main_battles + builder_battles:,}')
         self.card_total_battles.set_sub_value(f'Phiên: +{delta_total:,}')
@@ -3560,7 +3564,9 @@ class MainWindow(QMainWindow):
         self.card_builder_total.set_value(f'{builder_battles:,}')
         self.card_builder_total.set_sub_value(f'Phiên: +{delta_builder:,}')
         self.card_builder_stars.set_value(f'{builder_stars:,}')
+        self.card_builder_stars.set_sub_value(f'Phiên: +{delta_builder_stars:,}')
         self.card_builder_started.set_value(f"{stats.get('builder_battles_started', 0):,}")
+        self.card_builder_started.set_sub_value(f'Phiên: +{delta_builder_started:,}')
         self.card_battles.set_value(f'{main_battles:,}')
         self.card_stars.set_value(f"{stats.get('stars_earned', 0):,}")
         self.card_gold.set_value(f"{stats.get('gold_looted', 0):,}")
@@ -3590,6 +3596,7 @@ class MainWindow(QMainWindow):
         self.card_uptime.set_value(self._format_uptime(stats.get('uptime_seconds', 0)))
         self.card_uptime.set_sub_value(f'Phiên: +{self._format_uptime(delta_uptime)}')
         self.card_builder_uptime.set_value(self._format_uptime(stats.get('builder_uptime_seconds', 0)))
+        self.card_builder_uptime.set_sub_value(f'Phiên: +{self._format_uptime(delta_builder_uptime)}')
 
     @staticmethod
     def _format_uptime(seconds):

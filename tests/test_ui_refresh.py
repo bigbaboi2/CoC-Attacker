@@ -334,7 +334,9 @@ class AppearanceTests(unittest.TestCase):
             store = StatsStore(str(stats_path))
             seed = {
                 'battles_completed': 100,
+                'builder_battles_started': 12,
                 'builder_battles_completed': 10,
+                'builder_stars_earned': 35,
                 'uptime_seconds': 3600,
                 'builder_uptime_seconds': 600,
                 'gold_looted': 10_000_000,
@@ -361,6 +363,9 @@ class AppearanceTests(unittest.TestCase):
                 self.assertEqual(window.card_total_battles.sub_lbl.text(), 'Phiên: +0')
                 self.assertEqual(window.card_main_total.sub_lbl.text(), 'Phiên: +0')
                 self.assertEqual(window.card_builder_total.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_builder_started.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_builder_stars.sub_lbl.text(), 'Phiên: +0')
+                self.assertEqual(window.card_builder_uptime.sub_lbl.text(), 'Phiên: +00:00')
                 self.assertEqual(window.card_uptime.sub_lbl.text(), 'Phiên: +00:00')
                 self.assertEqual(window.card_gold.sub_lbl.text(), 'Phiên: +0')
                 self.assertEqual(window.card_elixir.sub_lbl.text(), 'Phiên: +0')
@@ -374,8 +379,11 @@ class AppearanceTests(unittest.TestCase):
                 # Simulate progress in this session with a slower battle (lower current RPH, peak preserved)
                 updated = window.bot.get_stats()
                 updated['battles_completed'] += 1
+                updated['builder_battles_started'] += 3
                 updated['builder_battles_completed'] += 2
+                updated['builder_stars_earned'] += 9
                 updated['uptime_seconds'] += 125
+                updated['builder_uptime_seconds'] += 75
                 updated['gold_looted'] += 250_000
                 updated['elixir_looted'] += 180_000
                 updated['dark_looted'] += 1_500
@@ -386,6 +394,9 @@ class AppearanceTests(unittest.TestCase):
                 self.assertEqual(window.card_total_battles.sub_lbl.text(), 'Phiên: +3')
                 self.assertEqual(window.card_main_total.sub_lbl.text(), 'Phiên: +1')
                 self.assertEqual(window.card_builder_total.sub_lbl.text(), 'Phiên: +2')
+                self.assertEqual(window.card_builder_started.sub_lbl.text(), 'Phiên: +3')
+                self.assertEqual(window.card_builder_stars.sub_lbl.text(), 'Phiên: +9')
+                self.assertEqual(window.card_builder_uptime.sub_lbl.text(), 'Phiên: +01:15')
                 self.assertEqual(window.card_uptime.sub_lbl.text(), 'Phiên: +02:05')
                 self.assertEqual(window.card_gold.sub_lbl.text(), 'Phiên: +250,000')
                 self.assertEqual(window.card_elixir.sub_lbl.text(), 'Phiên: +180,000')
